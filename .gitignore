@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.log
+.coverage
+htmlcov/
+build/
+dist/
+.vm/

@@ -1,0 +1,42 @@
+[Unit]
+Description=Distraction Blocker policy service
+After=systemd-timesyncd.service time-sync.target
+Wants=systemd-timesyncd.service time-sync.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/
+ExecStart=/usr/bin/python3 -I /usr/lib/distraction-blocker/daemon_entry.py service
+Restart=always
+RestartSec=1s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=no
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE CAP_CHOWN
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE CAP_CHOWN
+RuntimeDirectory=distraction-blocker
+RuntimeDirectoryMode=0755
+StateDirectory=distraction-blocker
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/distraction-blocker /run/distraction-blocker /etc
+ReadOnlyPaths=/usr/lib/distraction-blocker
+
+[Install]
+WantedBy=multi-user.target

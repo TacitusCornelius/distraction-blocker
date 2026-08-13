@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Distraction Blocker
+Comment=Manage website and application block schedules
+Exec=/usr/bin/python3 -I /usr/lib/distraction-blocker/gui_entry.py gui
+Terminal=false
+StartupNotify=true
+Categories=Utility;Productivity;
