@@ -2610,12 +2610,17 @@ class RuleEditor:
         selected = SCHEDULE_KINDS.index(form.schedule_kind)
         self.schedule_dropdown.set_selected(selected)
         self.schedule_stack.set_visible_child_name(form.schedule_kind)
-        self.one_start.set_text(form.one_time_start)
-        self.one_end.set_text(form.one_time_end)
+        # Breadcrumb for reviewers: unused schedule fields are blank in a
+        # RuleForm. DateTimePicker rejects blank text, so populate only the
+        # controls for the stored schedule kind.
+        if form.schedule_kind == "one_time":
+            self.one_start.set_text(form.one_time_start)
+            self.one_end.set_text(form.one_time_end)
         for row in tuple(self.weekly_rows):
             self._remove_weekly_period(row)
-        for period in form.weekly_periods:
-            self._add_weekly_period(period)
+        if form.schedule_kind == "weekly":
+            for period in form.weekly_periods:
+                self._add_weekly_period(period)
 
     def present(self) -> None:
         self.window.present()

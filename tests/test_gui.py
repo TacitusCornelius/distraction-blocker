@@ -12,6 +12,7 @@ from distraction_blocker.gui import (
     GtkUnavailableError,
     ManagedListSummary,
     ObservedRuleState,
+    RuleEditor,
     RuleForm,
     WeeklyPeriodForm,
     create_focus_rule,
@@ -217,6 +218,64 @@ class FormConversionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(FormError, "Add at least one target"):
             form_to_request(form, id_factory=lambda: UUID(RULE_ID))
+
+
+class StoredRuleEditorTests(unittest.TestCase):
+    def test_weekly_and_indefinite_rules_do_not_load_blank_picker_values(self):
+        class TextField:
+            def set_text(self, value):
+                self.value = value
+
+        class TextView:
+            def __init__(self):
+                self.buffer = TextField()
+
+            def get_buffer(self):
+                return self.buffer
+
+        class Picker:
+            def set_text(self, value):
+                if not value:
+                    raise FormError("blank picker value")
+
+        class Dropdown:
+            def set_selected(self, value):
+                self.value = value
+
+        class Stack:
+            def set_visible_child_name(self, value):
+                self.value = value
+
+        editor = RuleEditor.__new__(RuleEditor)
+        editor.name_entry = TextField()
+        editor.website_view = TextView()
+        editor.application_paths = []
+        editor._render_applications = lambda: None
+        editor.managed_list_checks = {}
+        editor.schedule_dropdown = Dropdown()
+        editor.schedule_stack = Stack()
+        editor.one_start = Picker()
+        editor.one_end = Picker()
+        editor.weekly_rows = []
+        editor._remove_weekly_period = editor.weekly_rows.remove
+        editor._add_weekly_period = editor.weekly_rows.append
+        weekly = make_rule(
+            schedule={
+                "kind": "weekly",
+                "timezone": "UTC",
+                "periods": [{
+                    "weekdays": [0],
+                    "start": "09:00",
+                    "end": "10:00",
+                }],
+            }
+        )
+        indefinite = make_rule(schedule={"kind": "indefinite"})
+
+        editor._populate(rule_to_form(weekly, "UTC"))
+        editor._populate(rule_to_form(indefinite, "UTC"))
+
+        self.assertEqual(editor.weekly_rows, [])
 
 
 class ScheduleProjectionTests(unittest.TestCase):

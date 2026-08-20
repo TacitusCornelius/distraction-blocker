@@ -5,7 +5,7 @@ from .categories import STARTER_CATEGORIES, starter_categories
 from .model import ManagedList, Policy, Rule, Schedule, Target, ValidationError, WeeklyPeriod
 from .storage import LoadResult, ProtectedStore, StorageError
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 __all__ = [
     "LoadResult",
