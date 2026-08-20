@@ -11,7 +11,7 @@ from pathlib import Path
 import secrets
 import stat
 import tempfile
-from typing import Any, Callable
+from typing import Any
 
 from .model import Policy, ValidationError
 
@@ -29,10 +29,11 @@ class LoadResult:
 
 
 class ProtectedStore:
-    VERSION = 1
+    VERSION = 2
     KEY_NAME = "hmac.key"
     PRIMARY_NAME = "policy.json"
     BACKUP_NAME = "policy.json.bak"
+    MAX_POLICY_BYTES = 16 * 1024 * 1024
 
     def __init__(self, directory: str | os.PathLike[str], key_source: Any = None):
         self.directory = Path(directory)
@@ -128,11 +129,7 @@ class ProtectedStore:
         return parsed.astimezone(timezone.utc)
 
     def _envelope(self, policy: Policy, high_water_utc: datetime | None, clock_untrusted: bool) -> bytes:
-        payload = {
-            "clock_untrusted": bool(clock_untrusted),
-            "high_water_utc": self._format_utc(high_water_utc),
-            "policy": policy.to_dict(),
-        }
+        payload = {"clock_untrusted": bool(clock_untrusted), "high_water_utc": self._format_utc(high_water_utc), "policy": policy.to_dict()}
         unsigned = {"version": self.VERSION, "payload": payload}
         signature = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
         return self._canonical({**unsigned, "hmac": signature})
@@ -182,27 +179,54 @@ class ProtectedStore:
         errors: list[Exception] = []
         for path, degraded in ((self.primary_path, False), (self.backup_path, True)):
             try:
-                result = self._load_file(path, degraded)
-                return result
+                return self._load_file(path, degraded)
             except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, StorageError, ValidationError) as exc:
                 errors.append(exc)
         if not self.primary_path.exists() and not self.backup_path.exists():
             return LoadResult(Policy(0, ()), None, False, False)
         raise StorageError("primary and backup policy state are invalid") from errors[-1]
 
+    @staticmethod
+    def _migrate_policy(data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise StorageError("policy is invalid")
+        migrated = dict(data)
+        migrated.setdefault("managed_lists", [])
+        rules = migrated.get("rules")
+        if not isinstance(rules, list):
+            raise StorageError("policy rules are invalid")
+        converted_rules = []
+        for rule in rules:
+            if not isinstance(rule, dict):
+                raise StorageError("policy rule is invalid")
+            converted = dict(rule)
+            schedule = converted.get("schedule")
+            if isinstance(schedule, dict) and schedule.get("kind") == "weekly" and "periods" not in schedule:
+                old = dict(schedule)
+                required = {"kind", "timezone", "weekdays", "start", "end"}
+                if set(old) != required:
+                    raise StorageError("old weekly schedule is invalid")
+                converted["schedule"] = {"kind": "weekly", "timezone": old["timezone"], "periods": [{"weekdays": old["weekdays"], "start": old["start"], "end": old["end"]}]}
+            converted_rules.append(converted)
+        migrated["rules"] = converted_rules
+        return migrated
+
     def _load_file(self, path: Path, degraded: bool) -> LoadResult:
         if path.is_symlink() or not path.is_file():
             raise StorageError("policy path is not a regular file")
+        if path.stat().st_size > self.MAX_POLICY_BYTES:
+            raise StorageError("policy file is too large")
         raw = path.read_bytes()
         envelope = json.loads(raw.decode("utf-8"))
         if not isinstance(envelope, dict) or set(envelope) != {"version", "payload", "hmac"}:
             raise StorageError("policy envelope is invalid")
-        if isinstance(envelope["version"], bool) or envelope["version"] != self.VERSION:
+        version = envelope["version"]
+        if isinstance(version, bool) or version not in {1, self.VERSION}:
             raise StorageError("policy version is invalid")
         signature = envelope["hmac"]
         if not isinstance(signature, str) or len(signature) != 64:
             raise StorageError("policy signature is invalid")
-        unsigned = {"version": envelope["version"], "payload": envelope["payload"]}
+        unsigned = {"version": version, "payload": envelope["payload"]}
         expected = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
         # Breadcrumb for reviewers: compare_digest avoids a timing leak from attacker-controlled signatures.
         if not hmac.compare_digest(signature, expected):
@@ -212,5 +236,10 @@ class ProtectedStore:
             raise StorageError("policy payload is invalid")
         if not isinstance(payload["clock_untrusted"], bool):
             raise StorageError("clock state is invalid")
-        policy = Policy.from_dict(payload["policy"])
-        return LoadResult(policy, self._parse_utc(payload["high_water_utc"]), degraded, payload["clock_untrusted"])
+        policy_data = self._migrate_policy(payload["policy"]) if version == 1 else payload["policy"]
+        policy = Policy.from_dict(policy_data)
+        result = LoadResult(policy, self._parse_utc(payload["high_water_utc"]), degraded, payload["clock_untrusted"])
+        if version == 1:
+            # Breadcrumb for reviewers: verify the old signature first, then write only the converted v2 form.
+            self.save(policy, result.high_water_utc, result.clock_untrusted)
+        return result

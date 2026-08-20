@@ -15,7 +15,8 @@ PREFIX = Path("/usr/lib/distraction-blocker")
 STATE = Path("/var/lib/distraction-blocker")
 RUN = Path("/run/distraction-blocker")
 UNIT = Path("/etc/systemd/system/distraction-blocker.service")
-DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
+DESKTOP = Path("/usr/share/applications/org.distraction_blocker.App.desktop")
+LEGACY_DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
 PACKAGE_NAME = "distraction_blocker"
 MARKER_NAME = "INSTALLATION"
 MARKER_TEXT = "distraction-blocker\n"
@@ -103,9 +104,13 @@ def installation_exists() -> bool:
 def install_files(source_root: Path, owner_uid: int) -> None:
     upgrading = installation_exists()
     if not upgrading:
-        for path in (UNIT, DESKTOP):
+        for path in (UNIT, DESKTOP, LEGACY_DESKTOP):
             if path.exists() or path.is_symlink():
                 fail(f"refusing to replace an existing path: {path}")
+    elif LEGACY_DESKTOP.is_symlink() or (
+        LEGACY_DESKTOP.exists() and not LEGACY_DESKTOP.is_file()
+    ):
+        fail(f"the old desktop path is unsafe: {LEGACY_DESKTOP}")
     package_source = source_root / PACKAGE_NAME
     copy_tree(package_source, PREFIX / PACKAGE_NAME)
 
@@ -113,8 +118,11 @@ def install_files(source_root: Path, owner_uid: int) -> None:
     copy_asset(packaging / "daemon_entry.py", PREFIX / "daemon_entry.py", 0o755)
     copy_asset(packaging / "gui_entry.py", PREFIX / "gui_entry.py", 0o755)
     copy_asset(packaging / "distraction-blocker.service", UNIT)
-    copy_asset(packaging / "distraction-blocker.desktop", DESKTOP)
-
+    copy_asset(packaging / "org.distraction_blocker.App.desktop", DESKTOP)
+    if upgrading and LEGACY_DESKTOP.is_file():
+        # Breadcrumb for reviewers: version 1.2 aligns the desktop filename
+        # with the GTK application ID so Gio notifications have an identity.
+        LEGACY_DESKTOP.unlink()
     marker = PREFIX / MARKER_NAME
     marker.write_text(MARKER_TEXT, encoding="ascii")
     set_mode(marker, 0o644)

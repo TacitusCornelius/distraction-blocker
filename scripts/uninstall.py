@@ -15,7 +15,8 @@ PREFIX = Path("/usr/lib/distraction-blocker")
 STATE = Path("/var/lib/distraction-blocker")
 RUN = Path("/run/distraction-blocker")
 UNIT = Path("/etc/systemd/system/distraction-blocker.service")
-DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
+DESKTOP = Path("/usr/share/applications/org.distraction_blocker.App.desktop")
+LEGACY_DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
 POLICY_FILES = ("hmac.key", "policy.json", "policy.json.bak")
 MARKER_NAME = "INSTALLATION"
 MARKER_TEXT = "distraction-blocker\n"
@@ -76,7 +77,7 @@ def main() -> int:
         run_systemctl(["disable", "--now", "distraction-blocker.service"])
         clear_hosts()
 
-        for path in (UNIT, DESKTOP):
+        for path in (UNIT, DESKTOP, LEGACY_DESKTOP):
             if path.is_symlink():
                 fail(f"refusing to remove a symlink at {path}")
             if path.is_file():

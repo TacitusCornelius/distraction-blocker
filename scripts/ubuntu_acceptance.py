@@ -24,6 +24,7 @@ POLICY = Path("/var/lib/distraction-blocker/policy.json")
 SOCKET = Path("/run/distraction-blocker/control.sock")
 TEST_EXECUTABLE = Path("/usr/local/lib/distraction-blocker-acceptance-app")
 TEST_DOMAIN = "blocked.invalid"
+TEST_WEEKLY_DOMAIN = "weekly.invalid"
 MARKER_PURPOSE = "distraction-blocker-acceptance"
 
 
@@ -108,13 +109,30 @@ def make_test_executable() -> None:
 
 def add_active_rule() -> str:
     now = datetime.now(timezone.utc)
+    list_id = str(uuid4())
+    client = installed_client()
+    begun = client.request(
+        "begin_list_import",
+        metadata={
+            "id": list_id,
+            "name": "Acceptance managed list",
+            "source": "acceptance",
+            "version": "1",
+            "license": "Acceptance test data",
+        },
+    )
+    import_id = begun["import_id"]
+    client.request(
+        "import_list_chunk", import_id=import_id, domains=[TEST_DOMAIN]
+    )
+    client.request("commit_list_import", import_id=import_id)
     rule_id = str(uuid4())
     rule = {
         "id": rule_id,
         "name": "Acceptance block",
         "enabled": True,
         "targets": [
-            {"kind": "website", "value": TEST_DOMAIN},
+            {"kind": "managed_list", "value": list_id},
             {"kind": "application", "value": str(TEST_EXECUTABLE)},
         ],
         "schedule": {
@@ -124,17 +142,58 @@ def add_active_rule() -> str:
         },
         "revision": 0,
     }
-    installed_client().request("put_rule", rule=rule)
+    client.request("put_rule", rule=rule)
+    status = client.request("status")
+    if status.get("active_counts") != {"website": 1, "application": 1}:
+        raise AcceptanceError("Managed-list active counts are wrong.")
+    summaries = client.request("list_managed_lists")
+    if len(summaries) != 1 or "domains" in summaries[0]:
+        raise AcceptanceError("A normal list response exposed managed domains.")
     return rule_id
 
 
-def check_domain_block() -> None:
+def add_active_weekly_rule() -> str:
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=1)
+    end = now + timedelta(hours=1)
+    later = now + timedelta(days=2)
+    rule_id = str(uuid4())
+    installed_client().request(
+        "put_rule",
+        rule={
+            "id": rule_id,
+            "name": "Acceptance weekly periods",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": TEST_WEEKLY_DOMAIN}],
+            "schedule": {
+                "kind": "weekly",
+                "timezone": "UTC",
+                "periods": [
+                    {
+                        "weekdays": [start.weekday()],
+                        "start": start.strftime("%H:%M:%S"),
+                        "end": end.strftime("%H:%M:%S"),
+                    },
+                    {
+                        "weekdays": [later.weekday()],
+                        "start": "02:00:00",
+                        "end": "03:00:00",
+                    },
+                ],
+            },
+            "revision": 0,
+        },
+    )
+    return rule_id
+
+
+def check_domain_block(domain: str = TEST_DOMAIN) -> None:
     addresses = {
         item[4][0]
-        for item in socket.getaddrinfo(TEST_DOMAIN, 80, type=socket.SOCK_STREAM)
+        for item in socket.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)
     }
     if not addresses or not addresses <= {"0.0.0.0", "::"}:
-        raise AcceptanceError("The test domain did not resolve to refusal addresses.")
+        raise AcceptanceError(f"The test domain was not blocked: {domain}")
 
 
 def check_executable_block() -> None:
@@ -309,7 +368,9 @@ def phase_one(source_root: Path, owner_uid: int, reboot: bool) -> None:
     install(source_root, owner_uid)
     make_test_executable()
     add_active_rule()
+    add_active_weekly_rule()
     check_domain_block()
+    check_domain_block(TEST_WEEKLY_DOMAIN)
     check_executable_block()
     check_gui_exit(owner_uid)
     change_time_and_restore()
@@ -334,6 +395,7 @@ def phase_two(source_root: Path) -> None:
     if status.get("clock_trusted") is not False:
         raise AcceptanceError("The clock-tamper latch did not survive the restart.")
     check_domain_block()
+    check_domain_block(TEST_WEEKLY_DOMAIN)
     check_executable_block()
     cleanup(source_root, strict=True)
     print("Ubuntu acceptance checks passed.")

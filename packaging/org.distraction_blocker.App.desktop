@@ -6,3 +6,4 @@ Exec=/usr/bin/python3 -I /usr/lib/distraction-blocker/gui_entry.py gui
 Terminal=false
 StartupNotify=true
 Categories=Utility;Productivity;
+X-GNOME-UsesNotifications=true

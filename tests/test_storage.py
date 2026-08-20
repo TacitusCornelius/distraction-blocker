@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import tempfile
 import unittest
@@ -25,6 +27,56 @@ class StorageTests(unittest.TestCase):
             result = store.load()
             self.assertTrue(result.degraded)
             self.assertEqual(result.policy.revision, 1)
+
+    def test_signed_v1_policy_migrates_weekly_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            store.initialize()
+            payload = {
+                "clock_untrusted": False,
+                "high_water_utc": None,
+                "policy": {
+                    "revision": 4,
+                    "rules": [{
+                        "id": "12345678-1234-5678-9234-567812345678",
+                        "name": "Old weekly rule",
+                        "enabled": True,
+                        "targets": [{"kind": "website", "value": "example.com"}],
+                        "schedule": {
+                            "kind": "weekly",
+                            "timezone": "UTC",
+                            "weekdays": [0, 2],
+                            "start": "09:00:00",
+                            "end": "17:00:00",
+                        },
+                        "revision": 0,
+                    }],
+                },
+            }
+            unsigned = {"version": 1, "payload": payload}
+            envelope = {
+                **unsigned,
+                "hmac": hmac.new(
+                    b"k" * 32,
+                    store._canonical(unsigned),
+                    hashlib.sha256,
+                ).hexdigest(),
+            }
+            Path(directory, "policy.json").write_bytes(store._canonical(envelope))
+            result = store.load()
+            self.assertEqual(result.policy.to_dict()["managed_lists"], [])
+            self.assertEqual(
+                result.policy.rules[0].to_dict()["schedule"]["periods"],
+                [{
+                    "weekdays": [0, 2],
+                    "start": "09:00:00",
+                    "end": "17:00:00",
+                }],
+            )
+            self.assertEqual(
+                json.loads(Path(directory, "policy.json").read_text())["version"],
+                2,
+            )
 
     def test_bad_both_refuses_start(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 import ipaddress
 import os
 import re
@@ -33,13 +33,15 @@ def _object(value: Any, fields: set[str], label: str) -> dict[str, Any]:
     return value
 
 
-def _string(value: Any, label: str, *, nonempty: bool = True) -> str:
+def _string(value: Any, label: str, *, nonempty: bool = True, maximum: int | None = None) -> str:
     if not isinstance(value, str):
         _error("bad_type", f"{label} must be a string")
-    if nonempty and not value:
+    if nonempty and not value.strip():
         _error("bad_value", f"{label} must not be empty")
     if "\x00" in value:
         _error("bad_value", f"{label} has an invalid character")
+    if maximum is not None and len(value.encode("utf-8")) > maximum:
+        _error("bad_value", f"{label} is too long")
     return value
 
 
@@ -53,11 +55,14 @@ def _integer(value: Any, label: str, *, minimum: int | None = None) -> int:
 
 
 def _utc_datetime(value: Any, label: str) -> datetime:
-    text = _string(value, label)
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        _error("bad_value", f"{label} must be an ISO UTC time")
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = _string(value, label)
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            _error("bad_value", f"{label} must be an ISO UTC time")
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         _error("bad_value", f"{label} must be an aware UTC time")
     return parsed.astimezone(timezone.utc).replace(tzinfo=timezone.utc)
@@ -70,24 +75,35 @@ def _utc_text(value: datetime) -> str:
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
-def _hostname(value: Any) -> str:
-    raw = _string(value, "target value").strip().rstrip(".")
+def _hostname(value: Any, label: str = "website value") -> str:
+    raw = _string(value, label).strip().rstrip(".")
     if not raw or "/" in raw or "\\" in raw or "*" in raw or ":" in raw:
-        _error("bad_value", "website value must be a hostname")
+        _error("bad_value", f"{label} must be a hostname")
     try:
         # Breadcrumb for reviewers: IDNA conversion gives one stable ASCII form for matching.
         host = raw.encode("idna").decode("ascii").lower()
     except UnicodeError:
-        _error("bad_value", "website value is not valid")
+        _error("bad_value", f"{label} is not valid")
     try:
         ipaddress.ip_address(host)
     except ValueError:
         pass
     else:
-        _error("bad_value", "website value must be a hostname")
+        _error("bad_value", f"{label} must be a hostname")
     if len(host) > 253 or any(not _HOST_LABEL.fullmatch(part) for part in host.split(".")):
-        _error("bad_value", "website value must be a hostname")
+        _error("bad_value", f"{label} must be a hostname")
     return host
+
+
+def _uuid(value: Any, label: str) -> str:
+    text = _string(value, label)
+    try:
+        parsed = uuid.UUID(text)
+    except ValueError:
+        _error("bad_value", f"{label} must be a UUID")
+    if str(parsed) != text.lower():
+        _error("bad_value", f"{label} must be a canonical UUID")
+    return text.lower()
 
 
 @dataclass(frozen=True)
@@ -99,11 +115,13 @@ class Target:
     def from_dict(cls, data: Mapping[str, Any]) -> "Target":
         obj = _object(data, {"kind", "value"}, "target")
         kind = _string(obj.get("kind"), "target kind")
-        if kind not in {"website", "application"}:
+        if kind not in {"website", "application", "managed_list"}:
             _error("bad_value", "target kind is not supported")
         value = obj.get("value")
         if kind == "website":
             value = _hostname(value)
+        elif kind == "managed_list":
+            value = _uuid(value, "managed-list target value")
         else:
             value = _string(value, "target value")
             if not os.path.isabs(value):
@@ -118,18 +136,39 @@ class Target:
 
 
 @dataclass(frozen=True)
+class WeeklyPeriod:
+    weekdays: tuple[int, ...]
+    start_local: time
+    end_local: time
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "WeeklyPeriod":
+        obj = _object(data, {"weekdays", "start", "end"}, "weekly period")
+        if set(obj) != {"weekdays", "start", "end"}:
+            _error("bad_value", "weekly period fields are incomplete")
+        days = obj["weekdays"]
+        if not isinstance(days, list) or not days:
+            _error("bad_type" if not isinstance(days, list) else "bad_value", "weekdays must be a non-empty list")
+        parsed_days = tuple(sorted(_integer(day, "weekday", minimum=0) for day in days))
+        if len(parsed_days) > 7 or any(day > 6 for day in parsed_days) or len(set(parsed_days)) != len(parsed_days):
+            _error("bad_value", "weekdays are not valid")
+        return cls(parsed_days, _local_time(obj["start"], "start"), _local_time(obj["end"], "end"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"weekdays": list(self.weekdays), "start": self.start_local.strftime("%H:%M:%S"), "end": self.end_local.strftime("%H:%M:%S")}
+
+
+@dataclass(frozen=True)
 class Schedule:
     kind: str
     start_utc: datetime | None = None
     end_utc: datetime | None = None
     timezone_name: str | None = None
-    weekdays: tuple[int, ...] = ()
-    start_local: time | None = None
-    end_local: time | None = None
+    periods: tuple[WeeklyPeriod, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Schedule":
-        obj = _object(data, {"kind", "start_utc", "end_utc", "timezone", "weekdays", "start", "end"}, "schedule")
+        obj = _object(data, {"kind", "start_utc", "end_utc", "timezone", "periods"}, "schedule")
         kind = _string(obj.get("kind"), "schedule kind")
         if kind == "one_time":
             if set(obj) != {"kind", "start_utc", "end_utc"}:
@@ -140,23 +179,21 @@ class Schedule:
                 _error("bad_value", "schedule end must be after start")
             return cls(kind, start_utc=start, end_utc=end)
         if kind == "weekly":
-            required = {"kind", "timezone", "weekdays", "start", "end"}
-            if set(obj) != required:
+            if set(obj) != {"kind", "timezone", "periods"}:
                 _error("bad_value", "weekly schedule fields are incomplete")
             zone = _string(obj["timezone"], "timezone")
             try:
                 ZoneInfo(zone)
             except (ZoneInfoNotFoundError, ValueError):
                 _error("bad_value", "timezone is not valid")
-            days = obj["weekdays"]
-            if not isinstance(days, list):
-                _error("bad_type", "weekdays must be a list")
-            parsed_days = tuple(sorted(set(_integer(day, "weekday", minimum=0) for day in days)))
-            if len(parsed_days) != len(days) or any(day > 6 for day in parsed_days) or not parsed_days:
-                _error("bad_value", "weekdays are not valid")
-            start_time = _local_time(obj["start"], "start")
-            end_time = _local_time(obj["end"], "end")
-            return cls(kind, timezone_name=zone, weekdays=parsed_days, start_local=start_time, end_local=end_time)
+            raw_periods = obj["periods"]
+            if not isinstance(raw_periods, list) or not raw_periods:
+                _error("bad_type" if not isinstance(raw_periods, list) else "bad_value", "periods must be a non-empty list")
+            periods = tuple(WeeklyPeriod.from_dict(item) for item in raw_periods)
+            if len(periods) > 16 or len(set(periods)) != len(periods):
+                _error("bad_value", "weekly schedule periods are not valid")
+            periods = tuple(sorted(periods, key=lambda period: (period.weekdays, period.start_local, period.end_local)))
+            return cls(kind, timezone_name=zone, periods=periods)
         if kind == "indefinite":
             if set(obj) != {"kind"}:
                 _error("bad_value", "indefinite schedule fields are incomplete")
@@ -167,14 +204,9 @@ class Schedule:
         if self.kind == "one_time":
             return {"kind": self.kind, "start_utc": _utc_text(self.start_utc), "end_utc": _utc_text(self.end_utc)}
         if self.kind == "weekly":
-            return {
-                "kind": self.kind,
-                "timezone": self.timezone_name,
-                "weekdays": list(self.weekdays),
-                "start": self.start_local.strftime("%H:%M:%S"),
-                "end": self.end_local.strftime("%H:%M:%S"),
-            }
+            return {"kind": self.kind, "timezone": self.timezone_name, "periods": [period.to_dict() for period in self.periods]}
         return {"kind": self.kind}
+
 
     def is_active(self, now_utc: datetime) -> bool:
         if not isinstance(now_utc, datetime) or now_utc.tzinfo is None or now_utc.utcoffset() != timedelta(0):
@@ -187,15 +219,16 @@ class Schedule:
         local = now.astimezone(ZoneInfo(self.timezone_name))
         local_naive = local.replace(tzinfo=None)
         local_date = local.date()
-        for offset in (0, -1):
-            start_date = local_date + timedelta(days=offset)
-            if start_date.weekday() not in self.weekdays:
-                continue
-            start = datetime.combine(start_date, self.start_local)
-            end_date = start_date + timedelta(days=1 if self.end_local <= self.start_local else 0)
-            end = datetime.combine(end_date, self.end_local)
-            if start <= local_naive < end:
-                return True
+        for period in self.periods:
+            for offset in (0, -1):
+                start_date = local_date + timedelta(days=offset)
+                if start_date.weekday() not in period.weekdays:
+                    continue
+                start = datetime.combine(start_date, period.start_local)
+                end_date = start_date + timedelta(days=1 if period.end_local <= period.start_local else 0)
+                end = datetime.combine(end_date, period.end_local)
+                if start <= local_naive < end:
+                    return True
         return False
 
 
@@ -222,13 +255,8 @@ class Rule:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Rule":
         obj = _object(data, {"id", "name", "enabled", "targets", "schedule", "revision"}, "rule")
-        ident = _string(obj.get("id"), "rule id")
-        try:
-            if str(uuid.UUID(ident)) != ident.lower():
-                _error("bad_value", "rule id must be a UUID")
-        except ValueError:
-            _error("bad_value", "rule id must be a UUID")
-        name = _string(obj.get("name"), "rule name")
+        ident = _uuid(obj.get("id"), "rule id")
+        name = _string(obj.get("name"), "rule name", maximum=256)
         if not isinstance(obj.get("enabled"), bool):
             _error("bad_type", "enabled must be a boolean")
         raw_targets = obj.get("targets")
@@ -239,17 +267,10 @@ class Rule:
             _error("bad_value", "targets must be unique")
         schedule = Schedule.from_dict(obj.get("schedule"))
         revision = _integer(obj.get("revision"), "revision", minimum=0)
-        return cls(ident.lower(), name, obj["enabled"], targets, schedule, revision)
+        return cls(ident, name, obj["enabled"], targets, schedule, revision)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "name": self.name,
-            "enabled": self.enabled,
-            "targets": [target.to_dict() for target in self.targets],
-            "schedule": self.schedule.to_dict(),
-            "revision": self.revision,
-        }
+        return {"id": self.id, "name": self.name, "enabled": self.enabled, "targets": [target.to_dict() for target in self.targets], "schedule": self.schedule.to_dict(), "revision": self.revision}
 
     def is_active(self, now_utc: datetime, clock_trusted: bool = True) -> bool:
         if not self.enabled:
@@ -260,13 +281,47 @@ class Rule:
 
 
 @dataclass(frozen=True)
+class ManagedList:
+    id: str
+    name: str
+    source: str
+    version: str
+    license: str
+    imported_utc: datetime
+    domains: tuple[str, ...]
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ManagedList":
+        obj = _object(data, {"id", "name", "source", "version", "license", "imported_utc", "domains"}, "managed list")
+        if set(obj) != {"id", "name", "source", "version", "license", "imported_utc", "domains"}:
+            _error("bad_value", "managed list fields are incomplete")
+        raw_domains = obj["domains"]
+        if not isinstance(raw_domains, list):
+            _error("bad_type", "managed list domains must be a list")
+        if len(raw_domains) > 50_000:
+            _error("bad_value", "managed list has too many domains")
+        domains = tuple(_hostname(domain, "managed list domain") for domain in raw_domains)
+        if len(set(domains)) != len(domains):
+            _error("bad_value", "managed list domains must be unique")
+        if sum(len(domain.encode("utf-8")) for domain in domains) > 4 * 1024 * 1024:
+            _error("bad_value", "managed list domains are too large")
+        return cls(_uuid(obj["id"], "managed list id"), _string(obj["name"], "managed list name", maximum=256), _string(obj["source"], "managed list source", maximum=512), _string(obj["version"], "managed list version", maximum=128), _string(obj["license"], "managed list license", maximum=512), _utc_datetime(obj["imported_utc"], "imported_utc"), domains)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "name": self.name, "source": self.source, "version": self.version, "license": self.license, "imported_utc": _utc_text(self.imported_utc), "domains": list(self.domains)}
+
+
+@dataclass(frozen=True)
 class Policy:
     revision: int
     rules: tuple[Rule, ...]
+    managed_lists: tuple[ManagedList, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Policy":
-        obj = _object(data, {"revision", "rules"}, "policy")
+        obj = _object(data, {"revision", "rules", "managed_lists"}, "policy")
+        if set(obj) != {"revision", "rules", "managed_lists"}:
+            _error("bad_value", "policy fields are incomplete")
         revision = _integer(obj.get("revision"), "policy revision", minimum=0)
         raw_rules = obj.get("rules")
         if not isinstance(raw_rules, list):
@@ -274,7 +329,23 @@ class Policy:
         rules = tuple(Rule.from_dict(item) for item in raw_rules)
         if len({rule.id for rule in rules}) != len(rules):
             _error("bad_value", "rule ids must be unique")
-        return cls(revision, rules)
+        raw_lists = obj.get("managed_lists")
+        if not isinstance(raw_lists, list):
+            _error("bad_type", "managed_lists must be a list")
+        if len(raw_lists) > 64:
+            _error("bad_value", "too many managed lists")
+        managed_lists = tuple(ManagedList.from_dict(item) for item in raw_lists)
+        list_ids = {item.id for item in managed_lists}
+        if len(list_ids) != len(managed_lists):
+            _error("bad_value", "managed list ids must be unique")
+        total_bytes = sum(len(domain.encode("utf-8")) for item in managed_lists for domain in item.domains)
+        if total_bytes > 4 * 1024 * 1024:
+            _error("bad_value", "managed list domains are too large")
+        for rule in rules:
+            for target in rule.targets:
+                if target.kind == "managed_list" and target.value not in list_ids:
+                    _error("bad_value", "rule refers to an unknown managed list")
+        return cls(revision, rules, managed_lists)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"revision": self.revision, "rules": [rule.to_dict() for rule in self.rules]}
+        return {"revision": self.revision, "rules": [rule.to_dict() for rule in self.rules], "managed_lists": [item.to_dict() for item in self.managed_lists]}
