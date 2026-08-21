@@ -184,18 +184,9 @@ class ProtectedStore:
             envelope = json.loads(path.read_bytes().decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise StorageError("statistics file is invalid") from exc
-        if not isinstance(envelope, dict) or set(envelope) != {"version", "payload", "hmac"}:
-            raise StorageError("statistics envelope is invalid")
-        signature = envelope["hmac"]
-        if envelope["version"] != 1 or not isinstance(signature, str) or len(signature) != 64:
-            raise StorageError("statistics envelope is invalid")
-        unsigned = {"version": envelope["version"], "payload": envelope["payload"]}
-        expected = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
-        # Breadcrumb: compare_digest protects the signed file boundary from timing differences.
-        if not hmac.compare_digest(signature, expected):
-            raise StorageError("statistics signature is invalid")
+        _, payload = self._verify_envelope(envelope, {1}, "statistics")
         try:
-            return StatisticsState.from_dict(envelope["payload"])
+            return StatisticsState.from_dict(payload)
         except (TypeError, ValueError, KeyError) as exc:
             raise StorageError("statistics payload is invalid") from exc
 
@@ -243,6 +234,26 @@ class ProtectedStore:
             return LoadResult(Policy(0, ()), ControlState.empty(), None, False, False)
         raise StorageError("primary and backup policy state are invalid") from errors[-1]
 
+    def _verify_envelope(self, envelope: Any, versions: set[int], label: str) -> tuple[int, Any]:
+        """Check one signed envelope's shape and HMAC; return version and payload.
+
+        Breadcrumb: compare_digest avoids a timing leak from attacker-controlled
+        signatures, and ``label`` keeps each file's error messages distinct.
+        """
+        if not isinstance(envelope, dict) or set(envelope) != {"version", "payload", "hmac"}:
+            raise StorageError(f"{label} envelope is invalid")
+        version = envelope["version"]
+        if isinstance(version, bool) or version not in versions:
+            raise StorageError(f"{label} version is invalid")
+        signature = envelope["hmac"]
+        if not isinstance(signature, str) or len(signature) != 64:
+            raise StorageError(f"{label} signature is invalid")
+        unsigned = {"version": version, "payload": envelope["payload"]}
+        expected = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise StorageError(f"{label} signature is invalid")
+        return version, envelope["payload"]
+
     @staticmethod
     def _migrate_policy(data: Any) -> dict[str, Any]:
         if not isinstance(data, dict):
@@ -275,20 +286,9 @@ class ProtectedStore:
             raise StorageError("policy file is too large")
         raw = path.read_bytes()
         envelope = json.loads(raw.decode("utf-8"))
-        if not isinstance(envelope, dict) or set(envelope) != {"version", "payload", "hmac"}:
-            raise StorageError("policy envelope is invalid")
-        version = envelope["version"]
-        if isinstance(version, bool) or version not in {1, 2, self.VERSION}:
-            raise StorageError("policy version is invalid")
-        signature = envelope["hmac"]
-        if not isinstance(signature, str) or len(signature) != 64:
-            raise StorageError("policy signature is invalid")
-        unsigned = {"version": version, "payload": envelope["payload"]}
-        expected = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
-        # Breadcrumb: compare_digest avoids a timing leak from attacker-controlled signatures.
-        if not hmac.compare_digest(signature, expected):
-            raise StorageError("policy signature is invalid")
-        payload = envelope["payload"]
+        version, payload = self._verify_envelope(
+            envelope, {1, 2, self.VERSION}, "policy"
+        )
         old_fields = {"clock_untrusted", "high_water_utc", "policy"}
         current_fields = old_fields | {"controls"}
         if not isinstance(payload, dict) or set(payload) != (current_fields if version == self.VERSION else old_fields):
