@@ -11,6 +11,7 @@ from pathlib import Path
 import pwd
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -31,6 +32,11 @@ FRICTION_LOCK_RULE = "22222222-2222-4222-8222-222222222222"
 PASSWORD_LOCK_RULE = "33333333-3333-4333-8333-333333333333"
 POMODORO_RULE = "44444444-4444-4444-8444-444444444444"
 CLI_PATH = Path("/usr/local/bin/distraction-blocker")
+HOST_PATH = Path("/usr/lib/distraction-blocker/host_entry.py")
+NATIVE_MANIFESTS = (
+    Path("/usr/lib/mozilla/native-messaging-hosts/org.distraction_blocker.firefox.json"),
+    Path("/usr/lib/librewolf/native-messaging-hosts/org.distraction_blocker.firefox.json"),
+)
 MARKER_PURPOSE = "distraction-blocker-acceptance"
 
 
@@ -295,6 +301,118 @@ def add_v13_state(owner_uid: int) -> None:
     )
 
 
+EXT_RULE = "55555555-5555-4555-8555-555555555555"
+
+
+def _framed(payload: dict) -> bytes:
+    encoded = json.dumps(payload).encode("utf-8")
+    return struct.pack("@I", len(encoded)) + encoded
+
+
+def _read_framed(stream) -> dict:
+    header = stream.read(4)
+    if len(header) < 4:
+        raise AcceptanceError("the native host closed its output early")
+    (length,) = struct.unpack("@I", header)
+    return json.loads(stream.read(length).decode("utf-8"))
+
+
+def check_extension_policy_link(owner_uid: int) -> None:
+    """Exercise the installed native-messaging link as the desktop user.
+
+    The browser would speak this exact framing to this exact root-owned
+    binary, so a passing probe proves the whole chain: manifest placement,
+    allowlist enforcement, socket ownership, rule visibility, and denial
+    statistics persistence.
+    """
+    if HOST_PATH.is_symlink() or not HOST_PATH.is_file():
+        raise AcceptanceError("the native messaging host is not installed")
+    for manifest in NATIVE_MANIFESTS:
+        if not manifest.is_file():
+            raise AcceptanceError(f"native manifest is missing: {manifest}")
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        if (
+            data.get("type") != "stdio"
+            or data.get("path") != str(HOST_PATH)
+            or "{e4f1a2b3-9c8d-4e5f-a6b7-8c9d0e1f2a3b}"
+            not in data.get("allowed_extensions", [])
+        ):
+            raise AcceptanceError("a native manifest has unexpected content")
+
+    client = installed_client()
+    client.request(
+        "put_rule",
+        rule={
+            "id": EXT_RULE,
+            "name": "Extension policy acceptance",
+            "enabled": True,
+            "targets": [{"kind": "url_path", "value": "ext.invalid/feed"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        },
+    )
+
+    account = pwd.getpwuid(owner_uid)
+    process = subprocess.Popen(
+        [
+            "/usr/sbin/runuser",
+            "-u",
+            account.pw_name,
+            "--",
+            "/usr/bin/python3",
+            "-I",
+            str(HOST_PATH),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    try:
+        # Breadcrumb: feed every frame first, then read; the host answers
+        # strictly in order.
+        process.stdin.write(_framed({"command": "status"}))
+        process.stdin.write(
+            _framed({
+                "command": "delete_rule",
+                "rule_id": EXT_RULE,
+            })
+        )
+        process.stdin.write(
+            _framed({
+                "command": "report_website_denials",
+                "entries": [{
+                    "rule_id": EXT_RULE,
+                    "value": "ext.invalid/feed",
+                    "count": 2,
+                }],
+            })
+        )
+        process.stdin.write(_framed({"command": "list_website_stats"}))
+        process.stdin.close()
+
+        status = _read_framed(process.stdout)
+        if not status.get("ok") or not status["result"].get("healthy"):
+            raise AcceptanceError("the extension host cannot see a healthy service")
+        forbidden = _read_framed(process.stdout)
+        if forbidden.get("ok") is not False or forbidden["error"]["code"] != "forbidden":
+            raise AcceptanceError("the native host allowed a policy change")
+        report = _read_framed(process.stdout)
+        if not report.get("ok"):
+            raise AcceptanceError("the denial report was refused")
+        listed = _read_framed(process.stdout)
+        rows = {row["value"]: row for row in listed["result"]["items"]}
+        row = rows.get("ext.invalid/feed")
+        if row is None or row["count"] != 2:
+            raise AcceptanceError("website denial statistics were not recorded")
+    finally:
+        process.kill()
+        process.wait()
+    stored = json.loads(
+        Path("/var/lib/distraction-blocker/website-statistics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
 def check_v13_state(owner_uid: int) -> None:
     client = installed_client()
     locks = client.request("list_locks")
@@ -523,6 +641,7 @@ def phase_one(source_root: Path, owner_uid: int, reboot: bool) -> None:
     add_active_rule()
     add_active_weekly_rule()
     add_v13_state(owner_uid)
+    check_extension_policy_link(owner_uid)
     check_domain_block()
     check_domain_block(TEST_WEEKLY_DOMAIN)
     check_domain_block(TEST_POMODORO_DOMAIN)

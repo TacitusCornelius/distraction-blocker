@@ -159,8 +159,8 @@ class ProtectedStore:
         self._atomic_write(self.backup_path, content)
         self._atomic_write(self.primary_path, content)
 
-    def _statistics_envelope(self, state: StatisticsState) -> bytes:
-        if not isinstance(state, StatisticsState):
+    def _statistics_envelope(self, state) -> bytes:
+        if not isinstance(state, (StatisticsState, WebsiteDenialState)):
             raise StorageError("statistics state has an invalid type")
         unsigned = {"version": 1, "payload": state.to_dict()}
         signature = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()

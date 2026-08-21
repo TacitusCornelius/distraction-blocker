@@ -8,7 +8,7 @@ from pathlib import Path
 
 from distraction_blocker.control import ControlState, RuleLock
 from distraction_blocker.model import Policy
-from distraction_blocker.statistics import StatisticsState
+from distraction_blocker.statistics import StatisticsState, WebsiteDenialState
 from distraction_blocker.storage import ProtectedStore, StorageError
 
 
@@ -125,7 +125,24 @@ class StorageTests(unittest.TestCase):
                     "2026-01-01T00:00:00Z",
                 )
             store.save_statistics(state)
-            self.assertEqual(store.load_statistics(), state)
+
+    def test_website_statistics_round_trip_and_bad_signature_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            state = WebsiteDenialState.empty().record(
+                "example.com/feed",
+                "11111111-1111-4111-8111-111111111111",
+                "2026-01-01T00:00:00Z",
+                times=3,
+            )
+            store.save_website_statistics(state)
+            self.assertEqual(store.load_website_statistics(), state)
+            path = Path(directory, "website-statistics.json")
+            envelope = json.loads(path.read_text())
+            envelope["hmac"] = "0" * 64
+            path.write_bytes(store._canonical(envelope))
+            with self.assertRaises(StorageError):
+                store.load_website_statistics()
 
     def test_missing_statistics_is_empty_and_bad_signature_refuses(self):
         with tempfile.TemporaryDirectory() as directory:
