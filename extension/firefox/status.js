@@ -4,6 +4,18 @@
  */
 "use strict";
 
+/* global browser */
+
+const checkbox = document.getElementById("block_inactive");
+
+browser.storage.local.get("block_inactive").then((stored) => {
+  checkbox.checked = stored.block_inactive === true;
+});
+
+checkbox.addEventListener("change", () => {
+  browser.storage.local.set({ block_inactive: checkbox.checked });
+});
+
 browser.runtime.sendMessage({ topic: "status" }).then((state) => {
   const marker = document.getElementById("state");
   if (state.policy_ok) {
@@ -27,9 +39,9 @@ browser.runtime.sendMessage({ topic: "status" }).then((state) => {
     list.append(item);
     return;
   }
-  for (const [rule_id, count] of entries) {
+  for (const [label, count] of entries) {
     const item = document.createElement("li");
-    item.textContent = `${rule_id}: ${count} denied load(s)`;
+    item.textContent = `${label}: ${count} denied load(s)`;
     list.append(item);
   }
 });

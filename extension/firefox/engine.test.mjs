@@ -91,3 +91,47 @@ test("compile tolerates malformed rule entries", () => {
   const match = compile([{ id: "bad" }, { id: "ok", enabled: true, targets: [] }]);
   assert.equal(match("https://example.com/feed"), null);
 });
+
+const YOUTUBE_RULES = [
+  {
+    id: "video-rule",
+    enabled: true,
+    targets: [{ kind: "youtube_video", value: "dQw4w9WgXcQ" }],
+  },
+  {
+    id: "channel-rule",
+    enabled: true,
+    targets: [{ kind: "youtube_channel", value: "@examplehandle" }],
+  },
+];
+
+test("youtube_video matches watch, shorts, and embed forms", () => {
+  const match = compile(YOUTUBE_RULES);
+  assert.equal(
+    match("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1s").rule_id,
+    "video-rule",
+  );
+  assert.equal(
+    match("https://youtube.com/shorts/dQw4w9WgXcQ").rule_id,
+    "video-rule",
+  );
+  assert.equal(
+    match("https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ").rule_id,
+    "video-rule",
+  );
+  assert.equal(match("https://youtube.com/watch?v=aaaaaaaaaaa"), null);
+});
+
+test("youtube_channel matches handle and channel paths", () => {
+  const match = compile(YOUTUBE_RULES);
+  assert.equal(
+    match("https://youtube.com/@ExampleHandle/videos").rule_id,
+    "channel-rule",
+  );
+  assert.equal(match("https://youtube.com/@otherhandle"), null);
+});
+
+test("non-youtube hosts never match youtube targets", () => {
+  const match = compile(YOUTUBE_RULES);
+  assert.equal(match("https://evil.example.net/watch?v=dQw4w9WgXcQ"), null);
+});

@@ -464,7 +464,7 @@ def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
     url_targets = tuple(
         {"kind": item["kind"], "value": item["value"]}
         for item in rule.to_dict()["targets"]
-        if item["kind"].startswith("url")
+        if item["kind"].startswith(("url", "youtube"))
     )
     return replace(form, url_targets=url_targets)
 
@@ -1307,7 +1307,7 @@ def _target_summary(rule: Rule) -> str:
     applications = sum(item["kind"] == "application" for item in targets)
     managed_lists = sum(item["kind"] == "managed_list" for item in targets)
     url_targets = sum(
-        item["kind"].startswith("url") for item in targets
+        item["kind"].startswith(("url", "youtube")) for item in targets
     )
     parts: list[str] = []
     if websites:
@@ -3748,7 +3748,13 @@ class RuleEditor:
         self.application_paths.remove(path)
         self._render_applications()
 
-    _URL_KINDS = ("url_path", "url_wildcard", "url_keyword")
+    _URL_KINDS = (
+        "url_path",
+        "url_wildcard",
+        "url_keyword",
+        "youtube_video",
+        "youtube_channel",
+    )
 
     def _add_url_target(self) -> None:
         kinds = self._URL_KINDS
@@ -3783,6 +3789,8 @@ class RuleEditor:
             "url_path": "path",
             "url_wildcard": "wildcard",
             "url_keyword": "keyword",
+            "youtube_video": "YouTube video",
+            "youtube_channel": "YouTube channel",
         }
         for entry in self.url_targets:
             row = Gtk.ListBoxRow()

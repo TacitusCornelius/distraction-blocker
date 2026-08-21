@@ -7,9 +7,12 @@
  * `node --test`.
  *
  * Matching contract (mirrors distraction_blocker.model validation):
- * - url_path:    hostname equal (case-insensitive) AND path exactly equal.
- * - url_wildcard: hostname equal AND path starts with the stored prefix.
- * - url_keyword:  keyword occurs anywhere in the full lowercase URL.
+ * - url_path:       hostname equal (case-insensitive) AND path exactly equal.
+ * - url_wildcard:   hostname equal AND path starts with the stored prefix.
+ * - url_keyword:    keyword occurs anywhere in the full lowercase URL.
+ * - youtube_video:  video ID equal on any YouTube host (watch, shorts,
+ *                   embed, live).
+ * - youtube_channel: @handle or UC channel ID in the URL path.
  */
 "use strict";
 
@@ -25,6 +28,51 @@ export function split_target(value) {
   };
 }
 
+const YOUTUBE_HOSTS = new Set([
+  "youtube.com",
+  "www.youtube.com",
+  "m.youtube.com",
+  "music.youtube.com",
+  "youtube-nocookie.com",
+  "www.youtube-nocookie.com",
+]);
+/**
+ * Extract a video ID or channel reference from a YouTube URL.
+ * Handles watch?v=, /shorts/, /embed/, /live/, /@handle and /channel/UC….
+ */
+export function youtube_fields(parsed) {
+  const host = parsed.hostname.toLowerCase();
+  if (!YOUTUBE_HOSTS.has(host)) {
+    return null;
+  }
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  let youtube_video = parsed.searchParams.get("v");
+  if (
+    !youtube_video &&
+    (segments[0] === "shorts" ||
+      segments[0] === "embed" ||
+      segments[0] === "live")
+  ) {
+    youtube_video = segments[1] ?? null;
+  }
+  let youtube_channel = null;
+  if (segments[0] === "channel") {
+    youtube_channel = segments[1] ?? null;
+  } else if (segments[0]?.startsWith("@")) {
+    youtube_channel = segments[0];
+  }
+  return {
+    host,
+    path: parsed.pathname,
+    href: parsed.href.toLowerCase(),
+    youtube_video:
+      youtube_video && /^[A-Za-z0-9_-]{11}$/.test(youtube_video)
+        ? youtube_video
+        : null,
+    youtube_channel: youtube_channel ? youtube_channel.toLowerCase() : null,
+  };
+}
+
 /** Normalize a request URL into the fields matchers compare against. */
 export function describe_url(raw) {
   let parsed;
@@ -33,11 +81,15 @@ export function describe_url(raw) {
   } catch {
     return null;
   }
-  return {
-    host: parsed.hostname.toLowerCase(),
-    path: parsed.pathname,
-    href: parsed.href.toLowerCase(),
-  };
+  return (
+    youtube_fields(parsed) ?? {
+      host: parsed.hostname.toLowerCase(),
+      path: parsed.pathname,
+      href: parsed.href.toLowerCase(),
+      youtube_video: null,
+      youtube_channel: null,
+    }
+  );
 }
 
 function matches(target, url) {
@@ -70,6 +122,21 @@ export function compile(rules) {
       for (const target of rule.targets) {
         if (target.kind === "url_keyword") {
           if (url.href.includes(target.value)) {
+            return { rule_id: rule.id, kind: target.kind, value: target.value };
+          }
+          continue;
+        }
+        if (target.kind === "youtube_video") {
+          if (url.youtube_video !== null && url.youtube_video === target.value) {
+            return { rule_id: rule.id, kind: target.kind, value: target.value };
+          }
+          continue;
+        }
+        if (target.kind === "youtube_channel") {
+          if (
+            url.youtube_channel !== null &&
+            url.youtube_channel === target.value.toLowerCase()
+          ) {
             return { rule_id: rule.id, kind: target.kind, value: target.value };
           }
           continue;

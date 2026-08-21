@@ -149,6 +149,20 @@ def _url_keyword(value: Any, label: str) -> str:
         )
     return raw
 
+
+def _youtube_video_id(value: Any, label: str) -> str:
+    raw = _string(value, label).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", raw):
+        _error("bad_value", f"{label} must be an 11-character video ID")
+    return raw
+
+
+def _youtube_channel(value: Any, label: str) -> str:
+    raw = _string(value, label).strip()
+    if not re.fullmatch(r"(@[A-Za-z0-9._-]{3,30}|UC[A-Za-z0-9_-]{22})", raw):
+        _error("bad_value", f"{label} must be a @handle or a UC channel ID")
+    return raw
+
 @dataclass(frozen=True)
 class Target:
     kind: str
@@ -165,6 +179,8 @@ class Target:
             "url_path",
             "url_wildcard",
             "url_keyword",
+            "youtube_video",
+            "youtube_channel",
         }:
             _error("bad_value", "target kind is not supported")
         value = obj.get("value")
@@ -180,6 +196,10 @@ class Target:
             )
         elif kind == "url_keyword":
             value = _url_keyword(value, "URL keyword target")
+        elif kind == "youtube_video":
+            value = _youtube_video_id(value, "YouTube video target")
+        elif kind == "youtube_channel":
+            value = _youtube_channel(value, "YouTube channel target")
         else:
             value = _string(value, "target value")
             if not os.path.isabs(value):

@@ -192,5 +192,35 @@ class UrlTargetTests(unittest.TestCase):
         self.assertEqual(Policy.from_dict(policy.to_dict()), policy)
 
 
+class YoutubeTargetTests(unittest.TestCase):
+    def test_youtube_target_kinds_validate(self):
+        good = Target.from_dict(
+            {"kind": "youtube_video", "value": "dQw4w9WgXcQ"}
+        )
+        self.assertEqual(good.value, "dQw4w9WgXcQ")
+        channel = Target.from_dict(
+            {"kind": "youtube_channel", "value": "@Example.Handle"}
+        )
+        self.assertEqual(channel.value, "@Example.Handle")
+        channel_id = Target.from_dict(
+            {"kind": "youtube_channel", "value": "UC" + "a1_-" * 5 + "ab"}
+        )
+        self.assertEqual(len(channel_id.value), 24)
+        bad = (
+            ("youtube_video", "short"),
+            ("youtube_video", "waytoolongvideo"),
+            ("youtube_channel", "@no"),
+            ("youtube_channel", "UC" + "*" * 22),
+        )
+        for kind, value in bad:
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    Target.from_dict({"kind": kind, "value": value})
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
 if __name__ == "__main__":
     unittest.main()

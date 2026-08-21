@@ -1,10 +1,11 @@
 /**
- * Background event page: policy link and request blocking.
+ * Background event page: policy link, request blocking, tab blocking.
  *
  * Policy flows one way. The service authors rules; this script fetches them
  * through the root-owned native messaging host, compiles them with
  * engine.compile, and cancels matching loads. Denied loads are batched and
- * reported back as observational statistics.
+ * reported back as observational statistics. Inactive-tab blocking is a
+ * local toggle; its counts never reach the service.
  */
 "use strict";
 
@@ -12,11 +13,32 @@
 
 const HOST_NAME = "org.distraction_blocker.extension";
 const REFRESH_MS = 5 * 60 * 1000;
+const INACTIVE_KEY = "inactive-tab";
 
 let match = compile([]);
 let last_error = "No policy loaded yet.";
 let last_refresh_ms = 0;
+let block_inactive = false;
 const pending_denials = new Map(); // "rule_id\u0000value" -> count
+
+browser.storage.local.get("block_inactive").then((stored) => {
+  block_inactive = stored.block_inactive === true;
+});
+
+browser.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && "block_inactive" in changes) {
+    block_inactive = changes.block_inactive.newValue === true;
+  }
+});
+
+function denial_snapshot() {
+  return Object.fromEntries(
+    [...pending_denials].map(([key, count]) => [
+      key.replaceAll("\u0000", " → "),
+      count,
+    ]),
+  );
+}
 
 function record_state(error) {
   last_error = error;
@@ -25,12 +47,7 @@ function record_state(error) {
       policy_ok: error === null,
       last_error,
       last_refresh_ms,
-      denials: Object.fromEntries(
-        [...pending_denials].map(([key, count]) => [
-          key.replaceAll("\u0000", " → "),
-          count,
-        ]),
-      ),
+      denials: denial_snapshot(),
     });
   } catch {
     // A closed event page loses nothing that matters; the next refresh rewrites it.
@@ -71,18 +88,19 @@ function host_request(message) {
 }
 
 async function flush_denials() {
-  if (pending_denials.size === 0) {
+  // Only rule-matched denials travel to the service; inactive-tab counts are
+  // local because they carry no rule ID.
+  const reportable = [...pending_denials].filter(
+    ([key]) => !key.startsWith(INACTIVE_KEY),
+  );
+  if (reportable.length === 0) {
     return;
   }
-  const entries = [];
-  for (const [key, count] of pending_denials.splice(0)) {
+  const entries = reportable.map(([key, count]) => {
     const cut = key.indexOf("\u0000");
-    entries.push({
-      rule_id: key.slice(0, cut),
-      value: key.slice(cut + 1),
-      count,
-    });
-  }
+    return { rule_id: key.slice(0, cut), value: key.slice(cut + 1), count };
+  });
+  pending_denials.clear();
   // Breadcrumb: cap each report so one message stays far below the native
   // messaging frame limit.
   const response = await host_request({
@@ -90,10 +108,12 @@ async function flush_denials() {
     entries: entries.slice(0, 128),
   });
   if (!(response && response.ok)) {
-    // Put the counts back so a transient failure is not lost silently.
     for (const entry of entries) {
       const key = `${entry.rule_id}\u0000${entry.value}`;
-      pending_denials.set(key, (pending_denials.get(key) ?? 0) + entry.count);
+      pending_denials.set(
+        key,
+        (pending_denials.get(key) ?? 0) + entry.count,
+      );
     }
     record_state(
       `Denial report refused: ${response.error.code}: ${response.error.message}`,
@@ -118,19 +138,35 @@ async function refresh() {
   }
 }
 
+/** True when the tab holding this request is not the visible tab. */
+async function tab_is_inactive(tabId) {
+  try {
+    const tab = await browser.tabs.get(tabId);
+    return tab.active === false;
+  } catch {
+    return false;
+  }
+}
+
 browser.webRequest.onBeforeRequest.addListener(
-  (details) => {
+  async (details) => {
     if (details.tabId === -1 || !details.url.startsWith("http")) {
       return {};
     }
     const hit = match(details.url);
-    if (hit === null) {
-      return {};
+    if (hit !== null) {
+      const key = `${hit.rule_id}\u0000${hit.value}`;
+      pending_denials.set(key, (pending_denials.get(key) ?? 0) + 1);
+      record_state(null);
+      return { cancel: true };
     }
-    const key = `${hit.rule_id}\u0000${hit.value}`;
-    pending_denials.set(key, (pending_denials.get(key) ?? 0) + 1);
-    record_state(null);
-    return { cancel: true };
+    if (block_inactive && (await tab_is_inactive(details.tabId))) {
+      const key = `${INACTIVE_KEY}\u0000${details.url.slice(0, 200)}`;
+      pending_denials.set(key, (pending_denials.get(key) ?? 0) + 1);
+      record_state(null);
+      return { cancel: true };
+    }
+    return {};
   },
   { urls: ["<all_urls>"] },
   ["blocking"],
@@ -141,12 +177,8 @@ browser.runtime.onMessage.addListener((_message) => {
     policy_ok: last_error === null,
     last_error,
     last_refresh_ms,
-    denials: Object.fromEntries(
-      [...pending_denials].map(([key, count]) => [
-        key.replaceAll("\u0000", " → "),
-        count,
-      ]),
-    ),
+    block_inactive,
+    denials: denial_snapshot(),
   });
 });
 
