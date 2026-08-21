@@ -23,11 +23,16 @@ SOCKET = "/run/distraction-blocker/control.sock"
 
 # Breadcrumb for reviewers: the allowlist lives in this root-owned file so
 # a compromised extension cannot read protected state or change policy.
-ALLOWED_COMMANDS = frozenset({
+READONLY_COMMANDS = frozenset({
     "status",
     "list_rules",
     "list_denial_stats",
+    "list_website_stats",
 })
+# Commands that carry payload fields; the field set is still pinned here.
+FIELD_COMMANDS = {
+    "report_website_denials": frozenset({"command", "entries"}),
+}
 
 
 def read_message(stream) -> dict | None:
@@ -57,13 +62,23 @@ def send_message(stream, message: dict) -> None:
 
 def handle(request: dict) -> dict:
     command = request.get("command")
-    if command not in ALLOWED_COMMANDS or set(request) != {"command"}:
+    fields = set(request)
+    allowed = (
+        command in READONLY_COMMANDS
+        and fields == {"command"}
+        or command in FIELD_COMMANDS
+        and fields <= FIELD_COMMANDS[command]
+    )
+    if not allowed:
         return {
             "ok": False,
-            "error": {"code": "forbidden", "message": "command is not allowed"},
+            "error": {
+                "code": "forbidden",
+                "message": "command is not allowed",
+            },
         }
     try:
-        result = Client(SOCKET).request(command)
+        result = Client(SOCKET).request(**request)
     except Exception as error:  # noqa: BLE001 - the browser sees one JSON shape
         return {
             "ok": False,

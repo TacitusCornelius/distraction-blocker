@@ -338,4 +338,184 @@ class DenialBuffer:
         return self._queue.qsize()
 
 
-__all__ = ["MAX_COUNT", "MAX_PATHS", "MAX_QUEUE_SIZE", "MAX_STATE_BYTES", "DenialBuffer", "DenialEvent", "DenialStat", "StatisticsState", "canonical_path"]
+
+
+@dataclass(frozen=True, slots=True)
+class WebsiteDenialStat:
+    """One aggregated website-denial row keyed by matched target value.
+
+    The value is the target text the service itself authored (for example
+    ``example.com/feed`` or a keyword); the extension only echoes it back.
+    """
+
+    value: str
+    count: int
+    first_utc: str
+    last_utc: str
+    rule_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.value, str)
+            or not self.value
+            or len(self.value) > 512
+            or any(not 0x20 < ord(char) < 0x7F for char in self.value)
+        ):
+            raise ValueError("website denial value is invalid")
+        if isinstance(self.count, bool) or not isinstance(self.count, int):
+            raise TypeError("statistics count must be an integer")
+        if self.count < 1 or self.count > MAX_COUNT:
+            raise ValueError("statistics count is out of range")
+        first = _utc_text(self.first_utc)
+        last = _utc_text(self.last_utc)
+        if _time_key(first) > _time_key(last):
+            raise ValueError("first statistics time is after last statistics time")
+        object.__setattr__(self, "first_utc", first)
+        object.__setattr__(self, "last_utc", last)
+        object.__setattr__(self, "rule_ids", _rule_ids(self.rule_ids))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "value": self.value,
+            "count": self.count,
+            "first_utc": self.first_utc,
+            "last_utc": self.last_utc,
+            "rule_ids": list(self.rule_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "WebsiteDenialStat":
+        if not isinstance(data, Mapping) or set(data) != {
+            "value",
+            "count",
+            "first_utc",
+            "last_utc",
+            "rule_ids",
+        }:
+            raise ValueError("website statistics row has an invalid shape")
+        if not isinstance(data["rule_ids"], list):
+            raise ValueError("statistics rule_ids must be a list")
+        return cls(
+            data["value"],
+            data["count"],
+            data["first_utc"],
+            data["last_utc"],
+            tuple(data["rule_ids"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WebsiteDenialState:
+    """Bounded snapshot of website denials reported by the extension."""
+
+    items: tuple[WebsiteDenialStat, ...] = ()
+    dropped: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.items, tuple):
+            object.__setattr__(self, "items", tuple(self.items))
+        if len(self.items) > MAX_PATHS:
+            raise ValueError("website statistics state has too many entries")
+        if (
+            isinstance(self.dropped, bool)
+            or not isinstance(self.dropped, int)
+            or not 0 <= self.dropped <= MAX_COUNT
+        ):
+            raise ValueError("statistics dropped count is invalid")
+        rows: list[WebsiteDenialStat] = []
+        seen: set[str] = set()
+        for row in self.items:
+            if not isinstance(row, WebsiteDenialStat):
+                raise TypeError("website rows must be WebsiteDenialStat values")
+            if row.value in seen:
+                raise ValueError("website statistics state has duplicate values")
+            seen.add(row.value)
+            rows.append(row)
+        rows.sort(key=lambda row: row.value)
+        total = sum(_row_bytes(row) for row in rows)
+        # Breadcrumb: eviction mirrors StatisticsState so both signed files
+        # share one bound discipline.
+        while total > MAX_STATE_BYTES:
+            if len(rows) == 1:
+                raise ValueError(
+                    "website statistics row exceeds the state byte budget"
+                )
+            victim = min(
+                range(len(rows)),
+                key=lambda i: (_time_key(rows[i].last_utc), rows[i].value),
+            )
+            total -= _row_bytes(rows[victim])
+            rows.pop(victim)
+        object.__setattr__(self, "items", tuple(rows))
+
+    @classmethod
+    def empty(cls) -> "WebsiteDenialState":
+        return cls()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"items": [row.to_dict() for row in self.items], "dropped": self.dropped}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "WebsiteDenialState":
+        if not isinstance(data, Mapping) or set(data) != {"items", "dropped"}:
+            raise ValueError("website statistics state has an invalid shape")
+        if not isinstance(data["items"], list):
+            raise ValueError("website statistics items must be a list")
+        return cls(
+            tuple(WebsiteDenialStat.from_dict(row) for row in data["items"]),
+            data["dropped"],
+        )
+
+    def record(
+        self,
+        value: str,
+        rule_id: str,
+        now: datetime | str | None = None,
+        *,
+        times: int = 1,
+    ) -> "WebsiteDenialState":
+        """Return a state with ``times`` denials merged for ``value``."""
+        if isinstance(times, bool) or not isinstance(times, int) or times < 1:
+            raise ValueError("denial count is invalid")
+        stamp = _utc_text(now)
+        index = next(
+            (i for i, row in enumerate(self.items) if row.value == value), None
+        )
+        if index is None:
+            if len(self.items) >= MAX_PATHS:
+                victim = min(
+                    range(len(self.items)),
+                    key=lambda i: (_time_key(self.items[i].last_utc), self.items[i].value),
+                )
+                remaining = self.items[:victim] + self.items[victim + 1 :]
+                return WebsiteDenialState(remaining, self.dropped).record(
+                    value, rule_id, stamp, times=times
+                )
+            row = WebsiteDenialStat(value, times, stamp, stamp, (rule_id,))
+            return WebsiteDenialState((*self.items, row), self.dropped)
+        old = self.items[index]
+        updated = WebsiteDenialStat(
+            old.value,
+            min(MAX_COUNT, old.count + times),
+            min(old.first_utc, stamp, key=_time_key),
+            max(old.last_utc, stamp, key=_time_key),
+            old.rule_ids + _rule_ids(rule_id),
+        )
+        rows = list(self.items)
+        rows[index] = updated
+        return WebsiteDenialState(tuple(rows), self.dropped)
+
+
+__all__ = [
+    "MAX_COUNT",
+    "MAX_PATHS",
+    "MAX_QUEUE_SIZE",
+    "MAX_STATE_BYTES",
+    "DenialBuffer",
+    "DenialEvent",
+    "DenialStat",
+    "StatisticsState",
+    "WebsiteDenialState",
+    "WebsiteDenialStat",
+    "canonical_path",
+]

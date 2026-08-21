@@ -17,7 +17,7 @@ from typing import Any, Iterable
 from .control import ControlError, ControlState, RuleLock
 from .model import ManagedList, Policy, Rule, ValidationError
 from .schedule_view import ScheduleViewError, project_daily_schedule
-from .statistics import DenialBuffer, StatisticsState
+from .statistics import DenialBuffer, StatisticsState, WebsiteDenialState
 
 
 def _authorization_now() -> float:
@@ -57,6 +57,7 @@ class BlockerService:
         self.policy: Policy | None = None
         self.controls = ControlState.empty()
         self._statistics = StatisticsState.empty()
+        self._website_statistics = WebsiteDenialState.empty()
         self._statistics_dirty = False
         self._last_statistics_persist = time.monotonic()
         self._last_statistics_error: str | None = None
@@ -150,6 +151,15 @@ class BlockerService:
             # policy health or change a fanotify decision.
             self._statistics = StatisticsState.empty()
 
+    def _load_website_statistics(self) -> None:
+        try:
+            loaded = self.store.load_website_statistics()
+            if isinstance(loaded, WebsiteDenialState):
+                self._website_statistics = loaded
+        except Exception:
+            # Observational data can never degrade policy health.
+            self._website_statistics = WebsiteDenialState.empty()
+
     @staticmethod
     def _event_path(event) -> str:
         return os.path.realpath(os.path.abspath(os.fspath(
@@ -241,6 +251,7 @@ class BlockerService:
             return
         self.store.initialize()
         self._load_statistics()
+        self._load_website_statistics()
         loaded = self.store.load()
         self.policy = getattr(loaded, "policy", loaded)
         self.controls = getattr(loaded, "controls", ControlState.empty())
@@ -1141,6 +1152,10 @@ class BlockerService:
         "delete_rule": ((frozenset({"command", "rule_id"}),), "rule_id is required", "_cmd_delete_rule"),
         "set_enabled": ((frozenset({"command", "rule_id", "enabled"}),), "rule_id and enabled are required", "_cmd_set_enabled"),
         "clear_clock_latch": ((frozenset({"command"}),), "unknown command field", "_cmd_clear_clock_latch"),
+        # Breadcrumb: website statistics are observational, so reporting and
+        # listing stay available even when enforcement is unhealthy.
+        "list_website_stats": ((frozenset({"command"}),), "unknown command field", "_cmd_list_website_stats"),
+        "report_website_denials": ((frozenset({"command", "entries"}),), "entries is required", "_cmd_report_website_denials"),
     }
 
     # Refused while enforcement is unhealthy. The gate runs before field
@@ -1211,6 +1226,56 @@ class BlockerService:
         return self._set_rule_lock(
             uid, request["rule_id"], request["lock"]
         )
+
+    def _cmd_list_website_stats(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._ok(self._website_statistics.to_dict())
+
+    def _cmd_report_website_denials(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        entries = request["entries"]
+        if not isinstance(entries, list) or not entries or len(entries) > 128:
+            return self._error(
+                "bad_request", "entries must be a list of 1 to 128 items"
+            )
+        stamp = self._now()
+        state = self._website_statistics
+        try:
+            for entry in entries:
+                if not isinstance(entry, dict) or set(entry) != {
+                    "rule_id",
+                    "value",
+                    "count",
+                }:
+                    raise ValidationError("bad_value", "entry fields are invalid")
+                rule_id = entry["rule_id"]
+                value = entry["value"]
+                count = entry["count"]
+                if (
+                    isinstance(rule_id, bool)
+                    or not isinstance(rule_id, str)
+                    or isinstance(value, bool)
+                    or not isinstance(value, str)
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                ):
+                    raise ValidationError("bad_type", "entry types are invalid")
+                # Breadcrumb: record() revalidates the value bounds and the
+                # canonical UUID form, so a hostile client cannot widen the
+                # signed statistics file beyond its budget.
+                try:
+                    state = state.record(value, rule_id, stamp, times=count)
+                except (TypeError, ValueError) as error:
+                    raise ValidationError("bad_value", str(error)) from error
+        except ValidationError as error:
+            return self._error(error.code, error.message)
+        accepted = len(state.items)
+        dropped = state.dropped
+        self._website_statistics = state
+        try:
+            self.store.save_website_statistics(state)
+        except Exception:
+            # Observational writes never block or fail the report.
+            pass
+        return self._ok({"accepted": accepted, "dropped": dropped})
 
     def _cmd_begin_rule_authorization(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         return self._begin_rule_authorization(

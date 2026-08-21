@@ -76,6 +76,48 @@ class NativeHostTests(unittest.TestCase):
         fields = host_entry.handle({"command": "status", "extra": 1})
         self.assertEqual(fields["error"]["code"], "forbidden")
 
+    def test_handle_forwards_report_with_fields(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "host_entry",
+            Path(__file__).resolve().parent.parent
+            / "packaging"
+            / "host_entry.py",
+        )
+        host_entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(host_entry)
+        seen = {}
+
+        def fake_request(self, **request):
+            seen.update(request)
+            return {"accepted": 1, "dropped": 0}
+
+        with patch.object(
+            host_entry,
+            "Client",
+            lambda socket_path: type(
+                "C", (), {"request": fake_request}
+            )(),
+        ):
+            forwarded = host_entry.handle({
+                "command": "report_website_denials",
+                "entries": [{
+                    "rule_id": "12345678-1234-5678-1234-567812345678",
+                    "value": "example.com/feed",
+                    "count": 2,
+                }],
+            })
+        self.assertTrue(forwarded["ok"])
+        self.assertEqual(seen["command"], "report_website_denials")
+        self.assertEqual(len(seen["entries"]), 1)
+        widened = host_entry.handle({
+            "command": "report_website_denials",
+            "entries": [],
+            "extra": True,
+        })
+        self.assertEqual(widened["error"]["code"], "forbidden")
+
     def test_message_framing_round_trip(self) -> None:
         import io
         import struct

@@ -13,7 +13,11 @@ from distraction_blocker.model import ManagedList, Policy, Rule
 from distraction_blocker.rpc import Client, RpcServer
 from distraction_blocker.service import BlockerService
 from distraction_blocker.transfer import native_export_text
-from distraction_blocker.statistics import DenialBuffer, StatisticsState
+from distraction_blocker.statistics import (
+    DenialBuffer,
+    StatisticsState,
+    WebsiteDenialState,
+)
 
 
 class FakeClock:
@@ -39,9 +43,32 @@ class FakeStore:
         self.policy = policy
         self.controls = controls or ControlState.empty()
         self.statistics = statistics or StatisticsState.empty()
+        self.website_statistics = WebsiteDenialState.empty()
         self.statistics_saves = []
         self.fail_statistics = False
         self.fail_policy = False
+
+    def initialize(self):
+        return None
+
+    def load_statistics(self):
+        return self.statistics
+
+    def save_statistics(self, state):
+        if self.fail_statistics:
+            raise OSError("statistics storage unavailable")
+        self.statistics = state
+        self.statistics_saves.append(state)
+        return None
+
+    def load_website_statistics(self):
+        return self.website_statistics
+
+    def save_website_statistics(self, state):
+        if self.fail_statistics:
+            raise OSError("statistics storage unavailable")
+        self.website_statistics = state
+        return None
 
     def initialize(self):
         return None
@@ -927,6 +954,64 @@ class ServiceTests(unittest.TestCase):
         service.tick()
         result = service.dispatch(1000, {"command": "list_denial_stats"})
         self.assertEqual(result["result"], {"items": [], "dropped": 0})
+
+    def test_website_denial_reports_merge_and_persist(self) -> None:
+        service = BlockerService(
+            FakeStore(Policy(0, ())), FakeClock(), FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        first = service.dispatch(1000, {
+            "command": "report_website_denials",
+            "entries": [
+                {
+                    "rule_id": "12345678-1234-5678-1234-567812345678",
+                    "value": "example.com/feed",
+                    "count": 3,
+                },
+                {"kind": "url_keyword", "value": "casino"},
+            ],
+        })
+        self.assertEqual(first["error"]["code"], "bad_value")
+        second = service.dispatch(1000, {
+            "command": "report_website_denials",
+            "entries": [
+                {
+                    "rule_id": "12345678-1234-5678-1234-567812345678",
+                    "value": "example.com/feed",
+                    "count": 3,
+                },
+                {
+                    "rule_id": "22222222-2222-4222-8222-222222222222",
+                    "value": "casino",
+                    "count": 1,
+                },
+            ],
+        })
+        self.assertTrue(second["ok"])
+        again = service.dispatch(1000, {
+            "command": "report_website_denials",
+            "entries": [{
+                "rule_id": "12345678-1234-5678-1234-567812345678",
+                "value": "example.com/feed",
+                "count": 2,
+            }],
+        })
+        self.assertTrue(again["ok"])
+        listed = service.dispatch(1000, {"command": "list_website_stats"})
+        rows = {row["value"]: row for row in listed["result"]["items"]}
+        self.assertEqual(rows["example.com/feed"]["count"], 5)
+        self.assertEqual(rows["casino"]["count"], 1)
+        self.assertEqual(
+            len(rows["example.com/feed"]["rule_ids"]),
+            1,
+        )
+        saved = service.store.website_statistics
+        self.assertEqual(saved, service._website_statistics)
+        self.assertEqual(
+            next(r for r in saved.items if r.value == "example.com/feed").count,
+            5,
+        )
 
     def test_friction_authorization_treats_non_ascii_as_incorrect(self):
         rule = Rule.from_dict({

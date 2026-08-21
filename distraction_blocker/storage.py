@@ -15,7 +15,7 @@ from typing import Any
 from .canonical import CanonicalError, format_utc, parse_utc
 from .control import ControlState
 from .model import Policy, ValidationError
-from .statistics import StatisticsState
+from .statistics import StatisticsState, WebsiteDenialState
 
 
 class StorageError(RuntimeError):
@@ -37,6 +37,7 @@ class ProtectedStore:
     PRIMARY_NAME = "policy.json"
     BACKUP_NAME = "policy.json.bak"
     STATISTICS_NAME = "statistics.json"
+    WEBSITE_STATISTICS_NAME = "website-statistics.json"
     MAX_POLICY_BYTES = 16 * 1024 * 1024
     MAX_STATISTICS_BYTES = 1024 * 1024
 
@@ -56,6 +57,10 @@ class ProtectedStore:
     @property
     def statistics_path(self) -> Path:
         return self.directory / self.STATISTICS_NAME
+
+    @property
+    def website_statistics_path(self) -> Path:
+        return self.directory / self.WEBSITE_STATISTICS_NAME
 
     def initialize(self) -> None:
         if self.directory.exists() and self.directory.is_symlink():
@@ -189,6 +194,34 @@ class ProtectedStore:
             return StatisticsState.from_dict(payload)
         except (TypeError, ValueError, KeyError) as exc:
             raise StorageError("statistics payload is invalid") from exc
+
+    def save_website_statistics(self, state: WebsiteDenialState) -> None:
+        """Atomically save website denials into their own signed file."""
+        self.initialize()
+        content = self._statistics_envelope(state)
+        if len(content) > self.MAX_STATISTICS_BYTES:
+            raise StorageError("website statistics file is too large")
+        self._atomic_write(self.website_statistics_path, content)
+
+    def load_website_statistics(self) -> WebsiteDenialState:
+        """Load signed website statistics, or an empty state when absent."""
+        self.initialize()
+        path = self.website_statistics_path
+        if not path.exists():
+            return WebsiteDenialState.empty()
+        if path.is_symlink() or not path.is_file():
+            raise StorageError("website statistics path is not a regular file")
+        if path.stat().st_size > self.MAX_STATISTICS_BYTES:
+            raise StorageError("website statistics file is too large")
+        try:
+            envelope = json.loads(path.read_bytes().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StorageError("website statistics file is invalid") from exc
+        _, payload = self._verify_envelope(envelope, {1}, "website statistics")
+        try:
+            return WebsiteDenialState.from_dict(payload)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise StorageError("website statistics payload is invalid") from exc
 
 
     def _atomic_write(self, path: Path, content: bytes) -> None:
