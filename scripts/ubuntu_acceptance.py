@@ -193,7 +193,7 @@ def add_active_weekly_rule() -> str:
     return rule_id
 
 
-def add_v13_state() -> None:
+def add_v13_state(owner_uid: int) -> None:
     now = datetime.now(timezone.utc)
     client = installed_client()
     for rule_id, name in (
@@ -238,20 +238,39 @@ def add_v13_state() -> None:
             "password": "acceptance secret",
         },
     )
-    challenge = client.request(
-        "begin_rule_authorization", rule_id=PASSWORD_LOCK_RULE
-    )
-    from distraction_blocker.rpc import RpcError
-    try:
-        client.request(
-            "complete_rule_authorization",
-            rule_id=PASSWORD_LOCK_RULE,
-            challenge_id=challenge["challenge_id"],
-            response="incorrect secret",
-        )
-    except RpcError as error:
-        if error.code != "invalid_password":
-            raise
+    # Breadcrumb: the service treats uid 0 as outside the lock boundary, so
+    # a root client is refused authorization by design. Exercise the
+    # begin/complete flow as the desktop user, exactly like the GUI does.
+    account = pwd.getpwuid(owner_uid)
+    probe = "\n".join((
+        "import sys",
+        "sys.path.insert(0, '/usr/lib/distraction-blocker')",
+        "from distraction_blocker.rpc import Client, RpcError",
+        f"client = Client('{SOCKET}')",
+        f"rule_id = '{PASSWORD_LOCK_RULE}'",
+        "challenge = client.request('begin_rule_authorization', rule_id=rule_id)",
+        "try:",
+        "    client.request(",
+        "        'complete_rule_authorization',",
+        "        rule_id=rule_id,",
+        "        challenge_id=challenge['challenge_id'],",
+        "        response='incorrect secret',",
+        "    )",
+        "except RpcError as error:",
+        "    if error.code != 'invalid_password':",
+        "        raise SystemExit(error.code)",
+        "else:",
+        "    raise SystemExit('the wrong password was accepted')",
+    ))
+    command([
+        "/usr/sbin/runuser",
+        "-u",
+        account.pw_name,
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        probe,
+    ])
     client.request(
         "put_rule",
         rule={
@@ -503,7 +522,7 @@ def phase_one(source_root: Path, owner_uid: int, reboot: bool) -> None:
     make_test_executable()
     add_active_rule()
     add_active_weekly_rule()
-    add_v13_state()
+    add_v13_state(owner_uid)
     check_domain_block()
     check_domain_block(TEST_WEEKLY_DOMAIN)
     check_domain_block(TEST_POMODORO_DOMAIN)
