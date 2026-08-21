@@ -106,6 +106,49 @@ def _uuid(value: Any, label: str) -> str:
     return text.lower()
 
 
+def _url_target_value(value: Any, label: str, *, wildcard: bool) -> str:
+    """Validate one ``host/path`` URL target; the host is canonicalized."""
+    # Breadcrumb for reviewers: the extension matches this text against real
+    # URLs, so only visible ASCII without query or fragment parts is kept,
+    # and the hostname goes through the same IDNA form as website targets.
+    raw = _string(value, label).strip()
+    if (
+        not raw
+        or len(raw) > 512
+        or any(ord(char) < 0x21 or ord(char) > 0x7E for char in raw)
+        or any(char in raw for char in '"\\<>`')
+    ):
+        _error("bad_value", f"{label} is not a valid URL target")
+    if "?" in raw or "#" in raw:
+        _error("bad_value", f"{label} cannot contain a query or fragment")
+    host_part, separator, _path_part = raw.partition("/")
+    if not separator:
+        _error("bad_value", f"{label} needs a path after the hostname")
+    host = _hostname(host_part, label)
+    if wildcard:
+        if raw.count("*") != 1 or not raw.endswith("*"):
+            _error(
+                "bad_value",
+                f"{label} must end with exactly one * wildcard",
+            )
+    elif "*" in raw:
+        _error("bad_value", f"{label} cannot contain a * wildcard")
+    return host + raw[len(host_part):]
+
+
+def _url_keyword(value: Any, label: str) -> str:
+    raw = _string(value, label).strip().lower()
+    if (
+        len(raw) < 2
+        or len(raw) > 64
+        or any(ord(char) < 0x21 or ord(char) > 0x7E for char in raw)
+    ):
+        _error(
+            "bad_value",
+            f"{label} must contain 2 to 64 visible ASCII characters",
+        )
+    return raw
+
 @dataclass(frozen=True)
 class Target:
     kind: str
@@ -115,13 +158,28 @@ class Target:
     def from_dict(cls, data: Mapping[str, Any]) -> "Target":
         obj = _object(data, {"kind", "value"}, "target")
         kind = _string(obj.get("kind"), "target kind")
-        if kind not in {"website", "application", "managed_list"}:
+        if kind not in {
+            "website",
+            "application",
+            "managed_list",
+            "url_path",
+            "url_wildcard",
+            "url_keyword",
+        }:
             _error("bad_value", "target kind is not supported")
         value = obj.get("value")
         if kind == "website":
             value = _hostname(value)
         elif kind == "managed_list":
             value = _uuid(value, "managed-list target value")
+        elif kind == "url_path":
+            value = _url_target_value(value, "URL path target", wildcard=False)
+        elif kind == "url_wildcard":
+            value = _url_target_value(
+                value, "URL wildcard target", wildcard=True
+            )
+        elif kind == "url_keyword":
+            value = _url_keyword(value, "URL keyword target")
         else:
             value = _string(value, "target value")
             if not os.path.isabs(value):

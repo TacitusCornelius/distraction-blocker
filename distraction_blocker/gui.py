@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import IntEnum
 from types import ModuleType
@@ -215,6 +215,9 @@ class RuleForm:
     pomodoro_work_minutes: int = 25
     pomodoro_break_minutes: int = 5
     pomodoro_cycles: int = 4
+    # Breadcrumb: the editor has no URL fields yet, so these carried values
+    # keep an edit from silently dropping extension-enforced targets.
+    url_targets: tuple[dict[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -350,6 +353,9 @@ def form_to_rule(
             targets.append(
                 Target.from_dict({"kind": "managed_list", "value": list_id.strip()})
             )
+    for entry in form.url_targets:
+        if entry:
+            targets.append(Target.from_dict(entry))
     if not targets:
         raise FormError("Add at least one target.")
 
@@ -454,6 +460,17 @@ def form_to_request(
 
 def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
     """Convert a model rule to editor values."""
+    form = _rule_to_form_fields(rule, timezone_name)
+    url_targets = tuple(
+        {"kind": item["kind"], "value": item["value"]}
+        for item in rule.to_dict()["targets"]
+        if item["kind"].startswith("url")
+    )
+    return replace(form, url_targets=url_targets)
+
+
+def _rule_to_form_fields(rule: Rule, timezone_name: str) -> RuleForm:
+    """Convert schedule and classic target fields to editor values."""
     data = rule.to_dict()
     websites = tuple(
         item["value"] for item in data["targets"] if item["kind"] == "website"
@@ -1289,6 +1306,9 @@ def _target_summary(rule: Rule) -> str:
     websites = sum(item["kind"] == "website" for item in targets)
     applications = sum(item["kind"] == "application" for item in targets)
     managed_lists = sum(item["kind"] == "managed_list" for item in targets)
+    url_targets = sum(
+        item["kind"].startswith("url") for item in targets
+    )
     parts: list[str] = []
     if websites:
         parts.append(f"{websites} website" + ("s" if websites != 1 else ""))
@@ -1298,6 +1318,8 @@ def _target_summary(rule: Rule) -> str:
         parts.append(
             f"{managed_lists} managed list" + ("s" if managed_lists != 1 else "")
         )
+    if url_targets:
+        parts.append(f"{url_targets} URL rule" + ("s" if url_targets != 1 else ""))
     return ", ".join(parts)
 
 

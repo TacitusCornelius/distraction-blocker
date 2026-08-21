@@ -37,6 +37,7 @@ from distraction_blocker.gui import (
     duplicate_rule,
     filter_rules,
     form_to_request,
+    _target_summary,
     friction_lock_request,
     import_preview_text,
     load_gtk,
@@ -316,6 +317,30 @@ class FormConversionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(FormError, "Add at least one target"):
             form_to_request(form, id_factory=lambda: UUID(RULE_ID))
+
+    def test_rule_round_trip_keeps_url_targets(self) -> None:
+        rule = make_rule(
+            targets=[
+                {"kind": "website", "value": "example.com"},
+                {"kind": "url_path", "value": "example.com/feed"},
+                {"kind": "url_wildcard", "value": "example.com/vid/*"},
+                {"kind": "url_keyword", "value": "casino"},
+            ],
+        )
+
+        form = rule_to_form(rule, "UTC")
+        rebuilt = form_to_request(form, id_factory=lambda: UUID(RULE_ID))
+
+        self.assertEqual(
+            form.url_targets,
+            (
+                {"kind": "url_path", "value": "example.com/feed"},
+                {"kind": "url_wildcard", "value": "example.com/vid/*"},
+                {"kind": "url_keyword", "value": "casino"},
+            ),
+        )
+        self.assertEqual(rebuilt["rule"], rule.to_dict())
+        self.assertIn("3 URL rules", _target_summary(rule))
 
 
 class StoredRuleEditorTests(unittest.TestCase):

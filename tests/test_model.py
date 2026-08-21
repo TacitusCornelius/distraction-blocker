@@ -133,5 +133,64 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(Policy.from_dict(policy.to_dict()), policy)
 
 
+
+
+class UrlTargetTests(unittest.TestCase):
+    def test_url_target_kinds_canonicalize_and_round_trip(self):
+        cases = (
+            ({"kind": "url_path", "value": "Example.COM/feed"},
+             {"kind": "url_path", "value": "example.com/feed"}),
+            ({"kind": "url_path", "value": "example.com/"},
+             {"kind": "url_path", "value": "example.com/"}),
+            ({"kind": "url_wildcard", "value": "example.com/vid/*"},
+             {"kind": "url_wildcard", "value": "example.com/vid/*"}),
+            ({"kind": "url_keyword", "value": "  Casino "},
+             {"kind": "url_keyword", "value": "casino"}),
+        )
+        for raw, expected in cases:
+            with self.subTest(value=raw["value"]):
+                target = Target.from_dict(raw)
+                self.assertEqual(target.to_dict(), expected)
+                self.assertEqual(Target.from_dict(target.to_dict()), target)
+
+    def test_url_target_rejects_invalid_values(self):
+        bad = (
+            {"kind": "url_path", "value": "example.com"},
+            {"kind": "url_path", "value": "example.com/a?x=1"},
+            {"kind": "url_path", "value": "example.com/a#top"},
+            {"kind": "url_path", "value": "example.com/a*"},
+            {"kind": "url_path", "value": "example.com/sp ace"},
+            {"kind": "url_wildcard", "value": "*.example.com/*"},
+            {"kind": "url_wildcard", "value": "example.com/*a*"},
+            {"kind": "url_wildcard", "value": "example.com/vid"},
+            {"kind": "url_keyword", "value": "a"},
+            {"kind": "url_keyword", "value": "two words"},
+            {"kind": "url_keyword", "value": "x" * 65},
+        )
+        for data in bad:
+            with self.subTest(value=data["value"]):
+                with self.assertRaises(ValidationError):
+                    Target.from_dict(data)
+
+    def test_policy_round_trips_url_targets(self):
+        policy = Policy.from_dict({
+            "revision": 1,
+            "rules": [{
+                "id": "12345678-1234-5678-1234-567812345678",
+                "name": "URL",
+                "enabled": True,
+                "targets": [
+                    {"kind": "url_path", "value": "example.com/feed"},
+                    {"kind": "url_wildcard", "value": "example.com/v/*"},
+                    {"kind": "url_keyword", "value": "casino"},
+                ],
+                "schedule": {"kind": "indefinite"},
+                "revision": 0,
+            }],
+            "managed_lists": [],
+        })
+        self.assertEqual(Policy.from_dict(policy.to_dict()), policy)
+
+
 if __name__ == "__main__":
     unittest.main()
