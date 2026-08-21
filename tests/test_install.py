@@ -47,5 +47,67 @@ class InstallerSecurityTests(unittest.TestCase):
                 install.check_cli_collision()
 
 
+class NativeHostTests(unittest.TestCase):
+    def test_handle_allowlist_forwards_and_refuses(self) -> None:
+        import io
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "host_entry",
+            Path(__file__).resolve().parent.parent
+            / "packaging"
+            / "host_entry.py",
+        )
+        host_entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(host_entry)
+
+        with patch.object(
+            host_entry,
+            "Client",
+            lambda socket_path: type(
+                "C", (), {"request": lambda self, command: {"healthy": True}}
+            )(),
+        ):
+            allowed = host_entry.handle({"command": "status"})
+            self.assertTrue(allowed["ok"])
+            self.assertEqual(allowed["result"], {"healthy": True})
+        denied = host_entry.handle({"command": "delete_rule"})
+        self.assertFalse(denied["ok"])
+        fields = host_entry.handle({"command": "status", "extra": 1})
+        self.assertEqual(fields["error"]["code"], "forbidden")
+
+    def test_message_framing_round_trip(self) -> None:
+        import io
+        import struct
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "host_entry",
+            Path(__file__).resolve().parent.parent
+            / "packaging"
+            / "host_entry.py",
+        )
+        host_entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(host_entry)
+
+        message = {"ok": True, "result": {"items": [1, 2, 3]}}
+        outgoing = io.BytesIO()
+        host_entry.send_message(outgoing, message)
+        encoded = outgoing.getvalue()
+        (length,) = struct.unpack("@I", encoded[:4])
+        self.assertEqual(length, len(encoded) - 4)
+
+        class Stream:
+            def __init__(self, data: bytes) -> None:
+                self._data = io.BytesIO(data)
+
+            def read(self, count: int) -> bytes:
+                return self._data.read(count)
+
+        wrapper = Stream(encoded)
+        self.assertEqual(host_entry.read_message(wrapper), message)
+        self.assertIsNone(host_entry.read_message(Stream(b"")))
+
+
 if __name__ == "__main__":
     unittest.main()

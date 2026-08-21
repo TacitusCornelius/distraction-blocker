@@ -246,6 +246,23 @@ def install_files(source_root: Path, owner_uid: int) -> None:
                 "org.distraction_blocker.App.desktop",
                 DESKTOP,
             )
+            copy_asset(
+                packaging_fd,
+                "host_entry.py",
+                PREFIX / "host_entry.py",
+                0o755,
+            )
+            # Breadcrumb: Firefox and LibreWolf each read only their own
+            # system-wide native-messaging directory, so both get the manifest.
+            for browser_dir in (
+                Path("/usr/lib/mozilla/native-messaging-hosts"),
+                Path("/usr/lib/librewolf/native-messaging-hosts"),
+            ):
+                copy_asset(
+                    packaging_fd,
+                    "org.distraction_blocker.firefox.json",
+                    browser_dir / "org.distraction_blocker.firefox.json",
+                )
         finally:
             os.close(packaging_fd)
             os.close(package_fd)

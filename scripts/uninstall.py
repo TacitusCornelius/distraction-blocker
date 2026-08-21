@@ -18,6 +18,13 @@ UNIT = Path("/etc/systemd/system/distraction-blocker.service")
 DESKTOP = Path("/usr/share/applications/org.distraction_blocker.App.desktop")
 LEGACY_DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
 CLI_PATH = Path("/usr/local/bin/distraction-blocker")
+NATIVE_MANIFESTS = tuple(
+    Path(directory) / "org.distraction_blocker.firefox.json"
+    for directory in (
+        "/usr/lib/mozilla/native-messaging-hosts",
+        "/usr/lib/librewolf/native-messaging-hosts",
+    )
+)
 POLICY_FILES = ("hmac.key", "policy.json", "policy.json.bak", "statistics.json")
 MARKER_NAME = "INSTALLATION"
 MARKER_TEXT = "distraction-blocker\n"
@@ -69,6 +76,14 @@ def remove_cli() -> None:
     CLI_PATH.unlink()
 
 
+def remove_native_manifests() -> None:
+    for path in NATIVE_MANIFESTS:
+        if path.is_symlink():
+            fail(f"refusing to remove a symlink at {path}")
+        if path.is_file():
+            path.unlink()
+
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Remove Distraction Blocker")
@@ -103,7 +118,8 @@ def main() -> int:
             if path.is_file():
                 path.unlink()
         run_systemctl(["daemon-reload"])
-
+        remove_cli()
+        remove_native_manifests()
         if PREFIX.is_symlink():
             fail("refusing to remove a symlink at the install path")
         if PREFIX.exists():

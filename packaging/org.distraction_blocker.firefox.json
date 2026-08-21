@@ -1,0 +1,7 @@
+{
+  "name": "org.distraction_blocker.extension",
+  "description": "Distraction Blocker policy link between the browser extension and the root service",
+  "path": "/usr/lib/distraction-blocker/host_entry.py",
+  "type": "stdio",
+  "allowed_extensions": ["{e4f1a2b3-9c8d-4e5f-a6b7-8c9d0e1f2a3b}"]
+}
