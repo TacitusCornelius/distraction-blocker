@@ -3362,6 +3362,7 @@ class RuleEditor:
             save,
         )
         self.application_paths: list[str] = []
+        self.url_targets: list[dict[str, str]] = []
         self.weekly_rows: list[WeeklyPeriodRow] = []
         local_now = datetime.now(ZoneInfo(timezone_name))
         self.default_one_start, self.default_one_end = default_one_time_window(local_now)
@@ -3465,8 +3466,39 @@ class RuleEditor:
         outer.append(app_row)
         self.application_list = Gtk.ListBox()
         self.application_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.application_list.add_css_class("boxed-list")
         outer.append(self.application_list)
+
+        url_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
+        )
+        url_label = Gtk.Label(label="URL rules")
+        url_label.set_xalign(0)
+        url_label.set_hexpand(True)
+        url_row.append(url_label)
+        self.url_kind_dropdown = Gtk.DropDown.new_from_strings(
+            ("Exact path", "Wildcard path", "Keyword")
+        )
+        self.url_kind_dropdown.set_selected(0)
+        url_row.append(self.url_kind_dropdown)
+        outer.append(url_row)
+        self.url_entry = Gtk.Entry()
+        self.url_entry.set_hexpand(True)
+        self.url_entry.set_placeholder_text("example.com/path or keyword")
+        # Breadcrumb: Enter in this field adds the URL rule; submitting the
+        # whole form from here surprised testers.
+        self.url_entry.connect(
+            "activate", lambda _entry: self._add_url_target()
+        )
+        outer.append(self.url_entry)
+        self.url_add_button = Gtk.Button.new_with_mnemonic("Add _URL rule")
+        self.url_add_button.connect(
+            "clicked", lambda _button: self._add_url_target()
+        )
+        outer.append(self.url_add_button)
+        self.url_list = Gtk.ListBox()
+        self.url_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.url_list.add_css_class("boxed-list")
+        outer.append(self.url_list)
 
         list_label = Gtk.Label(label="Managed lists")
         list_label.set_xalign(0)
@@ -3716,6 +3748,76 @@ class RuleEditor:
         self.application_paths.remove(path)
         self._render_applications()
 
+    _URL_KINDS = ("url_path", "url_wildcard", "url_keyword")
+
+    def _add_url_target(self) -> None:
+        kinds = self._URL_KINDS
+        selected = self.url_kind_dropdown.get_selected()
+        kind = kinds[selected] if selected < len(kinds) else kinds[0]
+        value = self.url_entry.get_text().strip()
+        if not value:
+            self.error_label.set_text("Enter a URL rule first.")
+            return
+        try:
+            target = Target.from_dict({"kind": kind, "value": value})
+        except ValidationError as error:
+            self.error_label.set_text(error.message)
+            return
+        entry = target.to_dict()
+        if entry in self.url_targets:
+            self.error_label.set_text("That URL rule is already in the list.")
+            return
+        self.url_targets.append(entry)
+        self.url_entry.set_text("")
+        self.error_label.set_text("")
+        self._render_url_targets()
+
+    def _render_url_targets(self) -> None:
+        Gtk = self.Gtk
+        child = self.url_list.get_first_child()
+        while child is not None:
+            next_child = child.get_next_sibling()
+            self.url_list.remove(child)
+            child = next_child
+        kind_labels = {
+            "url_path": "path",
+            "url_wildcard": "wildcard",
+            "url_keyword": "keyword",
+        }
+        for entry in self.url_targets:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
+            )
+            for method in (
+                box.set_margin_top,
+                box.set_margin_bottom,
+                box.set_margin_start,
+                box.set_margin_end,
+            ):
+                method(int(Space.COMPACT))
+            label = Gtk.Label(
+                label=f"[{kind_labels[entry['kind']]}] {entry['value']}"
+            )
+            label.set_xalign(0)
+            label.set_ellipsize(3)
+            label.set_hexpand(True)
+            box.append(label)
+            remove = Gtk.Button.new_with_mnemonic("_Remove")
+            remove.set_tooltip_text(f"Remove {entry['value']}")
+            remove.connect(
+                "clicked",
+                lambda _button, item=dict(entry): self._remove_url_target(item),
+            )
+            box.append(remove)
+            row.set_child(box)
+            self.url_list.append(row)
+
+    def _remove_url_target(self, entry: dict[str, str]) -> None:
+        if entry in self.url_targets:
+            self.url_targets.remove(entry)
+        self._render_url_targets()
+
     def _choose_domain_import(self) -> None:
         Gtk = self.Gtk
         chooser = Gtk.FileChooserNative.new(
@@ -3811,6 +3913,7 @@ class RuleEditor:
             pomodoro_work_minutes=self.pomodoro_work.get_value_as_int(),
             pomodoro_break_minutes=self.pomodoro_break.get_value_as_int(),
             pomodoro_cycles=self.pomodoro_cycles.get_value_as_int(),
+            url_targets=tuple(self.url_targets),
         )
 
     def _submit(self) -> None:
@@ -3837,6 +3940,8 @@ class RuleEditor:
         self.website_view.get_buffer().set_text("\n".join(form.websites))
         self.application_paths = list(form.applications)
         self._render_applications()
+        self.url_targets = list(form.url_targets)
+        self._render_url_targets()
         for list_id in form.managed_list_ids:
             check = self.managed_list_checks.get(list_id)
             if check is not None:

@@ -374,6 +374,8 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor.website_view = TextView()
         editor.application_paths = []
         editor._render_applications = lambda: None
+        editor.url_targets = []
+        editor._render_url_targets = lambda: None
         editor.managed_list_checks = {}
         editor.schedule_dropdown = Dropdown()
         editor.schedule_stack = Stack()
@@ -429,6 +431,9 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor.website_view = TextView()
         editor.application_paths = []
         editor._render_applications = lambda: None
+        editor.url_targets = []
+        editor._render_url_targets = lambda: None
+
         editor.managed_list_checks = {}
         editor.schedule_dropdown = Dropdown()
         editor.schedule_stack = Stack()
@@ -455,6 +460,58 @@ class StoredRuleEditorTests(unittest.TestCase):
         self.assertEqual(editor.pomodoro_work.value, 50)
         self.assertEqual(editor.pomodoro_break.value, 8)
         self.assertEqual(editor.pomodoro_cycles.value, 5)
+
+    def test_add_url_target_validates_and_deduplicates(self) -> None:
+        class Entry:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def get_text(self) -> str:
+                return self.value
+
+            def set_text(self, value: str) -> None:
+                self.value = value
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def set_text(self, value: str) -> None:
+                self.text = value
+
+        class Dropdown:
+            def __init__(self, selected: int) -> None:
+                self.value = selected
+
+            def get_selected(self) -> int:
+                return self.value
+
+        editor = RuleEditor.__new__(RuleEditor)
+        editor.url_entry = Entry()
+        editor.error_label = Label()
+        editor.url_kind_dropdown = Dropdown(0)
+        editor.url_targets = []
+        editor._render_url_targets = lambda: None
+
+        editor.url_entry.set_text("example.com/feed")
+        editor._add_url_target()
+        self.assertEqual(
+            editor.url_targets,
+            [{"kind": "url_path", "value": "example.com/feed"}],
+        )
+        self.assertEqual(editor.url_entry.value, "")
+
+        editor.url_kind_dropdown = Dropdown(0)
+        editor.url_entry.set_text("Example.COM/feed")
+        editor._add_url_target()
+        self.assertEqual(len(editor.url_targets), 1)
+        self.assertIn("already in the list", editor.error_label.text)
+
+        editor.url_kind_dropdown = Dropdown(2)
+        editor.url_entry.set_text("a")
+        editor._add_url_target()
+        self.assertEqual(len(editor.url_targets), 1)
+        self.assertIn("2 to 64", editor.error_label.text)
 
 
 class ScheduleProjectionTests(unittest.TestCase):
