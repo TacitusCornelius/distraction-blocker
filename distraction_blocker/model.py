@@ -10,6 +10,9 @@ import uuid
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from . import canonical
+from .canonical import CanonicalError
+
 
 class ValidationError(ValueError):
     """A policy value does not satisfy the public policy schema."""
@@ -57,21 +60,16 @@ def _integer(value: Any, label: str, *, minimum: int | None = None, maximum: int
 
 
 def _utc_datetime(value: Any, label: str) -> datetime:
-    if isinstance(value, datetime):
-        parsed = value
-    else:
-        text = _string(value, label)
-        try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
+    try:
+        return canonical.parse_utc(value)
+    except CanonicalError as error:
+        if error.reason == canonical.REASON_ISO:
             _error("bad_value", f"{label} must be an ISO UTC time")
-    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         _error("bad_value", f"{label} must be an aware UTC time")
-    return parsed.astimezone(timezone.utc).replace(tzinfo=timezone.utc)
 
 
 def _utc_text(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return canonical.format_utc(value)
 
 
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")

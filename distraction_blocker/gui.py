@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .categories import starter_categories
 from .model import ManagedList, Policy, Rule, Schedule, Target, ValidationError
+from .canonical import CanonicalError, canonical_uuid, parse_utc
 from .preferences import THEMES, load_theme, save_theme
 from .rpc import Client
 from .transfer import (
@@ -606,15 +607,10 @@ def managed_list_summaries_from_results(
     return tuple(summaries)
 
 def _canonical_uuid(value: object, message: str) -> str:
-    if not isinstance(value, str):
-        raise FormError(message)
     try:
-        parsed = UUID(value)
-    except ValueError as error:
-        raise FormError(message) from error
-    if str(parsed) != value:
+        return canonical_uuid(value)
+    except CanonicalError:
         raise FormError(message)
-    return value
 
 
 def _optional_utc_result(value: object, message: str) -> datetime | None:
@@ -623,12 +619,9 @@ def _optional_utc_result(value: object, message: str) -> datetime | None:
     if not isinstance(value, str):
         raise FormError(message)
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise FormError(message) from error
-    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        return parse_utc(value)
+    except CanonicalError:
         raise FormError(message)
-    return parsed.astimezone(UTC)
 
 
 def lock_summaries_from_results(

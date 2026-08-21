@@ -13,8 +13,17 @@ import os
 from pathlib import Path
 import queue
 import threading
-import uuid
 from typing import Any, Iterable, Mapping
+
+from .canonical import (
+    REASON_ISO,
+    REASON_TYPE,
+    REASON_UUID,
+    CanonicalError,
+    canonical_uuid,
+    format_utc,
+    parse_utc,
+)
 
 MAX_QUEUE_SIZE = 1024
 MAX_PATHS = 256
@@ -27,23 +36,19 @@ MAX_STATE_BYTES = 768 * 1024
 
 def _utc_text(value: datetime | str | None) -> str:
     if value is None:
-        parsed = datetime.now(timezone.utc)
-    elif isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError("statistics time is invalid") from exc
-    else:
+        value = datetime.now(timezone.utc)
+    if not isinstance(value, (datetime, str)):
         raise TypeError("statistics time must be an aware UTC datetime or ISO string")
-    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
-        raise ValueError("statistics time must be aware UTC")
-    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    try:
+        return format_utc(value)
+    except CanonicalError as error:
+        if error.reason == REASON_ISO:
+            raise ValueError("statistics time is invalid") from error
+        raise ValueError("statistics time must be aware UTC") from error
 
 
 def _time_key(value: str) -> datetime:
-    return datetime.fromisoformat(value[:-1] + "+00:00")
+    return parse_utc(value)
 
 
 def _bounded_absolute_path(value: str | os.PathLike[str]) -> str:
@@ -75,16 +80,12 @@ def _rule_ids(value: Iterable[str] | str | None) -> tuple[str, ...]:
         raise TypeError("rule_ids must be a sequence of strings")
     result: set[str] = set()
     for rule_id in value:
-        if not isinstance(rule_id, str):
-            raise TypeError("rule id must be a UUID string")
         try:
-            parsed = uuid.UUID(rule_id)
-        except ValueError as error:
-            raise ValueError("rule id must be a UUID") from error
-        normalized = str(parsed)
-        if normalized != rule_id.lower():
-            raise ValueError("rule id must be a canonical UUID")
-        result.add(normalized)
+            result.add(canonical_uuid(rule_id))
+        except CanonicalError as error:
+            if error.reason in (REASON_TYPE, REASON_UUID):
+                raise ValueError("rule id must be a UUID") from error
+            raise ValueError("rule id must be a canonical UUID") from error
     return tuple(sorted(result))
 
 

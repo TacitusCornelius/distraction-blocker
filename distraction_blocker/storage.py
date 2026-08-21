@@ -12,6 +12,7 @@ import secrets
 import tempfile
 from typing import Any
 
+from .canonical import CanonicalError, format_utc, parse_utc
 from .control import ControlState
 from .model import Policy, ValidationError
 from .statistics import StatisticsState
@@ -118,9 +119,10 @@ class ProtectedStore:
     def _format_utc(value: datetime | None) -> str | None:
         if value is None:
             return None
-        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta(0):
-            raise StorageError("high-water time must be aware UTC")
-        return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        try:
+            return format_utc(value)
+        except CanonicalError as error:
+            raise StorageError("high-water time must be aware UTC") from error
 
     @staticmethod
     def _parse_utc(value: Any) -> datetime | None:
@@ -129,12 +131,9 @@ class ProtectedStore:
         if not isinstance(value, str):
             raise StorageError("high-water time is invalid")
         try:
-            parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-        except ValueError as exc:
-            raise StorageError("high-water time is invalid") from exc
-        if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
-            raise StorageError("high-water time is invalid")
-        return parsed.astimezone(timezone.utc).replace(tzinfo=timezone.utc)
+            return parse_utc(value)
+        except CanonicalError as error:
+            raise StorageError("high-water time is invalid") from error
 
     def _envelope(self, policy: Policy, controls: ControlState, high_water_utc: datetime | None, clock_untrusted: bool) -> bytes:
         payload = {"policy": policy.to_dict(), "controls": controls.to_dict(), "clock_untrusted": bool(clock_untrusted), "high_water_utc": self._format_utc(high_water_utc)}

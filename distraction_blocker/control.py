@@ -10,8 +10,10 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import secrets
-from datetime import datetime, timedelta, timezone
-import uuid
+from datetime import datetime, timedelta
+
+from . import canonical
+from .canonical import CanonicalError
 from typing import Any, Mapping
 
 SCRYPT_N = 1 << 14
@@ -25,39 +27,31 @@ PASSWORD_MAX_BYTES = 1024
 class ControlError(ValueError):
     """A control value does not satisfy the protected control schema."""
 
-
 def _utc(value: Any, label: str) -> datetime:
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-        except ValueError as exc:
-            raise ControlError(f"{label} must be an ISO UTC time") from exc
-    else:
-        raise ControlError(f"{label} must be an aware UTC time")
-    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
-        raise ControlError(f"{label} must be an aware UTC time")
-    return parsed.astimezone(timezone.utc).replace(tzinfo=timezone.utc)
+    try:
+        return canonical.parse_utc(value)
+    except CanonicalError as error:
+        if error.reason == canonical.REASON_ISO:
+            raise ControlError(f"{label} must be an ISO UTC time") from error
+        raise ControlError(f"{label} must be an aware UTC time") from error
 
 
 def _utc_text(value: datetime | None) -> str | None:
     if value is None:
         return None
-    return _utc(value, "UTC time").isoformat(timespec="microseconds").replace("+00:00", "Z")
+    try:
+        return canonical.format_utc(value)
+    except CanonicalError as error:
+        raise ControlError("UTC time must be an aware UTC time") from error
 
 
 def _rule_id(value: Any) -> str:
-    if not isinstance(value, str):
-        raise ControlError("rule_id must be a UUID")
     try:
-        parsed = uuid.UUID(value)
-    except (ValueError, AttributeError) as exc:
-        raise ControlError("rule_id must be a UUID") from exc
-    normalized = str(parsed)
-    if normalized != value.lower():
-        raise ControlError("rule_id must be a canonical UUID")
-    return normalized
+        return canonical.canonical_uuid(value)
+    except CanonicalError as error:
+        if error.reason in (canonical.REASON_TYPE, canonical.REASON_UUID):
+            raise ControlError("rule_id must be a UUID") from error
+        raise ControlError("rule_id must be a canonical UUID") from error
 
 
 def _password_bytes(value: Any) -> bytes:

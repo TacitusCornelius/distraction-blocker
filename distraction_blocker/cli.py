@@ -13,9 +13,9 @@ import getpass as _getpass
 import json
 import sys
 from typing import Any
-from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .canonical import CanonicalError, canonical_uuid
 from .rpc import Client, RpcError
 
 UTC = timezone.utc
@@ -201,12 +201,9 @@ def _utc_expiry(value: str, timezone_name: str) -> str:
 
 def _rule_id(value: str) -> str:
     try:
-        parsed = UUID(value)
-    except (AttributeError, TypeError, ValueError) as error:
+        return canonical_uuid(value, normalize=True)
+    except CanonicalError as error:
         raise ValueError("rule ID is not valid") from error
-    if str(parsed) != value.lower():
-        raise ValueError("rule ID is not valid")
-    return value.lower()
 
 
 def _password(value: str) -> str:
