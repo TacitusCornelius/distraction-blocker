@@ -138,19 +138,42 @@ Notifications only report observed state. They never control enforcement.
 
 ## Version 1.3
 
-Version 1.3 can add stricter sessions and activity features.
+Version 1.3 is built. It adds stricter sessions and observational activity data.
 
-- Timed edit locks.
-- Password locks with root-owned password hashes.
-- Random-text friction locks.
-- Pomodoro work and break periods.
-- Application denial statistics.
-- Public command-line client.
-- Multi-user policy research.
+### Rule locks
 
-Random text adds friction. It is not a security boundary.
+The root service enforces timed, friction, and password locks.
 
-Usage-based allowances need foreground activity data. A fixed manual timer does not prove that the user viewed a blocked item.
+- A timed lock can last up to 366 days.
+- An untrusted clock keeps a timed lock effective.
+- A friction challenge uses 12 service-generated characters.
+- A password uses a root-owned scrypt hash.
+- Failed password attempts add a persisted delay of up to 64 seconds.
+- Friction and password grants are memory-only, single-use, and valid for 60 seconds.
+
+Random text adds friction. It is not a security boundary. Root remains outside the lock boundary.
+
+### Pomodoro
+
+A Pomodoro rule stores one UTC anchor. It supports 1 to 180 work minutes, 1 to 60 break minutes, and 1 to 20 cycles.
+
+The service derives each phase from trusted UTC. GUI exit and reboot do not reset it.
+
+### Application denial statistics
+
+Fanotify reports a denial only after it sends `FAN_DENY`. A bounded queue moves observational work to the service thread.
+
+The signed statistics file stores at most 256 application paths. The queue holds at most 1,024 pending events.
+
+Statistics count denied starts. They do not measure foreground use or time spent.
+
+### Public command-line client
+
+The installed `distraction-blocker` command uses the existing owner-checked Unix socket. Password input is hidden and never enters an argument.
+
+### Multi-user policy research
+
+[`MULTI-USER-RESEARCH.md`](MULTI-USER-RESEARCH.md) recommends one explicit machine-wide owner policy. Version 1.3 does not add multi-user enforcement.
 
 ## Browser extension version
 

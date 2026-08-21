@@ -145,8 +145,12 @@ _RESPONSE = struct.Struct("<iI")
 
 
 class FanotifyEnforcer:
-    def __init__(self, path_provider):
+    def __init__(self, path_provider, denial_buffer=None):
         self.path_provider = path_provider
+        # Breadcrumb: the listener only publishes after a successful deny.
+        # The bounded buffer keeps statistics work off the fanotify thread.
+        self.denial_buffer = denial_buffer
+        self._rule_ids_provider = lambda _path: ()
         self._fd: int | None = None
         self._mounts: list[str] = []
         self._blocked: set[str] = set()
@@ -157,6 +161,25 @@ class FanotifyEnforcer:
         os.set_blocking(self._wake_r, False)
         os.set_blocking(self._wake_w, False)
         self._libc = ctypes.CDLL(None, use_errno=True)
+
+    def set_denial_buffer(self, denial_buffer) -> None:
+        self.denial_buffer = denial_buffer
+
+    def set_rule_ids_provider(self, provider) -> None:
+        self._rule_ids_provider = (
+            provider if callable(provider) else lambda _path: ()
+        )
+
+    def _record_denial(self, path: str) -> None:
+        buffer = self.denial_buffer
+        if buffer is None:
+            return
+        try:
+            rule_ids = tuple(self._rule_ids_provider(path))
+            buffer.record(path, rule_ids)
+        except Exception:
+            # Observational statistics must never affect enforcement health.
+            return
 
     @property
     def healthy(self) -> bool:
@@ -236,9 +259,9 @@ class FanotifyEnforcer:
                 raise
         self._blocked = blocked
 
-    def _respond(self, event_fd: int, allow: bool) -> None:
+    def _respond(self, event_fd: int, allow: bool) -> bool:
         if self._fd is None:
-            return
+            return False
         payload = _RESPONSE.pack(event_fd, FAN_ALLOW if allow else FAN_DENY)
         view = memoryview(payload)
         while view:
@@ -246,6 +269,7 @@ class FanotifyEnforcer:
             if count <= 0:
                 raise OSError(errno.EIO, "fanotify response failed")
             view = view[count:]
+        return True
 
     def _handle_event(self, event: bytes) -> None:
         event_len, version, _reserved, metadata_len, mask, event_fd, _pid = _METADATA.unpack_from(event)
@@ -259,7 +283,10 @@ class FanotifyEnforcer:
             try:
                 target = os.path.realpath(os.readlink(f"/proc/self/fd/{event_fd}"))
                 allow = not (mask & FAN_OPEN_EXEC_PERM) or target not in self._blocked
-                self._respond(event_fd, allow)
+                responded = self._respond(event_fd, allow)
+                # FAN_DENY must reach fanotify before this best-effort publish.
+                if not allow and responded:
+                    self._record_denial(target)
             finally:
                 os.close(event_fd)
 
@@ -275,12 +302,14 @@ class FanotifyEnforcer:
             offset += event_len
         return data[offset:]
 
+
     def _run(self) -> None:
         buffer = bytearray()
         while self._fd is not None and not self._closed:
             try:
                 ready, _, _ = select.select([self._fd, self._wake_r], [], [], 1.0)
             except (OSError, ValueError):
+                self._healthy = False
                 break
             if self._wake_r in ready:
                 try:

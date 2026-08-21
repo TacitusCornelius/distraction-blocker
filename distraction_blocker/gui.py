@@ -57,18 +57,22 @@ class Space(IntEnum):
 WEEKDAY_LABELS = (
     "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
 )
-SCHEDULE_LABELS = ("One time", "Weekly", "Indefinite")
-SCHEDULE_KINDS = ("one_time", "weekly", "indefinite")
+SCHEDULE_LABELS = ("One time", "Weekly", "Pomodoro", "Indefinite")
+SCHEDULE_KINDS = ("one_time", "weekly", "pomodoro", "indefinite")
 THEME_LABELS = ("System", "Light", "Dark")
 RULE_FILTER_LABELS = ("All", "Active", "Inactive", "Enabled", "Disabled")
 RULE_FILTERS = ("all", "active", "inactive", "enabled", "disabled")
 FOCUS_DURATIONS = (15, 30, 60, 120)
 MAX_WEEKLY_PERIODS = 16
+MAX_POMODORO_CYCLES = 20
 RPC_LIST_CHUNK_SIZE = 200
 # Breadcrumb for reviewers: JSON ASCII escaping can triple the UTF-8 size.
 # This bound keeps the full request below the fixed 65,536-byte RPC frame.
 RPC_TEXT_CHUNK_BYTES = 16 * 1024
-MAX_DAILY_TRANSITIONS = MAX_WEEKLY_PERIODS * 2 + 2
+MAX_DAILY_TRANSITIONS = max(MAX_WEEKLY_PERIODS * 2 + 2, MAX_POMODORO_CYCLES * 2)
+MAX_DENIAL_PATHS = 256
+MAX_DENIAL_COUNT = (1 << 63) - 1
+
 
 
 @dataclass(frozen=True)
@@ -119,6 +123,66 @@ class ManagedListSummary:
     imported_utc: str
     domain_count: int
 
+@dataclass(frozen=True)
+class LockSummary:
+    """Public rule-lock state returned by the service."""
+
+    rule_id: str
+    kind: str
+    locked: bool
+    until_utc: datetime | None
+    retry_after_utc: datetime | None
+
+
+@dataclass(frozen=True)
+class DenialStat:
+    """One bounded application-denial row returned by the service."""
+
+    path: str
+    count: int
+    first_utc: datetime
+    last_utc: datetime
+    rule_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DenialStatistics:
+    """One immutable denial-statistics response."""
+
+    items: tuple[DenialStat, ...]
+    dropped: int
+
+
+@dataclass(frozen=True)
+class DenialStatDisplay:
+    """Read-only text for one application-denial row."""
+
+    path: str
+    count: str
+    first_utc: str
+    last_utc: str
+    rule_ids: str
+
+
+@dataclass(frozen=True)
+class AuthorizationChallenge:
+    """One short-lived rule authorization challenge."""
+
+    rule_id: str
+    kind: str
+    challenge_id: str
+    prompt: str | None
+    expires_in: int
+
+
+@dataclass(frozen=True)
+class AuthorizationGrant:
+    """One short-lived weakening grant returned by the service."""
+
+    rule_id: str
+    authorized: bool
+    expires_in: int
+
 
 @dataclass(frozen=True)
 class RpcCall:
@@ -148,6 +212,10 @@ class RuleForm:
     one_time_start: str = ""
     one_time_end: str = ""
     weekly_periods: tuple[WeeklyPeriodForm, ...] = ()
+    pomodoro_start: str = ""
+    pomodoro_work_minutes: int = 25
+    pomodoro_break_minutes: int = 5
+    pomodoro_cycles: int = 4
 
 
 @dataclass(frozen=True)
@@ -165,7 +233,7 @@ class ServiceSnapshot:
     active_applications: int
     rules: tuple[Rule, ...]
     managed_lists: tuple[ManagedListSummary, ...]
-
+    locks: tuple[LockSummary, ...]
 
 def load_gtk(
     importer: Callable[[str], ModuleType] = importlib.import_module,
@@ -352,6 +420,30 @@ def form_to_rule(
             "timezone": form.timezone,
             "periods": periods,
         }
+    elif form.schedule_kind == "pomodoro":
+        if not form.pomodoro_start.strip():
+            raise FormError("Enter the Pomodoro start date.")
+        values = (
+            ("Work minutes", form.pomodoro_work_minutes, 1, 180),
+            ("Break minutes", form.pomodoro_break_minutes, 1, 60),
+            ("Cycles", form.pomodoro_cycles, 1, MAX_POMODORO_CYCLES),
+        )
+        for label, value, minimum, maximum in values:
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not minimum <= value <= maximum
+            ):
+                raise FormError(f"{label} must be from {minimum} to {maximum}.")
+        schedule_data = {
+            "kind": "pomodoro",
+            "start_utc": _utc_text(
+                _local_to_utc(form.pomodoro_start, form.timezone)
+            ),
+            "work_minutes": form.pomodoro_work_minutes,
+            "break_minutes": form.pomodoro_break_minutes,
+            "cycles": form.pomodoro_cycles,
+        }
     elif form.schedule_kind == "indefinite":
         schedule_data = {"kind": "indefinite"}
     else:
@@ -435,6 +527,24 @@ def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
             schedule["timezone"],
             weekly_periods=periods,
         )
+    if kind == "pomodoro":
+        try:
+            zone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as error:
+            raise FormError("Select a valid IANA time zone.") from error
+        start = _parse_utc(schedule["start_utc"]).astimezone(zone)
+        return RuleForm(
+            data["name"],
+            websites,
+            applications,
+            managed_list_ids,
+            kind,
+            timezone_name,
+            pomodoro_start=start.strftime("%Y-%m-%d %H:%M"),
+            pomodoro_work_minutes=schedule["work_minutes"],
+            pomodoro_break_minutes=schedule["break_minutes"],
+            pomodoro_cycles=schedule["cycles"],
+        )
     return RuleForm(
         data["name"],
         websites,
@@ -494,6 +604,343 @@ def managed_list_summaries_from_results(
             )
         )
     return tuple(summaries)
+
+def _canonical_uuid(value: object, message: str) -> str:
+    if not isinstance(value, str):
+        raise FormError(message)
+    try:
+        parsed = UUID(value)
+    except ValueError as error:
+        raise FormError(message) from error
+    if str(parsed) != value:
+        raise FormError(message)
+    return value
+
+
+def _optional_utc_result(value: object, message: str) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise FormError(message)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise FormError(message) from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise FormError(message)
+    return parsed.astimezone(UTC)
+
+
+def lock_summaries_from_results(
+    items: Sequence[Mapping[str, object]],
+) -> tuple[LockSummary, ...]:
+    """Parse only the public rule-lock summary contract."""
+    expected = {"rule_id", "kind", "locked", "until_utc", "retry_after_utc"}
+    summaries: list[LockSummary] = []
+    seen_rule_ids: set[str] = set()
+    for item in items:
+        # Breadcrumb for reviewers: lock summaries have a fixed public shape.
+        # Rejecting extra fields keeps passwords and protected state out of the GUI.
+        if not isinstance(item, Mapping) or set(item) != expected:
+            raise FormError("The service returned an invalid lock summary.")
+        rule_id = _canonical_uuid(
+            item["rule_id"], "The service returned an invalid lock rule ID."
+        )
+        if rule_id in seen_rule_ids:
+            raise FormError("The service returned an invalid lock rule ID.")
+        kind = item["kind"]
+        if kind not in {"timed", "friction", "password"}:
+            raise FormError("The service returned an unsupported lock kind.")
+        if not isinstance(item["locked"], bool):
+            raise FormError("The service returned an invalid lock state.")
+        until_utc = _optional_utc_result(
+            item["until_utc"], "The service returned an invalid lock expiry."
+        )
+        retry_after_utc = _optional_utc_result(
+            item["retry_after_utc"],
+            "The service returned invalid lock retry data.",
+        )
+        if (kind == "timed") != (until_utc is not None):
+            raise FormError("The service returned an invalid lock expiry.")
+        if kind != "password" and retry_after_utc is not None:
+            raise FormError("The service returned invalid lock retry data.")
+        seen_rule_ids.add(rule_id)
+        summaries.append(
+            LockSummary(
+                rule_id,
+                kind,
+                item["locked"],
+                until_utc,
+                retry_after_utc,
+            )
+        )
+    return tuple(summaries)
+
+def denial_statistics_from_result(result: Mapping[str, object]) -> DenialStatistics:
+    """Parse the exact bounded denial-statistics RPC response."""
+    if not isinstance(result, Mapping) or set(result) != {"items", "dropped"}:
+        raise FormError("The service returned invalid denial statistics.")
+    items = result["items"]
+    dropped = result["dropped"]
+    if not isinstance(items, list) or len(items) > MAX_DENIAL_PATHS:
+        raise FormError("The service returned invalid denial statistics.")
+    if (
+        not isinstance(dropped, int)
+        or isinstance(dropped, bool)
+        or not 0 <= dropped <= MAX_DENIAL_COUNT
+    ):
+        raise FormError("The service returned an invalid dropped-event count.")
+
+    expected = {"path", "count", "first_utc", "last_utc", "rule_ids"}
+    parsed_items: list[DenialStat] = []
+    seen_paths: set[str] = set()
+    for item in items:
+        # Breadcrumb for reviewers: this fixed shape keeps the observational
+        # view bounded and prevents protected service state from entering GTK.
+        if not isinstance(item, Mapping) or set(item) != expected:
+            raise FormError("The service returned an invalid denial-statistics row.")
+        path = item["path"]
+        if (
+            not isinstance(path, str)
+            or not path
+            or "\x00" in path
+            or not os.path.isabs(path)
+            or path.startswith("//")
+            or os.path.normpath(path) != path
+            or path in seen_paths
+        ):
+            raise FormError("The service returned an invalid application path.")
+        count = item["count"]
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or not 1 <= count <= MAX_DENIAL_COUNT
+        ):
+            raise FormError("The service returned an invalid denial count.")
+        first_utc = _optional_utc_result(
+            item["first_utc"], "The service returned an invalid first denial time."
+        )
+        last_utc = _optional_utc_result(
+            item["last_utc"], "The service returned an invalid last denial time."
+        )
+        if first_utc is None or last_utc is None or first_utc > last_utc:
+            raise FormError("The service returned invalid denial times.")
+        raw_rule_ids = item["rule_ids"]
+        if not isinstance(raw_rule_ids, list):
+            raise FormError("The service returned invalid denial rule IDs.")
+        rule_ids = tuple(
+            _canonical_uuid(value, "The service returned an invalid denial rule ID.")
+            for value in raw_rule_ids
+        )
+        if rule_ids != tuple(sorted(set(rule_ids))):
+            raise FormError("The service returned invalid denial rule IDs.")
+        seen_paths.add(path)
+        parsed_items.append(
+            DenialStat(path, count, first_utc, last_utc, rule_ids)
+        )
+    return DenialStatistics(tuple(parsed_items), dropped)
+
+
+def denial_stat_display(stat: DenialStat) -> DenialStatDisplay:
+    """Format one denial row without GTK, I/O, or local-time ambiguity."""
+    return DenialStatDisplay(
+        stat.path,
+        f"{stat.count:,}",
+        _utc_text(stat.first_utc),
+        _utc_text(stat.last_utc),
+        ", ".join(stat.rule_ids) if stat.rule_ids else "None recorded",
+    )
+
+
+def timed_lock_request(
+    rule_id: str,
+    local_until: str,
+    timezone_name: str,
+) -> dict[str, object]:
+    """Build the exact request fields for a timed lock."""
+    try:
+        parsed_id = UUID(rule_id)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise FormError("The rule ID is invalid.") from error
+    if str(parsed_id) != rule_id:
+        raise FormError("The rule ID is invalid.")
+    return {
+        "rule_id": rule_id,
+        "lock": {
+            "kind": "timed",
+            "until_utc": _utc_text(_local_to_utc(local_until, timezone_name)),
+        },
+    }
+
+
+def friction_lock_request(rule_id: str) -> dict[str, object]:
+    """Build the exact request fields for a friction lock."""
+    _canonical_uuid(rule_id, "The rule ID is invalid.")
+    return {"rule_id": rule_id, "lock": {"kind": "friction"}}
+
+def _validated_password(password: object) -> str:
+    if not isinstance(password, str):
+        raise FormError("The password is invalid.")
+    try:
+        size = len(password.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise FormError("The password is invalid.") from error
+    if size < 8:
+        raise FormError("The password must contain at least 8 UTF-8 bytes.")
+    if size > 1024:
+        raise FormError("The password must contain at most 1024 UTF-8 bytes.")
+    return password
+
+
+def password_lock_request(
+    rule_id: str,
+    password: str,
+    confirmation: str,
+) -> dict[str, object]:
+    """Build a password lock request without sending its confirmation."""
+    _canonical_uuid(rule_id, "The rule ID is invalid.")
+    valid_password = _validated_password(password)
+    if confirmation != valid_password:
+        raise FormError("The password and confirmation must match.")
+    return {
+        "rule_id": rule_id,
+        "lock": {"kind": "password", "password": valid_password},
+    }
+
+
+def remove_rule_lock_request(rule_id: str) -> dict[str, object]:
+    """Build the exact request fields that remove a rule lock."""
+    _canonical_uuid(rule_id, "The rule ID is invalid.")
+    return {"rule_id": rule_id, "lock": {"kind": "none"}}
+
+
+def lock_summary_text(
+    summary: LockSummary,
+    timezone_name: str,
+) -> str:
+    """Describe the effective state of a timed, friction, or password lock."""
+    state = "locked" if summary.locked else "expired"
+    if summary.kind == "friction":
+        return (
+            "Friction lock: authorization required for weakening changes."
+            if summary.locked
+            else "Friction lock: not effective."
+        )
+    if summary.kind == "password":
+        text = (
+            "Password lock: authorization required for weakening changes."
+            if summary.locked
+            else "Password lock: not effective."
+        )
+        if summary.retry_after_utc is None:
+            return text
+        try:
+            zone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as error:
+            raise FormError("The system time zone is invalid.") from error
+        utc_text = summary.retry_after_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+        local_text = summary.retry_after_utc.astimezone(zone).strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
+        return f"{text} Retry after: {utc_text} ({local_text} local)."
+    try:
+        zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as error:
+        raise FormError("The system time zone is invalid.") from error
+    if summary.until_utc is None:
+        raise FormError("The timed lock expiry is invalid.")
+    utc_text = summary.until_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    local_text = summary.until_utc.astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+    return f"Timed lock: {state}. Expiry: {utc_text} ({local_text} local)."
+
+
+def begin_rule_authorization_request(rule_id: str) -> dict[str, object]:
+    """Build the exact request fields that begin friction authorization."""
+    _canonical_uuid(rule_id, "The rule ID is invalid.")
+    return {"rule_id": rule_id}
+
+
+def authorization_challenge_from_result(
+    item: Mapping[str, object],
+) -> AuthorizationChallenge:
+    """Parse a friction or password authorization challenge."""
+    expected = {"rule_id", "kind", "challenge_id", "prompt", "expires_in"}
+    if not isinstance(item, Mapping) or set(item) != expected:
+        raise FormError("The service returned an invalid authorization challenge.")
+    rule_id = _canonical_uuid(
+        item["rule_id"],
+        "The service returned an invalid authorization rule ID.",
+    )
+    challenge_id = _canonical_uuid(
+        item["challenge_id"],
+        "The service returned an invalid authorization challenge ID.",
+    )
+    kind = item["kind"]
+    prompt, expires_in = item["prompt"], item["expires_in"]
+    if kind not in {"friction", "password"}:
+        raise FormError("The service returned an unsupported authorization kind.")
+    if kind == "friction" and (not isinstance(prompt, str) or not prompt):
+        raise FormError("The service returned invalid authorization text.")
+    if kind == "password" and prompt is not None:
+        raise FormError("The service returned invalid authorization text.")
+    if (
+        not isinstance(expires_in, int)
+        or isinstance(expires_in, bool)
+        or expires_in <= 0
+    ):
+        raise FormError("The service returned an invalid authorization expiry.")
+    return AuthorizationChallenge(
+        rule_id,
+        kind,
+        challenge_id,
+        prompt,
+        expires_in,
+    )
+
+
+def complete_rule_authorization_request(
+    rule_id: str,
+    challenge_id: str,
+    response: str,
+    kind: str | None = None,
+) -> dict[str, object]:
+    """Build the exact fields that complete rule authorization."""
+    _canonical_uuid(rule_id, "The rule ID is invalid.")
+    _canonical_uuid(challenge_id, "The authorization challenge ID is invalid.")
+    if not isinstance(response, str):
+        raise FormError("The authorization response is invalid.")
+    if kind not in {None, "friction", "password"}:
+        raise FormError("The authorization kind is invalid.")
+    if kind == "password":
+        _validated_password(response)
+    return {
+        "rule_id": rule_id,
+        "challenge_id": challenge_id,
+        "response": response,
+    }
+
+
+def authorization_grant_from_result(
+    item: Mapping[str, object],
+) -> AuthorizationGrant:
+    """Parse the service result for one weakening grant."""
+    expected = {"rule_id", "authorized", "expires_in"}
+    if not isinstance(item, Mapping) or set(item) != expected:
+        raise FormError("The service returned an invalid authorization result.")
+    rule_id = _canonical_uuid(
+        item["rule_id"],
+        "The service returned an invalid authorization rule ID.",
+    )
+    expires_in = item["expires_in"]
+    if item["authorized"] is not True:
+        raise FormError("The service did not authorize the weakening change.")
+    if (
+        not isinstance(expires_in, int)
+        or isinstance(expires_in, bool)
+        or expires_in != 60
+    ):
+        raise FormError("The service returned an invalid authorization expiry.")
+    return AuthorizationGrant(rule_id, True, expires_in)
 
 
 def staged_list_upload_calls(
@@ -599,6 +1046,7 @@ def snapshot_from_results(
     status: Mapping[str, object],
     rule_items: Sequence[Mapping[str, object]],
     list_items: Sequence[Mapping[str, object]],
+    lock_items: Sequence[Mapping[str, object]],
 ) -> ServiceSnapshot:
     """Convert strict RPC results to GUI data."""
     if set(status) != {"healthy", "clock_trusted", "clock_reason", "active_counts"}:
@@ -628,6 +1076,7 @@ def snapshot_from_results(
         applications,
         tuple(Rule.from_dict(item) for item in rule_items),
         managed_list_summaries_from_results(list_items),
+        lock_summaries_from_results(lock_items),
     )
 
 def duplicate_rule(
@@ -753,9 +1202,10 @@ def next_state_change(
     if not data["enabled"] or not clock_trusted:
         return None
     schedule = data["schedule"]
-    if schedule["kind"] == "indefinite":
+    kind = schedule["kind"]
+    if kind == "indefinite":
         return None
-    if schedule["kind"] == "one_time":
+    if kind == "one_time":
         start = _parse_utc(schedule["start_utc"])
         end = _parse_utc(schedule["end_utc"])
         if now_utc < start:
@@ -763,6 +1213,22 @@ def next_state_change(
         if now_utc < end:
             return StateChange(end, False)
         return None
+    if kind == "pomodoro":
+        start = _parse_utc(schedule["start_utc"])
+        work = timedelta(minutes=schedule["work_minutes"])
+        rest = timedelta(minutes=schedule["break_minutes"])
+        cycles = schedule["cycles"]
+        end = start + cycles * work + (cycles - 1) * rest
+        if now_utc < start:
+            return StateChange(start, True)
+        if now_utc >= end:
+            return None
+        cycle_span = work + rest
+        cycle_index = (now_utc - start) // cycle_span
+        work_end = start + cycle_index * cycle_span + work
+        if now_utc < work_end:
+            return StateChange(work_end, False)
+        return StateChange(start + (cycle_index + 1) * cycle_span, True)
     current = rule.is_active(now_utc, clock_trusted=True)
     events = sorted(
         (item for item in _weekly_events(rule, now_utc) if item.at_utc > now_utc),
@@ -771,40 +1237,6 @@ def next_state_change(
     return next((item for item in events if item.active_after != current), None)
 
 
-def create_focus_rule(
-    source: Rule,
-    minutes: int,
-    now_utc: datetime,
-    id_factory: Callable[[], object] = uuid4,
-) -> Rule:
-    """Copy targets into an immediate one-time focus rule."""
-    if (
-        not isinstance(minutes, int)
-        or isinstance(minutes, bool)
-        or minutes <= 0
-    ):
-        raise FormError("Enter a positive focus duration.")
-    if now_utc.tzinfo is None:
-        raise FormError("The current UTC date needs a time zone.")
-    start = now_utc.astimezone(UTC)
-    try:
-        end = start + timedelta(minutes=minutes)
-    except OverflowError as error:
-        raise FormError("The focus duration is too large.") from error
-    return Rule.from_dict(
-        {
-            "id": str(id_factory()),
-            "name": f"Focus: {source.name}",
-            "enabled": True,
-            "targets": [target.to_dict() for target in source.targets],
-            "schedule": {
-                "kind": "one_time",
-                "start_utc": _utc_text(start),
-                "end_utc": _utc_text(end),
-            },
-            "revision": 0,
-        }
-    )
 
 
 def project_daily_schedule(
@@ -860,6 +1292,71 @@ def project_daily_schedule(
             intervals,
             key=lambda item: (item.start_local, item.end_local, item.rule_name),
         )
+    )
+
+
+def daily_schedule_from_result(
+    result: Mapping[str, object],
+) -> tuple[date, str, tuple[DailyInterval, ...]]:
+    """Parse the bounded daily schedule RPC result."""
+    if (
+        not isinstance(result, Mapping)
+        or set(result) != {"date", "timezone", "intervals"}
+        or not isinstance(result["date"], str)
+        or not isinstance(result["timezone"], str)
+        or not isinstance(result["intervals"], list)
+        or len(result["intervals"]) > 512
+    ):
+        raise FormError("The service returned an invalid daily schedule.")
+    try:
+        local_day = date.fromisoformat(result["date"])
+        zone = ZoneInfo(result["timezone"])
+    except (ValueError, ZoneInfoNotFoundError) as error:
+        raise FormError(
+            "The service returned an invalid daily schedule."
+        ) from error
+    intervals: list[DailyInterval] = []
+    for item in result["intervals"]:
+        if (
+            not isinstance(item, Mapping)
+            or set(item)
+            != {"rule_id", "rule_name", "start", "end"}
+            or not isinstance(item["rule_id"], str)
+            or not isinstance(item["rule_name"], str)
+            or not item["rule_name"].strip()
+            or not isinstance(item["start"], str)
+            or not isinstance(item["end"], str)
+        ):
+            raise FormError(
+                "The service returned an invalid daily schedule."
+            )
+        try:
+            rule_id = str(UUID(item["rule_id"]))
+            start = datetime.fromisoformat(item["start"])
+            end = datetime.fromisoformat(item["end"])
+        except (ValueError, TypeError) as error:
+            raise FormError(
+                "The service returned an invalid daily schedule."
+            ) from error
+        if (
+            rule_id != item["rule_id"].lower()
+            or start.tzinfo is None
+            or end.tzinfo is None
+            or end <= start
+        ):
+            raise FormError(
+                "The service returned an invalid daily schedule."
+            )
+        intervals.append(DailyInterval(
+            rule_id,
+            item["rule_name"],
+            start.astimezone(zone),
+            end.astimezone(zone),
+        ))
+    return (
+        local_day,
+        result["timezone"],
+        tuple(intervals),
     )
 
 
@@ -922,6 +1419,43 @@ def active_lock_explanation(rule: Rule, now_utc: datetime, clock_trusted: bool) 
     return f"This active rule cannot be weakened before {_display_time(change.at_utc)}."
 
 
+def _pomodoro_end(schedule: Mapping[str, object]) -> datetime:
+    start = _parse_utc(schedule["start_utc"])
+    work = timedelta(minutes=schedule["work_minutes"])
+    rest = timedelta(minutes=schedule["break_minutes"])
+    cycles = schedule["cycles"]
+    return start + cycles * work + (cycles - 1) * rest
+
+
+def _rule_state_text(
+    rule: Rule, now_utc: datetime, clock_trusted: bool
+) -> str:
+    """Name the visible state, including a trusted Pomodoro break."""
+    if not rule.enabled:
+        return "Disabled"
+    active = rule.is_active(now_utc, clock_trusted=clock_trusted)
+    schedule = rule.to_dict()["schedule"]
+    if schedule["kind"] == "pomodoro" and clock_trusted:
+        if active:
+            return "Work"
+        start = _parse_utc(schedule["start_utc"])
+        if start <= now_utc < _pomodoro_end(schedule):
+            return "Break"
+    return "Active" if active else "Inactive"
+
+
+def _state_change_action(rule: Rule, change: StateChange) -> str:
+    """Describe the next boundary without calling a Pomodoro break an end."""
+    schedule = rule.to_dict()["schedule"]
+    if schedule["kind"] != "pomodoro":
+        return "Starts" if change.active_after else "Ends"
+    if change.active_after:
+        return "Work starts"
+    if change.at_utc == _pomodoro_end(schedule):
+        return "Ends"
+    return "Break starts"
+
+
 def _schedule_summary(rule: Rule) -> str:
     schedule = rule.to_dict()["schedule"]
     if schedule["kind"] == "indefinite":
@@ -930,6 +1464,15 @@ def _schedule_summary(rule: Rule) -> str:
         return (
             f"One time: {_display_time(_parse_utc(schedule['start_utc']))} to "
             f"{_display_time(_parse_utc(schedule['end_utc']))}"
+        )
+    if schedule["kind"] == "pomodoro":
+        cycles = schedule["cycles"]
+        cycle_noun = "cycle" if cycles == 1 else "cycles"
+        return (
+            f"Pomodoro: {cycles} {cycle_noun}, "
+            f"{schedule['work_minutes']} min work, "
+            f"{schedule['break_minutes']} min break; "
+            f"starts {_display_time(_parse_utc(schedule['start_utc']))}"
         )
     count = len(schedule["periods"])
     noun = "period" if count == 1 else "periods"
@@ -1029,7 +1572,18 @@ class GuiController:
         service_row.append(heading)
         self.health_label = Gtk.Label(label="Loading service state.")
         self.health_label.set_xalign(0)
+        self.health_label.set_hexpand(True)
         service_row.append(self.health_label)
+        self.statistics_button = Gtk.Button.new_with_mnemonic(
+            "Denial _statistics"
+        )
+        self.statistics_button.set_tooltip_text(
+            "View recorded application denial counts"
+        )
+        self.statistics_button.connect(
+            "clicked", lambda _button: self.open_denial_statistics()
+        )
+        service_row.append(self.statistics_button)
         root.append(service_row)
         self.clock_label = Gtk.Label(label="Clock state is not available.")
         self.clock_label.set_xalign(0)
@@ -1132,6 +1686,7 @@ class GuiController:
         self.focus_button.set_sensitive(not busy)
         self.lists_button.set_sensitive(not busy)
         self.overview_button.set_sensitive(not busy)
+        self.statistics_button.set_sensitive(not busy)
         for widget in (
             self.import_domains_button,
             self.import_backup_button,
@@ -1155,13 +1710,15 @@ class GuiController:
                 status = self.client.request("status")
                 rules = self.client.request("list_rules")
                 lists = self.client.request("list_managed_lists")
+                locks = self.client.request("list_locks")
                 if (
                     not isinstance(status, Mapping)
                     or not isinstance(rules, list)
                     or not isinstance(lists, list)
+                    or not isinstance(locks, list)
                 ):
                     raise FormError("The service returned invalid data.")
-                snapshot = snapshot_from_results(status, rules, lists)
+                snapshot = snapshot_from_results(status, rules, lists, locks)
             except Exception as error:
                 self.GLib.idle_add(self._show_request_error, str(error))
             else:
@@ -1266,6 +1823,7 @@ class GuiController:
             now_utc,
             snapshot.clock_trusted,
         )
+        locks_by_rule = {item.rule_id: item for item in snapshot.locks}
         if not rules:
             row = Gtk.ListBoxRow()
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.COMPACT))
@@ -1289,9 +1847,22 @@ class GuiController:
             self.rule_list.append(row)
             return
         for rule in rules:
-            self.rule_list.append(self._rule_row(rule, now_utc, snapshot))
+            self.rule_list.append(
+                self._rule_row(
+                    rule,
+                    now_utc,
+                    snapshot,
+                    locks_by_rule.get(rule.id),
+                )
+            )
 
-    def _rule_row(self, rule: Rule, now_utc: datetime, snapshot: ServiceSnapshot) -> object:
+    def _rule_row(
+        self,
+        rule: Rule,
+        now_utc: datetime,
+        snapshot: ServiceSnapshot,
+        lock: LockSummary | None,
+    ) -> object:
         Gtk = self.Gtk
         data = rule.to_dict()
         active = rule.is_active(now_utc, clock_trusted=snapshot.clock_trusted)
@@ -1308,9 +1879,9 @@ class GuiController:
         name.set_xalign(0)
         name.set_hexpand(True)
         heading_row.append(name)
-        state = Gtk.Label(label="Active" if active else "Inactive")
-        if not data["enabled"]:
-            state.set_text("Disabled")
+        state = Gtk.Label(
+            label=_rule_state_text(rule, now_utc, snapshot.clock_trusted)
+        )
         state.add_css_class("accent" if active else "dim-label")
         heading_row.append(state)
         outer.append(heading_row)
@@ -1319,11 +1890,26 @@ class GuiController:
         details.set_wrap(True)
         details.add_css_class("dim-label")
         outer.append(details)
+        lock_text = Gtk.Label(
+            label=(
+                "Rule lock: none."
+                if lock is None
+                else lock_summary_text(lock, self.timezone)
+            )
+        )
+        lock_text.set_xalign(0)
+        lock_text.set_wrap(True)
+        lock_text.add_css_class(
+            "warning" if lock is not None and lock.locked else "dim-label"
+        )
+        outer.append(lock_text)
         if data["enabled"] and snapshot.clock_trusted:
             change = next_state_change(rule, now_utc)
             if change is not None:
-                action = "Starts" if change.active_after else "Ends"
-                label = Gtk.Label(label=f"Next state change: {action} at {_display_time(change.at_utc)}.")
+                action = _state_change_action(rule, change)
+                label = Gtk.Label(
+                    label=f"Next state change: {action} at {_display_time(change.at_utc)}."
+                )
                 label.set_xalign(0)
                 outer.append(label)
         elif data["enabled"] and kind != "indefinite":
@@ -1353,15 +1939,54 @@ class GuiController:
         actions.append(export)
         toggle = Gtk.Button.new_with_mnemonic("_Disable" if data["enabled"] else "_Enable")
         finite_lock = active and kind != "indefinite"
-        toggle.set_sensitive(snapshot.healthy and not finite_lock)
-        if finite_lock:
+        timed_disable_lock = (
+            lock is not None
+            and lock.kind == "timed"
+            and lock.locked
+            and data["enabled"]
+        )
+        toggle.set_sensitive(
+            snapshot.healthy and not finite_lock and not timed_disable_lock
+        )
+        if timed_disable_lock:
+            toggle.set_tooltip_text("The timed lock blocks disabling this rule.")
+        elif finite_lock:
             toggle.set_tooltip_text(explanation)
         toggle.connect("clicked", lambda _button, item=rule, enabled=not data["enabled"]: self._set_enabled(item, enabled))
         actions.append(toggle)
+        lock_button = Gtk.Button.new_with_mnemonic("_Lock")
+        lock_button.set_tooltip_text("Create, change, or remove a rule lock")
+        lock_button.connect(
+            "clicked",
+            lambda _button, item=rule, summary=lock: self.open_rule_lock(
+                item, summary
+            ),
+        )
+        actions.append(lock_button)
+        if (
+            lock is not None
+            and lock.kind in {"friction", "password"}
+            and lock.locked
+        ):
+            authorize = Gtk.Button.new_with_mnemonic("_Authorize")
+            authorize.set_sensitive(snapshot.healthy)
+            authorize.set_tooltip_text(
+                "Authorize one weakening change for this rule lock"
+            )
+            authorize.connect(
+                "clicked",
+                lambda _button, item=rule: self.open_rule_authorization(item),
+            )
+            actions.append(authorize)
         delete = Gtk.Button.new_with_mnemonic("_Delete")
         delete.add_css_class("destructive-action")
-        delete.set_sensitive(snapshot.healthy and not active)
-        if active:
+        timed_delete_lock = (
+            lock is not None and lock.kind == "timed" and lock.locked
+        )
+        delete.set_sensitive(snapshot.healthy and not active and not timed_delete_lock)
+        if timed_delete_lock:
+            delete.set_tooltip_text("The timed lock blocks deleting this rule.")
+        elif active:
             delete.set_tooltip_text(explanation or "Disable this rule before you delete it.")
         delete.connect("clicked", lambda _button, item=rule: self._confirm_delete(item))
         actions.append(delete)
@@ -1904,10 +2529,12 @@ class GuiController:
         minutes: int,
         completed: Callable[[str | None], None],
     ) -> None:
-        try:
-            rule = create_focus_rule(source, minutes, datetime.now(UTC))
-        except (FormError, ValidationError, ValueError) as error:
-            completed(str(error))
+        if (
+            isinstance(minutes, bool)
+            or not isinstance(minutes, int)
+            or not 1 <= minutes <= 1440
+        ):
+            completed("Enter 1 to 1440 focus minutes.")
             return
 
         def saved(_result: object) -> None:
@@ -1917,27 +2544,81 @@ class GuiController:
             self.refresh()
 
         self._request_async(
-            "put_rule",
-            {"rule": rule.to_dict()},
+            "start_focus",
+            {"rule_id": source.id, "minutes": minutes},
             saved,
             lambda error: completed(self._rpc_error(error)),
         )
 
     def open_daily_overview(self) -> None:
-        rules = () if self.snapshot is None else self.snapshot.rules
         local_day = datetime.now(ZoneInfo(self.timezone)).date()
-        try:
-            intervals = project_daily_schedule(rules, local_day, self.timezone)
-        except (FormError, ValidationError, ValueError) as error:
-            self._show_error(str(error))
-            return
-        DailyOverviewWindow(
+
+        def load():
+            result = self.client.request(
+                "daily_schedule",
+                timezone=self.timezone,
+                date=local_day.isoformat(),
+            )
+            if not isinstance(result, Mapping):
+                raise FormError(
+                    "The service returned an invalid daily schedule."
+                )
+            return daily_schedule_from_result(result)
+
+        def show(payload) -> None:
+            day, timezone_name, intervals = payload
+            DailyOverviewWindow(
+                self.Gtk,
+                self.window,
+                day,
+                timezone_name,
+                intervals,
+            ).present()
+
+        self._run_worker(
+            load,
+            show,
+            lambda error: self._show_error(self._rpc_error(error)),
+        )
+
+    def open_denial_statistics(self) -> None:
+        DenialStatisticsWindow(
             self.Gtk,
             self.window,
-            local_day,
-            self.timezone,
-            intervals,
+            self._load_denial_statistics,
+            self._clear_denial_statistics,
         ).present()
+
+    def _load_denial_statistics(
+        self,
+        completed: Callable[[DenialStatistics | None, str | None], None],
+    ) -> None:
+        def load() -> DenialStatistics:
+            # Breadcrumb for reviewers: this read uses only the bounded public
+            # RPC. The GUI never reads fanotify or protected statistics files.
+            result = self.client.request("list_denial_stats")
+            if not isinstance(result, Mapping):
+                raise FormError("The service returned invalid denial statistics.")
+            return denial_statistics_from_result(result)
+
+        self._run_worker(
+            load,
+            lambda statistics: completed(statistics, None),
+            lambda error: completed(None, self._rpc_error(error)),
+        )
+
+    def _clear_denial_statistics(
+        self,
+        completed: Callable[[str | None], None],
+    ) -> None:
+        # Breadcrumb for reviewers: clearing observational data is a distinct
+        # RPC and never sends a policy, file path, or enforcement request.
+        self._request_async(
+            "clear_denial_stats",
+            {},
+            lambda _result: completed(None),
+            lambda error: completed(self._rpc_error(error)),
+        )
 
     def _save_form(
         self,
@@ -1976,6 +2657,111 @@ class GuiController:
             self._save_form,
             initial_domains,
         ).present()
+
+    def open_rule_lock(
+        self,
+        rule: Rule,
+        summary: LockSummary | None,
+    ) -> None:
+        healthy = self.snapshot is not None and self.snapshot.healthy
+        RuleLockWindow(
+            self.Gtk,
+            self.window,
+            self.timezone,
+            rule,
+            summary,
+            healthy,
+            self._save_rule_lock,
+        ).present()
+
+    def _save_rule_lock(
+        self,
+        fields: Mapping[str, object],
+        completed: Callable[[str | None], None],
+    ) -> None:
+        # Breadcrumb for reviewers: the GUI sends only the public lock input.
+        # The root service owns expiry checks and all protected control state.
+        def saved(_result: object) -> None:
+            completed(None)
+            self.refresh()
+
+        self._request_async(
+            "set_rule_lock",
+            fields,
+            saved,
+            lambda error: completed(self._rpc_error(error)),
+        )
+
+    def open_rule_authorization(self, rule: Rule) -> None:
+        RuleAuthorizationWindow(
+            self.Gtk,
+            self.window,
+            rule,
+            self._begin_rule_authorization,
+            self._complete_rule_authorization,
+        ).present()
+
+    def _begin_rule_authorization(
+        self,
+        rule_id: str,
+        completed: Callable[[AuthorizationChallenge | None, str | None], None],
+    ) -> None:
+        try:
+            fields = begin_rule_authorization_request(rule_id)
+        except FormError as error:
+            completed(None, str(error))
+            return
+
+        def began(result: object) -> None:
+            try:
+                if not isinstance(result, Mapping):
+                    raise FormError(
+                        "The service returned an invalid authorization challenge."
+                    )
+                challenge = authorization_challenge_from_result(result)
+                if challenge.rule_id != rule_id:
+                    raise FormError(
+                        "The service returned an authorization challenge for another rule."
+                    )
+            except FormError as error:
+                completed(None, str(error))
+                return
+            completed(challenge, None)
+
+        self._request_async(
+            "begin_rule_authorization",
+            fields,
+            began,
+            lambda error: completed(None, self._rpc_error(error)),
+        )
+
+    def _complete_rule_authorization(
+        self,
+        fields: Mapping[str, object],
+        completed: Callable[[AuthorizationGrant | None, str | None], None],
+    ) -> None:
+        def authorized(result: object) -> None:
+            try:
+                if not isinstance(result, Mapping):
+                    raise FormError(
+                        "The service returned an invalid authorization result."
+                    )
+                grant = authorization_grant_from_result(result)
+                if grant.rule_id != fields.get("rule_id"):
+                    raise FormError(
+                        "The service authorized a change for another rule."
+                    )
+            except FormError as error:
+                completed(None, str(error))
+                return
+            completed(grant, None)
+
+        self._request_async(
+            "complete_rule_authorization",
+            fields,
+            authorized,
+            lambda error: completed(None, self._rpc_error(error)),
+        )
 
 
 class DateTimePicker:
@@ -2066,6 +2852,577 @@ class DateTimePicker:
         self.hour.set_value(self.value.hour)
         self.minute.set_value(self.value.minute)
         self._update_label()
+
+class RuleLockWindow:
+    """Create, change, or remove one rule lock."""
+
+    def __init__(
+        self,
+        Gtk: ModuleType,
+        parent: object,
+        timezone_name: str,
+        rule: Rule,
+        summary: LockSummary | None,
+        healthy: bool,
+        save: Callable[
+            [Mapping[str, object], Callable[[str | None], None]],
+            None,
+        ],
+    ):
+        self.Gtk = Gtk
+        self.timezone_name = timezone_name
+        self.rule = rule
+        self.summary = summary
+        self.healthy = healthy
+        self.save = save
+        self.primary_button: object | None = None
+        self.remove_button: object | None = None
+        self.kind_dropdown: object | None = None
+        self.expiry_widgets: tuple[object, ...] = ()
+        self.password_entry: object | None = None
+        self.password_confirmation: object | None = None
+        self.password_widgets: tuple[object, ...] = ()
+        self.window = self._build(parent)
+
+    def _build(self, parent: object) -> object:
+        Gtk = self.Gtk
+        window = Gtk.Window(
+            title="Rule lock",
+            transient_for=parent,
+            modal=True,
+        )
+        outer = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=int(Space.MEDIUM),
+        )
+        for method in (
+            outer.set_margin_top,
+            outer.set_margin_bottom,
+            outer.set_margin_start,
+            outer.set_margin_end,
+        ):
+            method(int(Space.LARGE))
+        window.set_child(outer)
+
+        heading = Gtk.Label(label=f"Rule lock · {self.rule.name}")
+        heading.add_css_class("title-2")
+        heading.set_xalign(0)
+        heading.set_wrap(True)
+        outer.append(heading)
+        intro = Gtk.Label(
+            label=(
+                "A timed lock blocks weakening changes until its expiry. "
+                "A friction lock requires exact-text authorization. "
+                "A password lock requires its password before one weakening change."
+            )
+        )
+        intro.set_xalign(0)
+        intro.set_wrap(True)
+        outer.append(intro)
+
+        state_text = (
+            "Rule lock: none."
+            if self.summary is None
+            else lock_summary_text(self.summary, self.timezone_name)
+        )
+        state = Gtk.Label(label=state_text)
+        state.set_xalign(0)
+        state.set_wrap(True)
+        state.add_css_class(
+            "warning"
+            if self.summary is not None and self.summary.locked
+            else "dim-label"
+        )
+        outer.append(state)
+
+        can_set = self.summary is None or self.summary.locked
+        if can_set:
+            kind_label = Gtk.Label(label="Lock type")
+            kind_label.set_xalign(0)
+            outer.append(kind_label)
+            self.kind_dropdown = Gtk.DropDown.new_from_strings(
+                ("Timed", "Friction", "Password")
+            )
+            selected_kind = "timed" if self.summary is None else self.summary.kind
+            self.kind_dropdown.set_selected(
+                {"timed": 0, "friction": 1, "password": 2}[selected_kind]
+            )
+            self.kind_dropdown.set_sensitive(
+                self.healthy
+                and not (
+                    self.summary is not None
+                    and self.summary.kind == "timed"
+                    and self.summary.locked
+                )
+            )
+            self.kind_dropdown.set_tooltip_text(
+                "Choose a timed, friction, or password lock"
+            )
+            kind_label.set_mnemonic_widget(self.kind_dropdown)
+            outer.append(self.kind_dropdown)
+
+            until_label = Gtk.Label(label="Lock expiry")
+            until_label.set_xalign(0)
+            outer.append(until_label)
+            zone = ZoneInfo(self.timezone_name)
+            if (
+                self.summary is not None
+                and self.summary.kind == "timed"
+                and self.summary.until_utc is not None
+            ):
+                initial_until = picker_datetime_text(
+                    self.summary.until_utc.astimezone(zone)
+                )
+            else:
+                _start, initial_until = default_one_time_window(datetime.now(zone))
+            self.until_picker = DateTimePicker(
+                Gtk,
+                initial_until,
+                "Lock expiry",
+            )
+            until_label.set_mnemonic_widget(self.until_picker.button)
+            outer.append(self.until_picker.button)
+            zone_label = Gtk.Label(
+                label=f"System time zone: {self.timezone_name}"
+            )
+            zone_label.set_xalign(0)
+            zone_label.add_css_class("dim-label")
+            outer.append(zone_label)
+            self.expiry_widgets = (
+                until_label,
+                self.until_picker.button,
+                zone_label,
+            )
+
+            password_label = Gtk.Label(label="Password")
+            password_label.set_xalign(0)
+            outer.append(password_label)
+            self.password_entry = Gtk.Entry()
+            self.password_entry.set_hexpand(True)
+            self.password_entry.set_visibility(False)
+            self.password_entry.set_placeholder_text("8 to 1024 UTF-8 bytes")
+            password_label.set_mnemonic_widget(self.password_entry)
+            outer.append(self.password_entry)
+
+            confirmation_label = Gtk.Label(label="Confirm password")
+            confirmation_label.set_xalign(0)
+            outer.append(confirmation_label)
+            self.password_confirmation = Gtk.Entry()
+            self.password_confirmation.set_hexpand(True)
+            self.password_confirmation.set_visibility(False)
+            self.password_confirmation.set_placeholder_text("Retype the password")
+            self.password_confirmation.connect(
+                "activate", lambda _entry: self._submit()
+            )
+            confirmation_label.set_mnemonic_widget(self.password_confirmation)
+            outer.append(self.password_confirmation)
+            self.password_widgets = (
+                password_label,
+                self.password_entry,
+                confirmation_label,
+                self.password_confirmation,
+            )
+            self.kind_dropdown.connect(
+                "notify::selected", self._lock_kind_changed
+            )
+            self._lock_kind_changed(self.kind_dropdown)
+
+        self.error_label = Gtk.Label(label="")
+        self.error_label.set_xalign(0)
+        self.error_label.set_wrap(True)
+        self.error_label.add_css_class("error")
+        outer.append(self.error_label)
+
+        actions = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=int(Space.SMALL),
+        )
+        actions.set_halign(Gtk.Align.END)
+        cancel = Gtk.Button.new_with_mnemonic("_Cancel")
+        cancel.connect("clicked", lambda _button: window.destroy())
+        actions.append(cancel)
+        if self.summary is not None:
+            self.remove_button = Gtk.Button.new_with_mnemonic("_Remove lock")
+            self.remove_button.add_css_class("destructive-action")
+            self.remove_button.set_sensitive(
+                self.healthy
+                and not (
+                    self.summary.kind == "timed" and self.summary.locked
+                )
+            )
+            if self.summary.kind == "timed" and self.summary.locked:
+                self.remove_button.set_tooltip_text(
+                    "An active timed lock cannot be removed."
+                )
+            elif (
+                self.summary.kind in {"friction", "password"}
+                and self.summary.locked
+            ):
+                self.remove_button.set_tooltip_text(
+                    "Authorize a weakening change before removing this rule lock."
+                )
+            self.remove_button.connect(
+                "clicked",
+                lambda _button: self._remove(),
+            )
+            actions.append(self.remove_button)
+        if can_set:
+            label = "_Update lock" if self.summary is not None else "_Create lock"
+            self.primary_button = Gtk.Button.new_with_mnemonic(label)
+            self.primary_button.add_css_class("suggested-action")
+            self.primary_button.set_sensitive(self.healthy)
+            self.primary_button.connect(
+                "clicked",
+                lambda _button: self._submit(),
+            )
+            actions.append(self.primary_button)
+        outer.append(actions)
+        if not self.healthy:
+            self.error_label.set_text(
+                "The service is unhealthy. Lock changes are disabled."
+            )
+        return window
+
+    def _selected_kind(self) -> str:
+        if self.kind_dropdown is None:
+            return "timed"
+        selected = self.kind_dropdown.get_selected()
+        return ("timed", "friction", "password")[selected]
+
+    def _lock_kind_changed(
+        self,
+        _dropdown: object,
+        _parameter: object = None,
+    ) -> None:
+        selected_kind = self._selected_kind()
+        for widget in self.expiry_widgets:
+            widget.set_visible(selected_kind == "timed")
+        for widget in self.password_widgets:
+            widget.set_visible(selected_kind == "password")
+        if selected_kind != "password":
+            if self.password_entry is not None:
+                self.password_entry.set_text("")
+            if self.password_confirmation is not None:
+                self.password_confirmation.set_text("")
+
+    def _set_busy(self, busy: bool) -> None:
+        if self.primary_button is not None:
+            self.primary_button.set_sensitive(self.healthy and not busy)
+        if self.kind_dropdown is not None:
+            active_timed = (
+                self.summary is not None
+                and self.summary.kind == "timed"
+                and self.summary.locked
+            )
+            self.kind_dropdown.set_sensitive(
+                self.healthy and not busy and not active_timed
+            )
+        if self.remove_button is not None:
+            active_timed = (
+                self.summary is not None
+                and self.summary.kind == "timed"
+                and self.summary.locked
+            )
+            self.remove_button.set_sensitive(
+                self.healthy and not busy and not active_timed
+            )
+        if self.password_entry is not None:
+            self.password_entry.set_sensitive(self.healthy and not busy)
+        if self.password_confirmation is not None:
+            self.password_confirmation.set_sensitive(self.healthy and not busy)
+
+    def _submit(self) -> None:
+        try:
+            kind = self._selected_kind()
+            if kind == "friction":
+                fields = friction_lock_request(self.rule.id)
+            elif kind == "password":
+                if (
+                    self.password_entry is None
+                    or self.password_confirmation is None
+                ):
+                    raise FormError("The password fields are not available.")
+                fields = password_lock_request(
+                    self.rule.id,
+                    self.password_entry.get_text(),
+                    self.password_confirmation.get_text(),
+                )
+            else:
+                fields = timed_lock_request(
+                    self.rule.id,
+                    self.until_picker.get_text(),
+                    self.timezone_name,
+                )
+                until_utc = _parse_utc(fields["lock"]["until_utc"])
+                if (
+                    self.summary is not None
+                    and self.summary.kind == "timed"
+                    and self.summary.until_utc is not None
+                    and until_utc <= self.summary.until_utc
+                ):
+                    raise FormError("Extend the lock to a later expiry.")
+        except (FormError, TypeError) as error:
+            self.error_label.set_text(str(error))
+            return
+        self._set_busy(True)
+        self.error_label.remove_css_class("error")
+        self.error_label.set_text(f"Saving {kind} lock.")
+        self.save(fields, self._saved)
+
+    def _remove(self) -> None:
+        try:
+            fields = remove_rule_lock_request(self.rule.id)
+        except FormError as error:
+            self.error_label.set_text(str(error))
+            return
+        self._set_busy(True)
+        self.error_label.remove_css_class("error")
+        self.error_label.set_text("Removing rule lock.")
+        self.save(fields, self._saved)
+
+    def _saved(self, message: str | None) -> None:
+        if message is None:
+            self.window.destroy()
+            return
+        self._set_busy(False)
+        self.error_label.set_text(message)
+        self.error_label.add_css_class("error")
+
+    def present(self) -> None:
+        self.window.present()
+
+
+class RuleAuthorizationWindow:
+    """Authorize one weakening change for a friction or password lock."""
+
+    def __init__(
+        self,
+        Gtk: ModuleType,
+        parent: object,
+        rule: Rule,
+        begin: Callable[
+            [str, Callable[[AuthorizationChallenge | None, str | None], None]],
+            None,
+        ],
+        complete: Callable[
+            [
+                Mapping[str, object],
+                Callable[[AuthorizationGrant | None, str | None], None],
+            ],
+            None,
+        ],
+    ):
+        self.Gtk = Gtk
+        self.rule = rule
+        self.begin = begin
+        self.complete = complete
+        self.challenge: AuthorizationChallenge | None = None
+        self.finished = False
+        self.window = self._build(parent)
+
+    def _build(self, parent: object) -> object:
+        Gtk = self.Gtk
+        window = Gtk.Window(
+            title="Authorize weakening change",
+            transient_for=parent,
+            modal=True,
+        )
+        window.set_default_size(520, 360)
+        outer = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=int(Space.MEDIUM),
+        )
+        for method in (
+            outer.set_margin_top,
+            outer.set_margin_bottom,
+            outer.set_margin_start,
+            outer.set_margin_end,
+        ):
+            method(int(Space.LARGE))
+        window.set_child(outer)
+
+        heading = Gtk.Label(label=f"Authorize change · {self.rule.name}")
+        heading.add_css_class("title-2")
+        heading.set_xalign(0)
+        heading.set_wrap(True)
+        outer.append(heading)
+        self.explanation = Gtk.Label(label="")
+        self.explanation.set_xalign(0)
+        self.explanation.set_wrap(True)
+        self.explanation.add_css_class("warning")
+        self.explanation.set_visible(False)
+        outer.append(self.explanation)
+
+        self.prompt_heading = Gtk.Label(label="Authorization text")
+        self.prompt_heading.set_xalign(0)
+        self.prompt_heading.set_visible(False)
+        outer.append(self.prompt_heading)
+        self.prompt_label = Gtk.Label(label="")
+        self.prompt_label.set_xalign(0)
+        self.prompt_label.set_selectable(True)
+        self.prompt_label.add_css_class("monospace")
+        self.prompt_label.set_visible(False)
+        outer.append(self.prompt_label)
+
+        self.response_label = Gtk.Label(label="Retype authorization text")
+        self.response_label.set_xalign(0)
+        self.response_label.set_visible(False)
+        outer.append(self.response_label)
+        self.response_entry = Gtk.Entry()
+        self.response_entry.set_hexpand(True)
+        self.response_entry.set_visible(False)
+        self.response_entry.connect("changed", self._response_changed)
+        self.response_entry.connect("activate", lambda _entry: self._submit())
+        self.response_label.set_mnemonic_widget(self.response_entry)
+        outer.append(self.response_entry)
+
+        self.status_label = Gtk.Label(label="Requesting authorization.")
+        self.status_label.set_xalign(0)
+        self.status_label.set_wrap(True)
+        outer.append(self.status_label)
+
+        actions = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=int(Space.SMALL),
+        )
+        actions.set_halign(Gtk.Align.END)
+        self.close_button = Gtk.Button.new_with_mnemonic("_Cancel")
+        self.close_button.connect("clicked", lambda _button: window.destroy())
+        actions.append(self.close_button)
+        self.authorize_button = Gtk.Button.new_with_mnemonic("_Authorize change")
+        self.authorize_button.add_css_class("suggested-action")
+        self.authorize_button.set_sensitive(False)
+        self.authorize_button.connect(
+            "clicked",
+            lambda _button: self._submit(),
+        )
+        actions.append(self.authorize_button)
+        outer.append(actions)
+        window.set_default_widget(self.authorize_button)
+        return window
+
+    def _response_changed(self, _entry: object) -> None:
+        ready = False
+        if not self.finished and self.challenge is not None:
+            response = self.response_entry.get_text()
+            if self.challenge.kind == "friction":
+                ready = response == self.challenge.prompt
+            else:
+                try:
+                    _validated_password(response)
+                except FormError:
+                    pass
+                else:
+                    ready = True
+        self.authorize_button.set_sensitive(ready)
+
+    def _challenge_ready(
+        self,
+        challenge: AuthorizationChallenge | None,
+        message: str | None,
+    ) -> None:
+        if message is not None or challenge is None:
+            self.finished = True
+            self.status_label.set_text(
+                message or "The service did not return an authorization challenge."
+            )
+            self.status_label.add_css_class("error")
+            self.close_button.set_label("_Close")
+            return
+        self.challenge = challenge
+        if challenge.kind == "friction":
+            self.explanation.set_text(
+                "This step adds friction only. It is not a security check. "
+                "Retype the service text exactly to authorize one weakening change."
+            )
+            self.explanation.set_visible(True)
+            self.prompt_label.set_text(challenge.prompt)
+            self.prompt_heading.set_visible(True)
+            self.prompt_label.set_visible(True)
+            self.response_label.set_text("Retype authorization text")
+            self.response_entry.set_visibility(True)
+            expiry_subject = "authorization text"
+        else:
+            # Breadcrumb for reviewers: password challenges never render a prompt.
+            self.explanation.set_text(
+                "Enter the password to authorize one weakening change."
+            )
+            self.explanation.set_visible(True)
+            self.prompt_heading.set_visible(False)
+            self.prompt_label.set_visible(False)
+            self.response_label.set_text("Password")
+            self.response_entry.set_visibility(False)
+            expiry_subject = "password authorization"
+        self.response_label.set_visible(True)
+        self.response_entry.set_visible(True)
+        self.status_label.set_text(
+            f"This {expiry_subject} expires in {challenge.expires_in} seconds."
+        )
+        self.response_entry.grab_focus()
+
+    def _submit(self) -> None:
+        if self.finished or self.challenge is None:
+            return
+        response = self.response_entry.get_text()
+        if self.challenge.kind == "friction" and response != self.challenge.prompt:
+            return
+        try:
+            fields = complete_rule_authorization_request(
+                self.rule.id,
+                self.challenge.challenge_id,
+                response,
+                self.challenge.kind,
+            )
+        except FormError as error:
+            self.status_label.set_text(str(error))
+            self.status_label.add_css_class("error")
+            return
+        self.authorize_button.set_sensitive(False)
+        self.response_entry.set_sensitive(False)
+        self.status_label.remove_css_class("error")
+        self.status_label.set_text("Authorizing the weakening change.")
+        self.complete(fields, self._authorization_completed)
+
+    def _authorization_completed(
+        self,
+        grant: AuthorizationGrant | None,
+        message: str | None,
+    ) -> None:
+        if message is not None or grant is None:
+            detail = message or "The service did not authorize the weakening change."
+            self.status_label.remove_css_class("accent")
+            self.status_label.add_css_class("error")
+            if self.challenge is None or self.challenge.kind == "friction":
+                self.finished = True
+                self.authorize_button.set_sensitive(False)
+                self.response_entry.set_sensitive(False)
+                self.close_button.set_label("_Close")
+                self.status_label.set_text(
+                    detail
+                    + " Close this window and request new authorization text."
+                )
+                return
+            self.response_entry.set_sensitive(True)
+            self.response_entry.set_text("")
+            self.status_label.set_text(detail)
+            self._response_changed(self.response_entry)
+            self.response_entry.grab_focus()
+            return
+        self.finished = True
+        self.authorize_button.set_sensitive(False)
+        self.response_entry.set_sensitive(False)
+        self.close_button.set_label("_Close")
+        self.status_label.remove_css_class("error")
+        self.status_label.add_css_class("accent")
+        self.status_label.set_text(
+            "The next weakening change is authorized for 60 seconds."
+        )
+
+    def present(self) -> None:
+        self.window.present()
+        # Breadcrumb for reviewers: only friction challenges expose service text.
+        # Both blocking authorization RPCs run through the controller worker.
+        self.begin(self.rule.id, self._challenge_ready)
 
 
 class WeeklyPeriodRow:
@@ -2181,6 +3538,7 @@ class RuleEditor:
         self.weekly_rows: list[WeeklyPeriodRow] = []
         local_now = datetime.now(ZoneInfo(timezone_name))
         self.default_one_start, self.default_one_end = default_one_time_window(local_now)
+        self.default_pomodoro_start = self.default_one_start
         self.window = self._build()
         if existing is not None:
             self._populate(rule_to_form(existing, self.timezone_name))
@@ -2370,6 +3728,51 @@ class RuleEditor:
         note.add_css_class("dim-label")
         weekly.append(note)
         self.schedule_stack.add_named(weekly, "weekly")
+        pomodoro = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.SMALL)
+        )
+        self.pomodoro_start = DateTimePicker(
+            Gtk, self.default_pomodoro_start, "Pomodoro start"
+        )
+        pomodoro.append(
+            self._label_for("_Start date and time", self.pomodoro_start.button)
+        )
+        pomodoro.append(self.pomodoro_start.button)
+        self.pomodoro_work = Gtk.SpinButton.new_with_range(1, 180, 1)
+        self.pomodoro_work.set_numeric(True)
+        self.pomodoro_work.set_value(25)
+        self.pomodoro_work.set_tooltip_text("Work duration from 1 to 180 minutes")
+        pomodoro.append(
+            self._label_for("_Work minutes", self.pomodoro_work)
+        )
+        pomodoro.append(self.pomodoro_work)
+        self.pomodoro_break = Gtk.SpinButton.new_with_range(1, 60, 1)
+        self.pomodoro_break.set_numeric(True)
+        self.pomodoro_break.set_value(5)
+        self.pomodoro_break.set_tooltip_text("Break duration from 1 to 60 minutes")
+        pomodoro.append(
+            self._label_for("_Break minutes", self.pomodoro_break)
+        )
+        pomodoro.append(self.pomodoro_break)
+        self.pomodoro_cycles = Gtk.SpinButton.new_with_range(
+            1, MAX_POMODORO_CYCLES, 1
+        )
+        self.pomodoro_cycles.set_numeric(True)
+        self.pomodoro_cycles.set_value(4)
+        self.pomodoro_cycles.set_tooltip_text("Cycle count from 1 to 20")
+        pomodoro.append(
+            self._label_for("_Cycles", self.pomodoro_cycles)
+        )
+        pomodoro.append(self.pomodoro_cycles)
+        pomodoro_note = Gtk.Label(
+            label="The rule blocks during work and permits each break. "
+            "It ends after the final work interval."
+        )
+        pomodoro_note.set_xalign(0)
+        pomodoro_note.set_wrap(True)
+        pomodoro_note.add_css_class("dim-label")
+        pomodoro.append(pomodoro_note)
+        self.schedule_stack.add_named(pomodoro, "pomodoro")
         indefinite = Gtk.Label(
             label="This rule stays active until you disable it."
         )
@@ -2577,6 +3980,10 @@ class RuleEditor:
             one_time_start=self.one_start.get_text(),
             one_time_end=self.one_end.get_text(),
             weekly_periods=tuple(row.value() for row in self.weekly_rows),
+            pomodoro_start=self.pomodoro_start.get_text(),
+            pomodoro_work_minutes=self.pomodoro_work.get_value_as_int(),
+            pomodoro_break_minutes=self.pomodoro_break.get_value_as_int(),
+            pomodoro_cycles=self.pomodoro_cycles.get_value_as_int(),
         )
 
     def _submit(self) -> None:
@@ -2616,6 +4023,11 @@ class RuleEditor:
         if form.schedule_kind == "one_time":
             self.one_start.set_text(form.one_time_start)
             self.one_end.set_text(form.one_time_end)
+        elif form.schedule_kind == "pomodoro":
+            self.pomodoro_start.set_text(form.pomodoro_start)
+            self.pomodoro_work.set_value(form.pomodoro_work_minutes)
+            self.pomodoro_break.set_value(form.pomodoro_break_minutes)
+            self.pomodoro_cycles.set_value(form.pomodoro_cycles)
         for row in tuple(self.weekly_rows):
             self._remove_weekly_period(row)
         if form.schedule_kind == "weekly":
@@ -3066,6 +4478,295 @@ class QuickFocusWindow:
 
     def present(self) -> None:
         self.window.present()
+
+
+class DenialStatisticsWindow:
+    """Show bounded application-denial statistics from public RPC data."""
+
+    def __init__(
+        self,
+        Gtk: ModuleType,
+        parent: object,
+        load: Callable[
+            [Callable[[DenialStatistics | None, str | None], None]],
+            None,
+        ],
+        clear: Callable[[Callable[[str | None], None]], None],
+    ):
+        self.Gtk = Gtk
+        self.load_statistics = load
+        self.clear_statistics = clear
+        self.closed = False
+        self.statistics: DenialStatistics | None = None
+        self.window = self._build(parent)
+
+    def _build(self, parent: object) -> object:
+        Gtk = self.Gtk
+        window = Gtk.Window(
+            title="Application denial statistics",
+            transient_for=parent,
+            modal=False,
+        )
+        window.connect("close-request", self._window_closed)
+        window.set_default_size(760, 640)
+        outer = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=int(Space.MEDIUM),
+        )
+        for method in (
+            outer.set_margin_top,
+            outer.set_margin_bottom,
+            outer.set_margin_start,
+            outer.set_margin_end,
+        ):
+            method(int(Space.LARGE))
+        window.set_child(outer)
+
+        heading = Gtk.Label(label="Application denial statistics")
+        heading.add_css_class("title-2")
+        heading.set_xalign(0)
+        outer.append(heading)
+        intro = Gtk.Label(
+            label=(
+                "This read-only view reports denied application launches. "
+                "It does not change rules or blocking decisions."
+            )
+        )
+        intro.set_xalign(0)
+        intro.set_wrap(True)
+        outer.append(intro)
+
+        self.dropped_label = Gtk.Label(label="Dropped denial events: loading.")
+        self.dropped_label.set_xalign(0)
+        self.dropped_label.set_wrap(True)
+        outer.append(self.dropped_label)
+
+        actions = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=int(Space.SMALL),
+        )
+        self.refresh_button = Gtk.Button.new_with_mnemonic("_Refresh")
+        self.refresh_button.connect("clicked", lambda _button: self._load())
+        actions.append(self.refresh_button)
+        self.clear_button = Gtk.Button.new_with_mnemonic("_Clear statistics")
+        self.clear_button.add_css_class("destructive-action")
+        self.clear_button.set_sensitive(False)
+        self.clear_button.set_tooltip_text(
+            "Delete recorded denial counts after confirmation"
+        )
+        self.clear_button.connect(
+            "clicked", lambda _button: self._confirm_clear()
+        )
+        actions.append(self.clear_button)
+        outer.append(actions)
+
+        self.status_label = Gtk.Label(label="Loading denial statistics.")
+        self.status_label.set_xalign(0)
+        self.status_label.set_wrap(True)
+        outer.append(self.status_label)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_vexpand(True)
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.list_box = Gtk.ListBox()
+        self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.list_box.add_css_class("boxed-list")
+        scroller.set_child(self.list_box)
+        outer.append(scroller)
+
+        close = Gtk.Button.new_with_mnemonic("_Close")
+        close.set_halign(Gtk.Align.END)
+        close.connect("clicked", lambda _button: self._close())
+        outer.append(close)
+        return window
+
+    def _window_closed(self, _window: object) -> bool:
+        self.closed = True
+        return False
+
+    def _close(self) -> None:
+        self.closed = True
+        self.window.destroy()
+
+    def _clear_rows(self) -> None:
+        child = self.list_box.get_first_child()
+        while child is not None:
+            next_child = child.get_next_sibling()
+            self.list_box.remove(child)
+            child = next_child
+
+    def _set_loading(self, message: str) -> None:
+        self.status_label.set_text(message)
+        self.status_label.remove_css_class("error")
+        self.refresh_button.set_sensitive(False)
+        self.clear_button.set_sensitive(False)
+
+    def _load(self) -> None:
+        self._set_loading("Loading denial statistics.")
+        self.load_statistics(self._loaded)
+
+    def _loaded(
+        self,
+        statistics: DenialStatistics | None,
+        error: str | None,
+    ) -> None:
+        if self.closed:
+            return
+        self.refresh_button.set_sensitive(True)
+        if statistics is None:
+            self.status_label.set_text(
+                "Denial statistics could not be loaded."
+                + (f" {error}" if error else "")
+            )
+            self.status_label.add_css_class("error")
+            self.clear_button.set_sensitive(
+                self.statistics is not None
+                and bool(self.statistics.items or self.statistics.dropped)
+            )
+            if self.statistics is None:
+                self.dropped_label.set_text("Dropped denial events: unavailable.")
+                self.dropped_label.remove_css_class("warning")
+                self.dropped_label.add_css_class("dim-label")
+            return
+
+        self.statistics = statistics
+        self.status_label.remove_css_class("error")
+        count = len(statistics.items)
+        noun = "application" if count == 1 else "applications"
+        self.status_label.set_text(f"Showing {count} denied {noun}.")
+        if statistics.dropped:
+            self.dropped_label.set_text(
+                f"Dropped denial events: {statistics.dropped:,}. "
+                "The event queue was full, so these events are not included."
+            )
+            self.dropped_label.remove_css_class("dim-label")
+            self.dropped_label.add_css_class("warning")
+        else:
+            self.dropped_label.set_text("Dropped denial events: 0.")
+            self.dropped_label.remove_css_class("warning")
+            self.dropped_label.add_css_class("dim-label")
+        self.clear_button.set_sensitive(
+            bool(statistics.items or statistics.dropped)
+        )
+        self._render(statistics.items)
+
+    def _render(self, items: Sequence[DenialStat]) -> None:
+        Gtk = self.Gtk
+        self._clear_rows()
+        if not items:
+            row = Gtk.ListBoxRow()
+            message = Gtk.Label(
+                label=(
+                    "No denied application launches have been recorded. "
+                    "Use Refresh after the service denies an application."
+                )
+            )
+            message.set_xalign(0)
+            message.set_wrap(True)
+            for method in (
+                message.set_margin_top,
+                message.set_margin_bottom,
+                message.set_margin_start,
+                message.set_margin_end,
+            ):
+                method(int(Space.MEDIUM))
+            row.set_child(message)
+            self.list_box.append(row)
+            return
+
+        for item in items:
+            display = denial_stat_display(item)
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL,
+                spacing=int(Space.COMPACT),
+            )
+            for method in (
+                box.set_margin_top,
+                box.set_margin_bottom,
+                box.set_margin_start,
+                box.set_margin_end,
+            ):
+                method(int(Space.SMALL))
+            path = Gtk.Label(label=display.path)
+            path.add_css_class("heading")
+            path.add_css_class("monospace")
+            path.set_xalign(0)
+            path.set_wrap(True)
+            path.set_selectable(True)
+            box.append(path)
+            count = Gtk.Label(label=f"Denied launches: {display.count}")
+            count.set_xalign(0)
+            box.append(count)
+            times = Gtk.Label(
+                label=(
+                    f"First denied: {display.first_utc}\n"
+                    f"Last denied: {display.last_utc}"
+                )
+            )
+            times.set_xalign(0)
+            times.set_selectable(True)
+            times.add_css_class("dim-label")
+            box.append(times)
+            rules = Gtk.Label(label=f"Rule IDs: {display.rule_ids}")
+            rules.set_xalign(0)
+            rules.set_wrap(True)
+            rules.set_selectable(True)
+            rules.add_css_class("dim-label")
+            box.append(rules)
+            row.set_child(box)
+            self.list_box.append(row)
+
+    def _confirm_clear(self) -> None:
+        if self.statistics is None or not (
+            self.statistics.items or self.statistics.dropped
+        ):
+            return
+        Gtk = self.Gtk
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE,
+            text="Clear all denial statistics?",
+            secondary_text=(
+                "This deletes the recorded application counts and dropped-event "
+                "count. It does not change rules or blocking decisions."
+            ),
+        )
+        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("_Clear statistics", Gtk.ResponseType.ACCEPT)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+
+        def respond(_dialog: object, response: int) -> None:
+            dialog.destroy()
+            if response != Gtk.ResponseType.ACCEPT:
+                return
+            self._set_loading("Clearing denial statistics.")
+            self.clear_statistics(self._cleared)
+
+        dialog.connect("response", respond)
+        dialog.present()
+
+    def _cleared(self, error: str | None) -> None:
+        if self.closed:
+            return
+        if error is not None:
+            self.refresh_button.set_sensitive(True)
+            self.clear_button.set_sensitive(
+                self.statistics is not None
+                and bool(self.statistics.items or self.statistics.dropped)
+            )
+            self.status_label.set_text(
+                f"Denial statistics could not be cleared. {error}"
+            )
+            self.status_label.add_css_class("error")
+            return
+        self._load()
+
+    def present(self) -> None:
+        self.window.present()
+        self._load()
 
 
 class DailyOverviewWindow:

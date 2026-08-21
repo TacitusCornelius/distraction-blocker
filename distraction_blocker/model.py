@@ -45,12 +45,14 @@ def _string(value: Any, label: str, *, nonempty: bool = True, maximum: int | Non
     return value
 
 
-def _integer(value: Any, label: str, *, minimum: int | None = None) -> int:
+def _integer(value: Any, label: str, *, minimum: int | None = None, maximum: int | None = None) -> int:
     # Breadcrumb for reviewers: bool is an int subclass, but is never valid policy data.
     if isinstance(value, bool) or not isinstance(value, int):
         _error("bad_type", f"{label} must be an integer")
     if minimum is not None and value < minimum:
         _error("bad_value", f"{label} is too small")
+    if maximum is not None and value > maximum:
+        _error("bad_value", f"{label} is too large")
     return value
 
 
@@ -165,10 +167,26 @@ class Schedule:
     end_utc: datetime | None = None
     timezone_name: str | None = None
     periods: tuple[WeeklyPeriod, ...] = ()
+    work_minutes: int | None = None
+    break_minutes: int | None = None
+    cycles: int | None = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Schedule":
-        obj = _object(data, {"kind", "start_utc", "end_utc", "timezone", "periods"}, "schedule")
+        obj = _object(
+            data,
+            {
+                "kind",
+                "start_utc",
+                "end_utc",
+                "timezone",
+                "periods",
+                "work_minutes",
+                "break_minutes",
+                "cycles",
+            },
+            "schedule",
+        )
         kind = _string(obj.get("kind"), "schedule kind")
         if kind == "one_time":
             if set(obj) != {"kind", "start_utc", "end_utc"}:
@@ -178,6 +196,16 @@ class Schedule:
             if end <= start:
                 _error("bad_value", "schedule end must be after start")
             return cls(kind, start_utc=start, end_utc=end)
+        if kind == "pomodoro":
+            if set(obj) != {"kind", "start_utc", "work_minutes", "break_minutes", "cycles"}:
+                _error("bad_value", "pomodoro schedule fields are incomplete")
+            return cls(
+                kind,
+                start_utc=_utc_datetime(obj["start_utc"], "start_utc"),
+                work_minutes=_integer(obj["work_minutes"], "work_minutes", minimum=1, maximum=180),
+                break_minutes=_integer(obj["break_minutes"], "break_minutes", minimum=1, maximum=60),
+                cycles=_integer(obj["cycles"], "cycles", minimum=1, maximum=20),
+            )
         if kind == "weekly":
             if set(obj) != {"kind", "timezone", "periods"}:
                 _error("bad_value", "weekly schedule fields are incomplete")
@@ -203,10 +231,17 @@ class Schedule:
     def to_dict(self) -> dict[str, Any]:
         if self.kind == "one_time":
             return {"kind": self.kind, "start_utc": _utc_text(self.start_utc), "end_utc": _utc_text(self.end_utc)}
+        if self.kind == "pomodoro":
+            return {
+                "kind": self.kind,
+                "start_utc": _utc_text(self.start_utc),
+                "work_minutes": self.work_minutes,
+                "break_minutes": self.break_minutes,
+                "cycles": self.cycles,
+            }
         if self.kind == "weekly":
             return {"kind": self.kind, "timezone": self.timezone_name, "periods": [period.to_dict() for period in self.periods]}
         return {"kind": self.kind}
-
 
     def is_active(self, now_utc: datetime) -> bool:
         if not isinstance(now_utc, datetime) or now_utc.tzinfo is None or now_utc.utcoffset() != timedelta(0):
@@ -216,6 +251,18 @@ class Schedule:
             return True
         if self.kind == "one_time":
             return self.start_utc <= now < self.end_utc
+        if self.kind == "pomodoro":
+            work = timedelta(minutes=self.work_minutes)
+            pause = timedelta(minutes=self.break_minutes)
+            cycle = work + pause
+            elapsed = now - self.start_utc
+            if elapsed < timedelta(0):
+                return False
+            final_end = self.start_utc + work * self.cycles + pause * (self.cycles - 1)
+            if now >= final_end:
+                return False
+            _, offset = divmod(elapsed, cycle)
+            return offset < work
         local = now.astimezone(ZoneInfo(self.timezone_name))
         local_naive = local.replace(tzinfo=None)
         local_date = local.date()

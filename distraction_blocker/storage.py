@@ -1,4 +1,4 @@
-"""Signed, atomic policy storage."""
+"""Signed, atomic policy and control storage."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,11 +9,12 @@ import json
 import os
 from pathlib import Path
 import secrets
-import stat
 import tempfile
 from typing import Any
 
+from .control import ControlState
 from .model import Policy, ValidationError
+from .statistics import StatisticsState
 
 
 class StorageError(RuntimeError):
@@ -23,17 +24,20 @@ class StorageError(RuntimeError):
 @dataclass(frozen=True)
 class LoadResult:
     policy: Policy
+    controls: ControlState
     high_water_utc: datetime | None
     degraded: bool = False
     clock_untrusted: bool = False
 
 
 class ProtectedStore:
-    VERSION = 2
+    VERSION = 3
     KEY_NAME = "hmac.key"
     PRIMARY_NAME = "policy.json"
     BACKUP_NAME = "policy.json.bak"
+    STATISTICS_NAME = "statistics.json"
     MAX_POLICY_BYTES = 16 * 1024 * 1024
+    MAX_STATISTICS_BYTES = 1024 * 1024
 
     def __init__(self, directory: str | os.PathLike[str], key_source: Any = None):
         self.directory = Path(directory)
@@ -47,6 +51,10 @@ class ProtectedStore:
     @property
     def backup_path(self) -> Path:
         return self.directory / self.BACKUP_NAME
+
+    @property
+    def statistics_path(self) -> Path:
+        return self.directory / self.STATISTICS_NAME
 
     def initialize(self) -> None:
         if self.directory.exists() and self.directory.is_symlink():
@@ -110,7 +118,7 @@ class ProtectedStore:
     def _format_utc(value: datetime | None) -> str | None:
         if value is None:
             return None
-        if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta(0):
             raise StorageError("high-water time must be aware UTC")
         return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -121,27 +129,77 @@ class ProtectedStore:
         if not isinstance(value, str):
             raise StorageError("high-water time is invalid")
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
         except ValueError as exc:
             raise StorageError("high-water time is invalid") from exc
         if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
             raise StorageError("high-water time is invalid")
-        return parsed.astimezone(timezone.utc)
+        return parsed.astimezone(timezone.utc).replace(tzinfo=timezone.utc)
 
-    def _envelope(self, policy: Policy, high_water_utc: datetime | None, clock_untrusted: bool) -> bytes:
-        payload = {"clock_untrusted": bool(clock_untrusted), "high_water_utc": self._format_utc(high_water_utc), "policy": policy.to_dict()}
+    def _envelope(self, policy: Policy, controls: ControlState, high_water_utc: datetime | None, clock_untrusted: bool) -> bytes:
+        payload = {"policy": policy.to_dict(), "controls": controls.to_dict(), "clock_untrusted": bool(clock_untrusted), "high_water_utc": self._format_utc(high_water_utc)}
         unsigned = {"version": self.VERSION, "payload": payload}
         signature = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
         return self._canonical({**unsigned, "hmac": signature})
 
-    def save(self, policy: Policy, high_water_utc: datetime | None, clock_untrusted: bool = False) -> None:
+    def save(self, policy: Policy, controls: ControlState, high_water_utc: datetime | None, clock_untrusted: bool = False) -> None:
         if not isinstance(policy, Policy):
             raise StorageError("policy has an invalid type")
+        if not isinstance(controls, ControlState):
+            raise StorageError("controls have an invalid type")
+        if not isinstance(clock_untrusted, bool):
+            raise StorageError("clock state is invalid")
         self.initialize()
-        content = self._envelope(policy, high_water_utc, clock_untrusted)
-        # Breadcrumb for reviewers: both files use same-directory replace so a crash cannot expose a partial JSON file.
+        content = self._envelope(policy, controls, high_water_utc, clock_untrusted)
+        # Breadcrumb: both files use same-directory replace so a crash cannot expose a partial JSON file.
         self._atomic_write(self.backup_path, content)
         self._atomic_write(self.primary_path, content)
+
+    def _statistics_envelope(self, state: StatisticsState) -> bytes:
+        if not isinstance(state, StatisticsState):
+            raise StorageError("statistics state has an invalid type")
+        unsigned = {"version": 1, "payload": state.to_dict()}
+        signature = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
+        return self._canonical({**unsigned, "hmac": signature})
+
+    def save_statistics(self, state: StatisticsState) -> None:
+        """Atomically save observational statistics without touching policy files."""
+        self.initialize()
+        content = self._statistics_envelope(state)
+        if len(content) > self.MAX_STATISTICS_BYTES:
+            raise StorageError("statistics file is too large")
+        # Breadcrumb: statistics have no backup. Observational data must never rewrite policy backups.
+        self._atomic_write(self.statistics_path, content)
+
+    def load_statistics(self) -> StatisticsState:
+        """Load signed statistics, or return an empty state when absent."""
+        self.initialize()
+        path = self.statistics_path
+        if not path.exists():
+            return StatisticsState.empty()
+        if path.is_symlink() or not path.is_file():
+            raise StorageError("statistics path is not a regular file")
+        if path.stat().st_size > self.MAX_STATISTICS_BYTES:
+            raise StorageError("statistics file is too large")
+        try:
+            envelope = json.loads(path.read_bytes().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StorageError("statistics file is invalid") from exc
+        if not isinstance(envelope, dict) or set(envelope) != {"version", "payload", "hmac"}:
+            raise StorageError("statistics envelope is invalid")
+        signature = envelope["hmac"]
+        if envelope["version"] != 1 or not isinstance(signature, str) or len(signature) != 64:
+            raise StorageError("statistics envelope is invalid")
+        unsigned = {"version": envelope["version"], "payload": envelope["payload"]}
+        expected = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
+        # Breadcrumb: compare_digest protects the signed file boundary from timing differences.
+        if not hmac.compare_digest(signature, expected):
+            raise StorageError("statistics signature is invalid")
+        try:
+            return StatisticsState.from_dict(envelope["payload"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise StorageError("statistics payload is invalid") from exc
+
 
     def _atomic_write(self, path: Path, content: bytes) -> None:
         if path.exists() and path.is_symlink():
@@ -183,7 +241,7 @@ class ProtectedStore:
             except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, StorageError, ValidationError) as exc:
                 errors.append(exc)
         if not self.primary_path.exists() and not self.backup_path.exists():
-            return LoadResult(Policy(0, ()), None, False, False)
+            return LoadResult(Policy(0, ()), ControlState.empty(), None, False, False)
         raise StorageError("primary and backup policy state are invalid") from errors[-1]
 
     @staticmethod
@@ -221,25 +279,28 @@ class ProtectedStore:
         if not isinstance(envelope, dict) or set(envelope) != {"version", "payload", "hmac"}:
             raise StorageError("policy envelope is invalid")
         version = envelope["version"]
-        if isinstance(version, bool) or version not in {1, self.VERSION}:
+        if isinstance(version, bool) or version not in {1, 2, self.VERSION}:
             raise StorageError("policy version is invalid")
         signature = envelope["hmac"]
         if not isinstance(signature, str) or len(signature) != 64:
             raise StorageError("policy signature is invalid")
         unsigned = {"version": version, "payload": envelope["payload"]}
         expected = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
-        # Breadcrumb for reviewers: compare_digest avoids a timing leak from attacker-controlled signatures.
+        # Breadcrumb: compare_digest avoids a timing leak from attacker-controlled signatures.
         if not hmac.compare_digest(signature, expected):
             raise StorageError("policy signature is invalid")
         payload = envelope["payload"]
-        if not isinstance(payload, dict) or set(payload) != {"clock_untrusted", "high_water_utc", "policy"}:
+        old_fields = {"clock_untrusted", "high_water_utc", "policy"}
+        current_fields = old_fields | {"controls"}
+        if not isinstance(payload, dict) or set(payload) != (current_fields if version == self.VERSION else old_fields):
             raise StorageError("policy payload is invalid")
         if not isinstance(payload["clock_untrusted"], bool):
             raise StorageError("clock state is invalid")
         policy_data = self._migrate_policy(payload["policy"]) if version == 1 else payload["policy"]
         policy = Policy.from_dict(policy_data)
-        result = LoadResult(policy, self._parse_utc(payload["high_water_utc"]), degraded, payload["clock_untrusted"])
-        if version == 1:
-            # Breadcrumb for reviewers: verify the old signature first, then write only the converted v2 form.
-            self.save(policy, result.high_water_utc, result.clock_untrusted)
+        controls = ControlState.from_dict(payload["controls"]) if version == self.VERSION else ControlState.empty()
+        result = LoadResult(policy, controls, self._parse_utc(payload["high_water_utc"]), degraded, payload["clock_untrusted"])
+        if version != self.VERSION:
+            # Breadcrumb: verify the old signature first, then write only the converted v3 form.
+            self.save(policy, controls, result.high_water_utc, result.clock_untrusted)
         return result

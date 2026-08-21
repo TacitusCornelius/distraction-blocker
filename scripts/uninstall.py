@@ -17,10 +17,11 @@ RUN = Path("/run/distraction-blocker")
 UNIT = Path("/etc/systemd/system/distraction-blocker.service")
 DESKTOP = Path("/usr/share/applications/org.distraction_blocker.App.desktop")
 LEGACY_DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
-POLICY_FILES = ("hmac.key", "policy.json", "policy.json.bak")
+CLI_PATH = Path("/usr/local/bin/distraction-blocker")
+POLICY_FILES = ("hmac.key", "policy.json", "policy.json.bak", "statistics.json")
 MARKER_NAME = "INSTALLATION"
 MARKER_TEXT = "distraction-blocker\n"
-
+CLI_MARKER = "# distraction-blocker-owned-wrapper-v1"
 
 def fail(message: str) -> NoReturn:
     print(f"Uninstall refused: {message}", file=sys.stderr)
@@ -51,6 +52,24 @@ def clear_hosts() -> None:
     HostsEnforcer("/etc/hosts").clear()
 
 
+def remove_cli() -> None:
+    """Remove only the wrapper that carries our ownership marker."""
+    if CLI_PATH.is_symlink():
+        fail(f"refusing to remove a symlink at {CLI_PATH}")
+    if not CLI_PATH.exists():
+        return
+    if not CLI_PATH.is_file():
+        fail(f"refusing to remove an unsafe CLI path: {CLI_PATH}")
+    try:
+        owned = CLI_MARKER in CLI_PATH.read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        owned = False
+    if not owned:
+        fail(f"refusing to remove an unrelated CLI path: {CLI_PATH}")
+    CLI_PATH.unlink()
+
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Remove Distraction Blocker")
     parser.add_argument(
@@ -76,6 +95,7 @@ def main() -> int:
             fail("the service unit is missing or unsafe")
         run_systemctl(["disable", "--now", "distraction-blocker.service"])
         clear_hosts()
+        remove_cli()
 
         for path in (UNIT, DESKTOP, LEGACY_DESKTOP):
             if path.is_symlink():

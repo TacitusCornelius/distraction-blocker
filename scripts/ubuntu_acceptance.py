@@ -25,6 +25,12 @@ SOCKET = Path("/run/distraction-blocker/control.sock")
 TEST_EXECUTABLE = Path("/usr/local/lib/distraction-blocker-acceptance-app")
 TEST_DOMAIN = "blocked.invalid"
 TEST_WEEKLY_DOMAIN = "weekly.invalid"
+TEST_POMODORO_DOMAIN = "pomodoro.invalid"
+TIMED_LOCK_RULE = "11111111-1111-4111-8111-111111111111"
+FRICTION_LOCK_RULE = "22222222-2222-4222-8222-222222222222"
+PASSWORD_LOCK_RULE = "33333333-3333-4333-8333-333333333333"
+POMODORO_RULE = "44444444-4444-4444-8444-444444444444"
+CLI_PATH = Path("/usr/local/bin/distraction-blocker")
 MARKER_PURPOSE = "distraction-blocker-acceptance"
 
 
@@ -185,6 +191,134 @@ def add_active_weekly_rule() -> str:
         },
     )
     return rule_id
+
+
+def add_v13_state() -> None:
+    now = datetime.now(timezone.utc)
+    client = installed_client()
+    for rule_id, name in (
+        (TIMED_LOCK_RULE, "Timed lock acceptance"),
+        (FRICTION_LOCK_RULE, "Friction lock acceptance"),
+        (PASSWORD_LOCK_RULE, "Password lock acceptance"),
+    ):
+        client.request(
+            "put_rule",
+            rule={
+                "id": rule_id,
+                "name": name,
+                "enabled": False,
+                "targets": [{
+                    "kind": "website",
+                    "value": f"{rule_id[:8]}.invalid",
+                }],
+                "schedule": {"kind": "indefinite"},
+                "revision": 0,
+            },
+        )
+    client.request(
+        "set_rule_lock",
+        rule_id=TIMED_LOCK_RULE,
+        lock={
+            "kind": "timed",
+            "until_utc": (now + timedelta(hours=2))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        },
+    )
+    client.request(
+        "set_rule_lock",
+        rule_id=FRICTION_LOCK_RULE,
+        lock={"kind": "friction"},
+    )
+    client.request(
+        "set_rule_lock",
+        rule_id=PASSWORD_LOCK_RULE,
+        lock={
+            "kind": "password",
+            "password": "acceptance secret",
+        },
+    )
+    challenge = client.request(
+        "begin_rule_authorization", rule_id=PASSWORD_LOCK_RULE
+    )
+    from distraction_blocker.rpc import RpcError
+    try:
+        client.request(
+            "complete_rule_authorization",
+            rule_id=PASSWORD_LOCK_RULE,
+            challenge_id=challenge["challenge_id"],
+            response="incorrect secret",
+        )
+    except RpcError as error:
+        if error.code != "invalid_password":
+            raise
+    client.request(
+        "put_rule",
+        rule={
+            "id": POMODORO_RULE,
+            "name": "Pomodoro acceptance",
+            "enabled": True,
+            "targets": [{
+                "kind": "website",
+                "value": TEST_POMODORO_DOMAIN,
+            }],
+            "schedule": {
+                "kind": "pomodoro",
+                "start_utc": (now - timedelta(minutes=1))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "work_minutes": 60,
+                "break_minutes": 1,
+                "cycles": 2,
+            },
+            "revision": 0,
+        },
+    )
+
+
+def check_v13_state(owner_uid: int) -> None:
+    client = installed_client()
+    locks = client.request("list_locks")
+    kinds = {item["rule_id"]: item["kind"] for item in locks}
+    expected = {
+        TIMED_LOCK_RULE: "timed",
+        FRICTION_LOCK_RULE: "friction",
+        PASSWORD_LOCK_RULE: "password",
+    }
+    if any(kinds.get(rule_id) != kind for rule_id, kind in expected.items()):
+        raise AcceptanceError("Version 1.3 locks did not persist.")
+    rules = {item["id"]: item for item in client.request("list_rules")}
+    schedule = rules.get(POMODORO_RULE, {}).get("schedule")
+    if not isinstance(schedule, dict) or schedule.get("kind") != "pomodoro":
+        raise AcceptanceError("The Pomodoro schedule did not persist.")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        statistics = client.request("list_denial_stats")
+        if any(
+            item.get("path") == str(TEST_EXECUTABLE)
+            and item.get("count", 0) > 0
+            for item in statistics.get("items", [])
+        ):
+            break
+        time.sleep(0.2)
+    else:
+        raise AcceptanceError("Application denial statistics were not recorded.")
+    account = pwd.getpwuid(owner_uid)
+    result = command([
+        "/usr/sbin/runuser",
+        "-u",
+        account.pw_name,
+        "--",
+        str(CLI_PATH),
+        "--json",
+        "status",
+    ])
+    try:
+        cli_status = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise AcceptanceError("The public CLI returned invalid JSON.") from error
+    if cli_status.get("healthy") is not True:
+        raise AcceptanceError("The public CLI did not report healthy state.")
 
 
 def check_domain_block(domain: str = TEST_DOMAIN) -> None:
@@ -369,12 +503,16 @@ def phase_one(source_root: Path, owner_uid: int, reboot: bool) -> None:
     make_test_executable()
     add_active_rule()
     add_active_weekly_rule()
+    add_v13_state()
     check_domain_block()
     check_domain_block(TEST_WEEKLY_DOMAIN)
+    check_domain_block(TEST_POMODORO_DOMAIN)
     check_executable_block()
+    check_v13_state(owner_uid)
     check_gui_exit(owner_uid)
     change_time_and_restore()
     tamper_primary_and_restart()
+    check_v13_state(owner_uid)
     STATE_DIRECTORY.mkdir(mode=0o700, parents=False, exist_ok=False)
     STATE.write_text(json.dumps({
         "phase": 2,
@@ -389,14 +527,16 @@ def phase_one(source_root: Path, owner_uid: int, reboot: bool) -> None:
     command(["/usr/bin/systemctl", "reboot"], check=False)
 
 
-def phase_two(source_root: Path) -> None:
+def phase_two(source_root: Path, owner_uid: int) -> None:
     wait_for_service()
     status = installed_client().request("status")
     if status.get("clock_trusted") is not False:
         raise AcceptanceError("The clock-tamper latch did not survive the restart.")
     check_domain_block()
     check_domain_block(TEST_WEEKLY_DOMAIN)
+    check_domain_block(TEST_POMODORO_DOMAIN)
     check_executable_block()
+    check_v13_state(owner_uid)
     cleanup(source_root, strict=True)
     print("Ubuntu acceptance checks passed.")
 
@@ -427,7 +567,7 @@ def main() -> int:
         current_boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
         if current_boot == state["boot_id"]:
             raise AcceptanceError("Restart the virtual machine before phase 2.")
-        phase_two(source_root)
+        phase_two(source_root, owner_uid)
         return 0
     if INSTALL_MARKER.exists():
         raise AcceptanceError("Remove the existing Distraction Blocker installation first.")

@@ -68,3 +68,69 @@ class FanotifyTests(unittest.TestCase):
             os.close(write_fd)
             enforcer._fd = None
             enforcer.close()
+
+    def test_denial_is_responded_before_statistics_record(self):
+        observed: list[bytes] = []
+
+        class Buffer:
+            def record(self, path, _rule_ids=()):
+                observed.append(os.read(read_fd, _RESPONSE.size))
+                return True
+
+        enforcer = FanotifyEnforcer(lambda: [], Buffer())
+        read_fd, write_fd = os.pipe()
+        try:
+            enforcer.set_blocked(["/usr/bin/example"])
+            enforcer._fd = write_fd
+            event = _METADATA.pack(
+                _METADATA.size, 3, 0, _METADATA.size,
+                FAN_OPEN_EXEC_PERM, read_fd, 0,
+            )
+            with patch("os.readlink", return_value="/usr/bin/example"), patch("os.close"):
+                enforcer.process_bytes(event)
+            self.assertEqual(_RESPONSE.unpack(observed[0]), (read_fd, FAN_DENY))
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+            enforcer._fd = None
+            enforcer.close()
+
+    def test_statistics_failure_does_not_change_health(self):
+        class Buffer:
+            def record(self, path, _rule_ids=()):
+                raise RuntimeError("statistics unavailable")
+
+        enforcer = FanotifyEnforcer(lambda: [], Buffer())
+        read_fd, write_fd = os.pipe()
+        try:
+            enforcer.set_blocked(["/usr/bin/example"])
+            enforcer._fd = write_fd
+            event = _METADATA.pack(
+                _METADATA.size, 3, 0, _METADATA.size,
+                FAN_OPEN_EXEC_PERM, read_fd, 0,
+            )
+            with patch("os.readlink", return_value="/usr/bin/example"), patch("os.close"):
+                enforcer.process_bytes(event)
+            self.assertTrue(enforcer.healthy)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+            enforcer._fd = None
+            enforcer.close()
+
+    def test_select_failure_marks_listener_unhealthy(self):
+        enforcer = FanotifyEnforcer(lambda: [])
+        read_fd, write_fd = os.pipe()
+        try:
+            enforcer._fd = read_fd
+            with patch(
+                "distraction_blocker.enforcement.select.select",
+                side_effect=ValueError("closed descriptor"),
+            ):
+                enforcer._run()
+            self.assertFalse(enforcer.healthy)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+            enforcer._fd = None
+            enforcer.close()

@@ -10,6 +10,7 @@ Each rule supports website, application, and managed-list targets. Each rule use
 
 - One time: The rule has one UTC start and end.
 - Weekly: The rule has up to 16 local weekly periods and one IANA time zone.
+- Pomodoro: The rule alternates work blocks with permitted breaks.
 - Indefinite: The rule stays active until the user disables it.
 
 A weekly period can cross midnight. Overlapping periods act as one continuous block.
@@ -17,6 +18,22 @@ A weekly period can cross midnight. Overlapping periods act as one continuous bl
 An active finite rule cannot lose targets, stop early, or become disabled.
 
 The service continues after the GUI closes. The service starts during the Ubuntu boot process.
+
+## Version 1.3
+
+Version 1.3 adds these functions:
+
+- Timed rule locks.
+- Random-text friction locks.
+- Password locks with root-owned scrypt hashes.
+- Persisted password attempt delays.
+- Pomodoro work and break schedules.
+- Bounded application denial statistics.
+- A public socket-only command-line client.
+- A multi-user policy research record.
+
+Locks and statistics stay outside portable policy exports. The root service remains the policy authority.
+
 
 ## Version 1.2
 
@@ -67,6 +84,10 @@ Root recovery must correct the clock and protected state. An offline RTC change 
 
 A fanotify listener failure or queue overflow can permit an execution. The service reports this state as unhealthy and rejects policy changes.
 
+Application denial statistics count denied starts. They do not measure foreground use or time spent in an application.
+
+Random-text entry adds friction only. It is not a security boundary.
+
 ## Requirements
 
 Use Ubuntu with systemd, Python 3, GTK 4, `python3-gi`, and a kernel that supports fanotify permission events.
@@ -101,6 +122,37 @@ Open **Distraction Blocker** from the Ubuntu application menu. You can also run 
 /usr/bin/python3 -I /usr/lib/distraction-blocker/gui_entry.py gui
 ```
 
+The installer also adds the public client at `/usr/local/bin/distraction-blocker`.
+
+### Command-line client
+
+The client uses the same owner-checked Unix socket as the GUI. It never reads protected files.
+
+Run a command:
+
+```bash
+distraction-blocker status
+distraction-blocker rules
+distraction-blocker managed-lists
+distraction-blocker today
+distraction-blocker focus RULE_ID 30
+distraction-blocker stats
+```
+
+Rule commands are `enable`, `disable`, and `delete`.
+
+Lock commands are `lock-timed`, `lock-friction`, `lock-password`, `clear-lock`, and `authorize`.
+
+The password commands read hidden terminal input. A password never appears in a command argument or output.
+
+Add `--json` for one deterministic JSON result:
+
+```bash
+distraction-blocker --json status
+```
+
+The client returns a nonzero status when validation or the service refuses a request.
+
 ## Use
 
 1. Select **Add rule**.
@@ -108,7 +160,7 @@ Open **Distraction Blocker** from the Ubuntu application menu. You can also run 
 3. Enter each exact website hostname on a separate line.
 4. Select each application executable.
 5. Select a schedule type.
-6. Select dates and times, or add one or more weekly periods.
+6. Select dates, times, weekly periods, or Pomodoro values.
 7. Select **Save rule**.
 
 Disable an indefinite rule before you delete it. Wait for an active finite rule to end before you weaken or delete it.
@@ -172,6 +224,38 @@ The GUI copies the source targets into an immediate one-time rule. The available
 
 You can also enter a custom number of minutes.
 
+### Rule locks
+
+Select **Lock** on a rule. Select a timed, friction, or password lock.
+
+A timed lock cannot be shortened before its UTC expiry. An untrusted clock keeps it effective.
+
+A friction lock shows random text. Select **Authorize**, then type that text exactly.
+
+A password lock stores only a root-owned scrypt hash. Select **Authorize**, then enter the hidden password.
+
+Friction and password authorization permit one weakening change for 60 seconds. The grant is memory-only and single-use.
+
+Failed password attempts add a persisted delay. The delay increases to a maximum of 64 seconds.
+
+Root remains outside the lock boundary and can recover protected state.
+
+### Pomodoro schedules
+
+Select **Pomodoro** in the rule editor. Set the start, work minutes, break minutes, and cycle count.
+
+The service blocks during work and permits each break. The UTC start keeps the phase stable after GUI exit and reboot.
+
+### Application denial statistics
+
+Select **Denial statistics** to see blocked application starts.
+
+Each row shows the path, count, first time, last time, and applicable rule IDs.
+
+The service stores at most 256 paths. A bounded queue reports events that it must drop.
+
+Select **Clear statistics** only when you no longer need this observational data.
+
 ### Daily overview and notifications
 
 Select **Daily overview** to see today's enabled intervals in the system time zone.
@@ -196,7 +280,7 @@ The service refuses a native import that removes or weakens an active rule or ac
 
 Version 2 backups include rules, managed-list metadata, and managed-list domains. Native backup files have an 8 MiB limit.
 
-Native backups do not contain the HMAC key, policy signature, clock state, or socket data.
+Native backups exclude locks, password hashes, attempt state, denial statistics, the HMAC key, policy signature, clock state, and socket data.
 
 ### Duplicate, search, and filter
 

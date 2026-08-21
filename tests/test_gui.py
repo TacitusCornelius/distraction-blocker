@@ -8,29 +8,51 @@ from datetime import UTC, date, datetime
 from uuid import UUID
 
 from distraction_blocker.gui import (
+    _rule_state_text,
+    _schedule_summary,
+    _state_change_action,
+    AuthorizationChallenge,
+    AuthorizationGrant,
+    DenialStat,
+    DenialStatDisplay,
+    DenialStatistics,
     FormError,
     GtkUnavailableError,
+    LockSummary,
     ManagedListSummary,
     ObservedRuleState,
     RuleEditor,
     RuleForm,
     WeeklyPeriodForm,
-    create_focus_rule,
+    authorization_challenge_from_result,
+    authorization_grant_from_result,
+    begin_rule_authorization_request,
+    active_lock_explanation,
+    complete_rule_authorization_request,
     default_one_time_window,
+    daily_schedule_from_result,
+    denial_stat_display,
+    denial_statistics_from_result,
     detect_rule_transitions,
     duplicate_rule,
     filter_rules,
     form_to_request,
+    friction_lock_request,
     import_preview_text,
     load_gtk,
+    lock_summaries_from_results,
+    lock_summary_text,
     managed_list_import_metadata,
     managed_list_summaries_from_results,
+    password_lock_request,
+    remove_rule_lock_request,
     next_state_change,
     picker_datetime_text,
     picker_text_to_datetime,
     project_daily_schedule,
     rule_to_form,
     snapshot_from_results,
+    timed_lock_request,
     staged_list_upload_calls,
     staged_native_upload_calls,
     utf8_text_chunks,
@@ -161,6 +183,82 @@ class FormConversionTests(unittest.TestCase):
             },
         )
 
+    def test_pomodoro_form_converts_local_start_and_exact_fields(self) -> None:
+        form = RuleForm(
+            name="Deep work",
+            websites=("example.com",),
+            applications=(),
+            managed_list_ids=(),
+            schedule_kind="pomodoro",
+            timezone="America/New_York",
+            pomodoro_start="2026-08-14 09:00",
+            pomodoro_work_minutes=45,
+            pomodoro_break_minutes=10,
+            pomodoro_cycles=3,
+        )
+
+        rule = form_to_request(form, id_factory=lambda: UUID(RULE_ID))["rule"]
+
+        self.assertEqual(
+            rule["schedule"],
+            {
+                "kind": "pomodoro",
+                "start_utc": "2026-08-14T13:00:00.000000Z",
+                "work_minutes": 45,
+                "break_minutes": 10,
+                "cycles": 3,
+            },
+        )
+
+    def test_pomodoro_form_enforces_each_integer_bound(self) -> None:
+        cases = (
+            ("pomodoro_work_minutes", 0, "Work minutes"),
+            ("pomodoro_work_minutes", 181, "Work minutes"),
+            ("pomodoro_break_minutes", 0, "Break minutes"),
+            ("pomodoro_break_minutes", 61, "Break minutes"),
+            ("pomodoro_cycles", 0, "Cycles"),
+            ("pomodoro_cycles", 21, "Cycles"),
+        )
+        for field, value, message in cases:
+            values = {
+                "pomodoro_work_minutes": 25,
+                "pomodoro_break_minutes": 5,
+                "pomodoro_cycles": 4,
+            }
+            values[field] = value
+            form = RuleForm(
+                name="Deep work",
+                websites=("example.com",),
+                applications=(),
+                managed_list_ids=(),
+                schedule_kind="pomodoro",
+                timezone="UTC",
+                pomodoro_start="2026-08-14 09:00",
+                **values,
+            )
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(FormError, message):
+                    form_to_request(form, id_factory=lambda: UUID(RULE_ID))
+
+    def test_pomodoro_rule_loads_local_editor_values(self) -> None:
+        rule = make_rule(
+            schedule={
+                "kind": "pomodoro",
+                "start_utc": "2026-08-14T13:00:00Z",
+                "work_minutes": 45,
+                "break_minutes": 10,
+                "cycles": 3,
+            }
+        )
+
+        form = rule_to_form(rule, "America/New_York")
+
+        self.assertEqual(form.schedule_kind, "pomodoro")
+        self.assertEqual(form.pomodoro_start, "2026-08-14 09:00")
+        self.assertEqual(form.pomodoro_work_minutes, 45)
+        self.assertEqual(form.pomodoro_break_minutes, 10)
+        self.assertEqual(form.pomodoro_cycles, 3)
+
     def test_managed_list_can_be_the_only_target(self) -> None:
         form = RuleForm(
             name="Managed",
@@ -277,6 +375,62 @@ class StoredRuleEditorTests(unittest.TestCase):
 
         self.assertEqual(editor.weekly_rows, [])
 
+    def test_pomodoro_rule_populates_picker_and_integer_controls(self) -> None:
+        class TextField:
+            def set_text(self, value):
+                self.value = value
+
+        class TextView:
+            def __init__(self):
+                self.buffer = TextField()
+
+            def get_buffer(self):
+                return self.buffer
+
+        class Dropdown:
+            def set_selected(self, value):
+                self.value = value
+
+        class Stack:
+            def set_visible_child_name(self, value):
+                self.value = value
+
+        class ValueField:
+            def set_value(self, value):
+                self.value = value
+
+        editor = RuleEditor.__new__(RuleEditor)
+        editor.name_entry = TextField()
+        editor.website_view = TextView()
+        editor.application_paths = []
+        editor._render_applications = lambda: None
+        editor.managed_list_checks = {}
+        editor.schedule_dropdown = Dropdown()
+        editor.schedule_stack = Stack()
+        editor.pomodoro_start = TextField()
+        editor.pomodoro_work = ValueField()
+        editor.pomodoro_break = ValueField()
+        editor.pomodoro_cycles = ValueField()
+        editor.weekly_rows = []
+        editor._remove_weekly_period = editor.weekly_rows.remove
+        editor._add_weekly_period = editor.weekly_rows.append
+        rule = make_rule(
+            schedule={
+                "kind": "pomodoro",
+                "start_utc": "2026-08-14T09:00:00Z",
+                "work_minutes": 50,
+                "break_minutes": 8,
+                "cycles": 5,
+            }
+        )
+
+        editor._populate(rule_to_form(rule, "UTC"))
+
+        self.assertEqual(editor.pomodoro_start.value, "2026-08-14 09:00")
+        self.assertEqual(editor.pomodoro_work.value, 50)
+        self.assertEqual(editor.pomodoro_break.value, 8)
+        self.assertEqual(editor.pomodoro_cycles.value, 5)
+
 
 class ScheduleProjectionTests(unittest.TestCase):
     def test_next_change_uses_union_of_weekly_periods(self) -> None:
@@ -295,6 +449,96 @@ class ScheduleProjectionTests(unittest.TestCase):
 
         self.assertEqual(change.at_utc, datetime(2026, 8, 14, 12, tzinfo=UTC))
         self.assertFalse(change.active_after)
+
+    def test_pomodoro_next_change_names_work_break_and_final_end(self) -> None:
+        rule = make_rule(
+            schedule={
+                "kind": "pomodoro",
+                "start_utc": "2026-08-14T09:00:00Z",
+                "work_minutes": 25,
+                "break_minutes": 5,
+                "cycles": 3,
+            }
+        )
+        cases = (
+            (
+                datetime(2026, 8, 14, 8, 50, tzinfo=UTC),
+                datetime(2026, 8, 14, 9, 0, tzinfo=UTC),
+                True,
+                "Work starts",
+            ),
+            (
+                datetime(2026, 8, 14, 9, 10, tzinfo=UTC),
+                datetime(2026, 8, 14, 9, 25, tzinfo=UTC),
+                False,
+                "Break starts",
+            ),
+            (
+                datetime(2026, 8, 14, 9, 27, tzinfo=UTC),
+                datetime(2026, 8, 14, 9, 30, tzinfo=UTC),
+                True,
+                "Work starts",
+            ),
+            (
+                datetime(2026, 8, 14, 10, 1, tzinfo=UTC),
+                datetime(2026, 8, 14, 10, 25, tzinfo=UTC),
+                False,
+                "Ends",
+            ),
+        )
+        for now, expected_at, active_after, action in cases:
+            with self.subTest(now=now):
+                change = next_state_change(rule, now)
+                self.assertEqual(change.at_utc, expected_at)
+                self.assertEqual(change.active_after, active_after)
+                self.assertEqual(_state_change_action(rule, change), action)
+
+        self.assertIsNone(
+            next_state_change(rule, datetime(2026, 8, 14, 10, 25, tzinfo=UTC))
+        )
+        self.assertIn("Pomodoro: 3 cycles", _schedule_summary(rule))
+        self.assertEqual(
+            _rule_state_text(
+                rule, datetime(2026, 8, 14, 9, 10, tzinfo=UTC), True
+            ),
+            "Work",
+        )
+        self.assertEqual(
+            _rule_state_text(
+                rule, datetime(2026, 8, 14, 9, 27, tzinfo=UTC), True
+            ),
+            "Break",
+        )
+        self.assertIn(
+            "cannot be weakened before",
+            active_lock_explanation(
+                rule, datetime(2026, 8, 14, 9, 10, tzinfo=UTC), True
+            ),
+        )
+
+    def test_daily_projection_contains_only_pomodoro_work_intervals(self) -> None:
+        rule = make_rule(
+            schedule={
+                "kind": "pomodoro",
+                "start_utc": "2026-08-14T09:00:00Z",
+                "work_minutes": 25,
+                "break_minutes": 5,
+                "cycles": 3,
+            }
+        )
+
+        intervals = project_daily_schedule((rule,), date(2026, 8, 14), "UTC")
+
+        self.assertEqual(
+            [
+                (
+                    item.start_local.strftime("%H:%M"),
+                    item.end_local.strftime("%H:%M"),
+                )
+                for item in intervals
+            ],
+            [("09:00", "09:25"), ("09:30", "09:55"), ("10:00", "10:25")],
+        )
 
     def test_daily_projection_uses_requested_system_zone(self) -> None:
         rule = make_rule(
@@ -336,37 +580,30 @@ class ScheduleProjectionTests(unittest.TestCase):
         )
 
 
-class FocusAndTransitionTests(unittest.TestCase):
-    def test_focus_rule_copies_targets_for_exact_duration(self) -> None:
-        source = make_rule(
-            name="Work block",
-            targets=[
-                {"kind": "website", "value": "example.com"},
-                {"kind": "managed_list", "value": LIST_ID},
-            ],
-        )
-        now = datetime(2026, 8, 14, 12, 0, 30, tzinfo=UTC)
+    def test_daily_schedule_rpc_result_is_strict(self) -> None:
+        day, timezone_name, intervals = daily_schedule_from_result({
+            "date": "2026-08-20",
+            "timezone": "UTC",
+            "intervals": [{
+                "rule_id": RULE_ID,
+                "rule_name": "Focus",
+                "start": "2026-08-20T09:00:00+00:00",
+                "end": "2026-08-20T10:00:00+00:00",
+            }],
+        })
+        self.assertEqual(day, date(2026, 8, 20))
+        self.assertEqual(timezone_name, "UTC")
+        self.assertEqual(intervals[0].rule_id, RULE_ID)
+        with self.assertRaises(FormError):
+            daily_schedule_from_result({
+                "date": "2026-08-20",
+                "timezone": "UTC",
+                "intervals": [],
+                "extra": True,
+            })
 
-        focus = create_focus_rule(
-            source,
-            30,
-            now,
-            id_factory=lambda: UUID(SECOND_RULE_ID),
-        )
 
-        self.assertEqual(focus.id, SECOND_RULE_ID)
-        self.assertEqual(focus.name, "Focus: Work block")
-        self.assertEqual(focus.targets, source.targets)
-        self.assertTrue(focus.enabled)
-        self.assertEqual(
-            focus.to_dict()["schedule"],
-            {
-                "kind": "one_time",
-                "start_utc": "2026-08-14T12:00:30.000000Z",
-                "end_utc": "2026-08-14T12:30:30.000000Z",
-            },
-        )
-
+class TransitionTests(unittest.TestCase):
     def test_transition_detection_reports_only_observed_changes(self) -> None:
         previous = {
             RULE_ID: ObservedRuleState("Focus", False),
@@ -384,6 +621,7 @@ class FocusAndTransitionTests(unittest.TestCase):
             [("Focus", True), ("Rest", False)],
         )
         self.assertEqual(detect_rule_transitions({}, {}), ())
+
 
 
 class StagedUploadTests(unittest.TestCase):
@@ -459,6 +697,263 @@ class ServiceResultTests(unittest.TestCase):
         with self.assertRaisesRegex(FormError, "summary"):
             managed_list_summaries_from_results(({**item, "domains": []},))
 
+    def test_lock_summary_accepts_public_timed_and_friction_fields(self) -> None:
+        timed = {
+            "rule_id": RULE_ID,
+            "kind": "timed",
+            "locked": True,
+            "until_utc": "2026-08-14T16:00:00.000000Z",
+            "retry_after_utc": None,
+        }
+        friction = {
+            "rule_id": SECOND_RULE_ID,
+            "kind": "friction",
+            "locked": True,
+            "until_utc": None,
+            "retry_after_utc": None,
+        }
+
+        summaries = lock_summaries_from_results((timed, friction))
+
+        self.assertEqual(
+            summaries,
+            (
+                LockSummary(
+                    RULE_ID,
+                    "timed",
+                    True,
+                    datetime(2026, 8, 14, 16, tzinfo=UTC),
+                    None,
+                ),
+                LockSummary(
+                    SECOND_RULE_ID,
+                    "friction",
+                    True,
+                    None,
+                    None,
+                ),
+            ),
+        )
+        self.assertEqual(
+            lock_summary_text(summaries[0], "America/New_York"),
+            (
+                "Timed lock: locked. Expiry: 2026-08-14 16:00:00 UTC "
+                "(2026-08-14 12:00:00 EDT local)."
+            ),
+        )
+        self.assertEqual(
+            lock_summary_text(summaries[1], "America/New_York"),
+            "Friction lock: authorization required for weakening changes.",
+        )
+        with self.assertRaisesRegex(FormError, "summary"):
+            lock_summaries_from_results(({**timed, "salt": "protected"},))
+        with self.assertRaisesRegex(FormError, "unsupported lock kind"):
+            lock_summaries_from_results(({**timed, "kind": "pin"},))
+        with self.assertRaisesRegex(FormError, "expiry"):
+            lock_summaries_from_results(
+                ({**friction, "until_utc": timed["until_utc"]},)
+            )
+
+    def test_rule_lock_requests_cover_all_kinds_and_removal(self) -> None:
+        password = "correct horse"
+        self.assertEqual(
+            timed_lock_request(
+                RULE_ID,
+                "2026-08-14 12:00",
+                "America/New_York",
+            ),
+            {
+                "rule_id": RULE_ID,
+                "lock": {
+                    "kind": "timed",
+                    "until_utc": "2026-08-14T16:00:00Z",
+                },
+            },
+        )
+        self.assertEqual(
+            friction_lock_request(RULE_ID),
+            {"rule_id": RULE_ID, "lock": {"kind": "friction"}},
+        )
+        self.assertEqual(
+            password_lock_request(RULE_ID, password, password),
+            {
+                "rule_id": RULE_ID,
+                "lock": {"kind": "password", "password": password},
+            },
+        )
+        self.assertEqual(
+            remove_rule_lock_request(RULE_ID),
+            {"rule_id": RULE_ID, "lock": {"kind": "none"}},
+        )
+
+    def test_password_lock_request_validates_secret_before_rpc(self) -> None:
+        self.assertEqual(
+            password_lock_request(RULE_ID, "éééé", "éééé")["lock"]["password"],
+            "éééé",
+        )
+        with self.assertRaisesRegex(FormError, "at least 8"):
+            password_lock_request(RULE_ID, "short", "short")
+        with self.assertRaisesRegex(FormError, "match"):
+            password_lock_request(RULE_ID, "long enough", "different")
+        with self.assertRaisesRegex(FormError, "at most 1024"):
+            password_lock_request(RULE_ID, "x" * 1025, "x" * 1025)
+
+    def test_authorization_requests_and_results_preserve_service_text(self) -> None:
+        challenge_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        prompt = "Ab3dE5fG7hJ9"
+        challenge = authorization_challenge_from_result(
+            {
+                "rule_id": RULE_ID,
+                "kind": "friction",
+                "challenge_id": challenge_id,
+                "prompt": prompt,
+                "expires_in": 120,
+            }
+        )
+
+        self.assertEqual(
+            challenge,
+            AuthorizationChallenge(
+                RULE_ID,
+                "friction",
+                challenge_id,
+                prompt,
+                120,
+            ),
+        )
+        self.assertEqual(
+            begin_rule_authorization_request(RULE_ID),
+            {"rule_id": RULE_ID},
+        )
+        self.assertEqual(
+            complete_rule_authorization_request(
+                RULE_ID,
+                challenge.challenge_id,
+                challenge.prompt,
+            ),
+            {
+                "rule_id": RULE_ID,
+                "challenge_id": challenge_id,
+                "response": prompt,
+            },
+        )
+        self.assertEqual(
+            authorization_grant_from_result(
+                {"rule_id": RULE_ID, "authorized": True, "expires_in": 60}
+            ),
+            AuthorizationGrant(RULE_ID, True, 60),
+        )
+        with self.assertRaisesRegex(FormError, "challenge"):
+            authorization_challenge_from_result(
+                {
+                    "rule_id": RULE_ID,
+                    "kind": "friction",
+                    "challenge_id": challenge_id,
+                    "prompt": prompt,
+                    "expires_in": 120,
+                    "generated_by_gui": False,
+                }
+            )
+
+    def test_password_secret_appears_only_in_outbound_requests(self) -> None:
+        challenge_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        password = "private password"
+        public_result = {
+            "rule_id": RULE_ID,
+            "kind": "password",
+            "locked": True,
+            "until_utc": None,
+            "retry_after_utc": "2026-08-14T16:05:00Z",
+        }
+
+        summary = lock_summaries_from_results((public_result,))[0]
+        challenge = authorization_challenge_from_result(
+            {
+                "rule_id": RULE_ID,
+                "kind": "password",
+                "challenge_id": challenge_id,
+                "prompt": None,
+                "expires_in": 120,
+            }
+        )
+        set_request = password_lock_request(RULE_ID, password, password)
+        complete_request = complete_rule_authorization_request(
+            RULE_ID,
+            challenge_id,
+            password,
+            "password",
+        )
+        begin_request = begin_rule_authorization_request(RULE_ID)
+
+        self.assertEqual(summary.kind, "password")
+        self.assertIsNone(summary.until_utc)
+        self.assertEqual(
+            summary.retry_after_utc,
+            datetime(2026, 8, 14, 16, 5, tzinfo=UTC),
+        )
+        self.assertIsNone(challenge.prompt)
+        self.assertNotIn("password", public_result.keys())
+        self.assertNotIn(password, repr(public_result))
+        self.assertNotIn(password, repr(begin_request))
+        self.assertNotIn(password, repr(summary))
+        self.assertNotIn(password, repr(challenge))
+        self.assertEqual(set_request["lock"]["password"], password)
+        self.assertEqual(complete_request["response"], password)
+        self.assertNotIn("confirmation", set_request["lock"])
+        with self.assertRaisesRegex(FormError, "at least 8"):
+            complete_rule_authorization_request(
+                RULE_ID,
+                challenge_id,
+                "short",
+                "password",
+            )
+        self.assertEqual(
+            lock_summary_text(summary, "America/New_York"),
+            (
+                "Password lock: authorization required for weakening changes. "
+                "Retry after: 2026-08-14 16:05:00 UTC "
+                "(2026-08-14 12:05:00 EDT local)."
+            ),
+        )
+        with self.assertRaisesRegex(FormError, "summary"):
+            lock_summaries_from_results(
+                ({**public_result, "password": password},)
+            )
+        with self.assertRaisesRegex(FormError, "authorization text"):
+            authorization_challenge_from_result(
+                {
+                    "rule_id": RULE_ID,
+                    "kind": "password",
+                    "challenge_id": challenge_id,
+                    "prompt": password,
+                    "expires_in": 120,
+                }
+            )
+
+    def test_snapshot_keeps_public_lock_summaries_beside_rules(self) -> None:
+        snapshot = snapshot_from_results(
+            {
+                "healthy": True,
+                "clock_trusted": True,
+                "clock_reason": "",
+                "active_counts": {"website": 0, "application": 0},
+            },
+            (make_rule().to_dict(),),
+            (),
+            (
+                {
+                    "rule_id": RULE_ID,
+                    "kind": "timed",
+                    "locked": False,
+                    "until_utc": "2026-08-14T16:00:00Z",
+                    "retry_after_utc": None,
+                },
+            ),
+        )
+
+        self.assertEqual(snapshot.locks[0].rule_id, RULE_ID)
+        self.assertFalse(snapshot.locks[0].locked)
+
     def test_snapshot_uses_integer_active_counts(self) -> None:
         rule = make_rule()
         snapshot = snapshot_from_results(
@@ -469,6 +964,7 @@ class ServiceResultTests(unittest.TestCase):
                 "active_counts": {"website": 203, "application": 2},
             },
             (rule.to_dict(),),
+            (),
             (),
         )
 
@@ -484,7 +980,106 @@ class ServiceResultTests(unittest.TestCase):
                 },
                 (),
                 (),
+                (),
             )
+
+
+class DenialStatisticsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.row = {
+            "path": "/usr/bin/example-app",
+            "count": 1200,
+            "first_utc": "2026-08-14T12:00:00Z",
+            "last_utc": "2026-08-14T12:05:00+00:00",
+            "rule_ids": [RULE_ID, SECOND_RULE_ID],
+        }
+
+    def test_exact_result_parses_to_immutable_display_values(self) -> None:
+        statistics = denial_statistics_from_result(
+            {"items": [self.row], "dropped": 7}
+        )
+
+        self.assertEqual(
+            statistics,
+            DenialStatistics(
+                (
+                    DenialStat(
+                        "/usr/bin/example-app",
+                        1200,
+                        datetime(2026, 8, 14, 12, tzinfo=UTC),
+                        datetime(2026, 8, 14, 12, 5, tzinfo=UTC),
+                        (RULE_ID, SECOND_RULE_ID),
+                    ),
+                ),
+                7,
+            ),
+        )
+        self.assertEqual(
+            denial_stat_display(statistics.items[0]),
+            DenialStatDisplay(
+                "/usr/bin/example-app",
+                "1,200",
+                "2026-08-14T12:00:00Z",
+                "2026-08-14T12:05:00Z",
+                f"{RULE_ID}, {SECOND_RULE_ID}",
+            ),
+        )
+        empty_rules = denial_statistics_from_result(
+            {"items": [{**self.row, "rule_ids": []}], "dropped": 0}
+        )
+        self.assertEqual(
+            denial_stat_display(empty_rules.items[0]).rule_ids,
+            "None recorded",
+        )
+
+    def test_parser_rejects_non_exact_or_invalid_rows(self) -> None:
+        invalid_results = (
+            {"items": (self.row,), "dropped": 0},
+            {"items": [self.row]},
+            {"items": [self.row], "dropped": 0, "policy": {}},
+            {"items": [{**self.row, "secret": "protected"}], "dropped": 0},
+            {
+                "items": [
+                    {**self.row, "path": "/usr/bin/../bin/example-app"}
+                ],
+                "dropped": 0,
+            },
+            {"items": [{**self.row, "path": "../example-app"}], "dropped": 0},
+            {"items": [{**self.row, "count": True}], "dropped": 0},
+            {
+                "items": [
+                    {
+                        **self.row,
+                        "first_utc": "2026-08-14T13:00:00Z",
+                    }
+                ],
+                "dropped": 0,
+            },
+            {
+                "items": [
+                    {
+                        **self.row,
+                        "rule_ids": [SECOND_RULE_ID, RULE_ID],
+                    }
+                ],
+                "dropped": 0,
+            },
+            {"items": [self.row], "dropped": False},
+        )
+
+        for result in invalid_results:
+            with self.subTest(result=result):
+                with self.assertRaises(FormError):
+                    denial_statistics_from_result(result)
+
+    def test_parser_enforces_the_256_path_view_bound(self) -> None:
+        items = [
+            {**self.row, "path": f"/usr/bin/example-{index}"}
+            for index in range(257)
+        ]
+
+        with self.assertRaisesRegex(FormError, "statistics"):
+            denial_statistics_from_result({"items": items, "dropped": 0})
 
 
 class ExistingWorkflowTests(unittest.TestCase):
