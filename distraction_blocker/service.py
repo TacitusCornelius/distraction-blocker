@@ -51,9 +51,9 @@ class BlockerService:
         )
         if self.denial_buffer is None:
             self.denial_buffer = DenialBuffer()
-        set_buffer = getattr(applications, "set_denial_buffer", None)
-        if set_buffer is not None:
-            set_buffer(self.denial_buffer)
+        # Breadcrumb: FakeApplications in the tests has no denial_buffer
+        # attribute until this call, so the fallback read above must stay.
+        applications.set_denial_buffer(self.denial_buffer)
         self.policy: Policy | None = None
         self.controls = ControlState.empty()
         self._statistics = StatisticsState.empty()
@@ -65,7 +65,7 @@ class BlockerService:
         self._closed = False
         self._healthy = True
         self._last_checkpoint = time.monotonic()
-        self._last_clock_trusted = bool(getattr(clock, "trusted", True))
+        self._last_clock_trusted = bool(clock.trusted)
         self._degraded = False
         # Breadcrumb for reviewers: staged data has no disk representation, so a
         # crash cannot create an unreviewed policy or bypass signed storage.
@@ -136,11 +136,8 @@ class BlockerService:
             ))
 
     def _load_statistics(self) -> None:
-        loader = getattr(self.store, "load_statistics", None)
-        if loader is None:
-            return
         try:
-            loaded = loader()
+            loaded = self.store.load_statistics()
             if loaded is None:
                 return
             if isinstance(loaded, dict):
@@ -160,21 +157,12 @@ class BlockerService:
         )))
 
     def _drain_statistics(self) -> None:
-        drain = getattr(self.denial_buffer, "drain", None)
-        if drain is None:
-            return
+        # Breadcrumb: denial_buffer is always a DenialBuffer — constructed
+        # here when not injected — and DenialBuffer.drain returns a list.
         try:
-            drained = drain()
+            events = self.denial_buffer.drain()
         except Exception:
             return
-        events = drained
-        dropped_hint = 0
-        if (
-            isinstance(drained, tuple)
-            and len(drained) == 2
-            and isinstance(drained[1], int)
-        ):
-            events, dropped_hint = drained
         state = self._statistics
         try:
             for event in events:
@@ -195,16 +183,7 @@ class BlockerService:
                 state = state.record(path, tuple(sorted(rule_ids)), stamp)
             # drain_into(limit=0) atomically reads and resets overflow without
             # consuming any additional events after the queue drain above.
-            drain_into = getattr(self.denial_buffer, "drain_into", None)
-            if drain_into is not None:
-                try:
-                    state = drain_into(state, limit=0)
-                except TypeError:
-                    state = drain_into(state)
-            elif dropped_hint or getattr(self.denial_buffer, "dropped", 0):
-                state = state.add_dropped(
-                    dropped_hint or int(getattr(self.denial_buffer, "dropped", 0))
-                )
+            state = self.denial_buffer.drain_into(state, limit=0)
         except Exception:
             # A statistics implementation failure is never enforcement failure.
             return
@@ -217,11 +196,8 @@ class BlockerService:
             return
         if not force and time.monotonic() - self._last_statistics_persist < 5:
             return
-        saver = getattr(self.store, "save_statistics", None)
-        if saver is None:
-            return
         try:
-            saver(self._statistics)
+            self.store.save_statistics(self._statistics)
         except Exception as error:
             # Statistics are observational, but silent permanent loss hid
             # real faults. Report each distinct failure once and throttle
@@ -400,6 +376,21 @@ class BlockerService:
         for rule_id in set(rule_ids):
             self._grants.pop((uid, rule_id), None)
 
+    def _finalize_weakening(
+        self,
+        policy: Policy,
+        uid: int,
+        grant_ids: set[str] | tuple[str, ...] | list[str],
+        controls: ControlState | None = None,
+    ) -> None:
+        """Persist a policy-weakening change, then burn its authorization grants.
+
+        Breadcrumb: callers MUST settle _lock_refusal or _validate_replacement
+        BEFORE this helper; it saves immediately and consumes grants.
+        """
+        self._save(policy, controls)
+        self._consume_grants(uid, grant_ids)
+
     def _lock_refusal(
         self, uid: int, rule_ids: set[str] | tuple[str, ...] | list[str]
     ) -> dict[str, Any] | None:
@@ -484,6 +475,20 @@ class BlockerService:
         )
         return self._ok(candidate.to_dict())
 
+    def _referencing_rule_ids(self, list_id: str) -> set[str]:
+        """Return ids of rules whose targets reference this managed list."""
+        if self.policy is None:
+            raise RuntimeError("service is not started")
+        return {
+            rule.id
+            for rule in self.policy.rules
+            if any(
+                target.kind == "managed_list"
+                and target.value == list_id
+                for target in rule.targets
+            )
+        }
+
     def _validate_replacement(
         self, uid: int, imported: Policy
     ) -> dict[str, Any] | None:
@@ -513,15 +518,7 @@ class BlockerService:
             new = new_lists.get(list_id)
             if new is not None and set(old.domains) <= set(new.domains):
                 continue
-            referencing = {
-                rule.id
-                for rule in self.policy.rules
-                if any(
-                    target.kind == "managed_list"
-                    and target.value == list_id
-                    for target in rule.targets
-                )
-            }
+            referencing = self._referencing_rule_ids(list_id)
             if any(
                 rule.id in referencing
                 and rule.is_active(now, clock_trusted=trusted)
@@ -556,15 +553,7 @@ class BlockerService:
                 and set(old_list.domains) <= set(new_list.domains)
             ):
                 continue
-            result.update(
-                rule.id
-                for rule in self.policy.rules
-                if any(
-                    target.kind == "managed_list"
-                    and target.value == old_list.id
-                    for target in rule.targets
-                )
-            )
+            result.update(self._referencing_rule_ids(old_list.id))
         return result
 
     def _replace_rules(self, uid: int, raw_rules: Any) -> dict[str, Any]:
@@ -588,8 +577,7 @@ class BlockerService:
             lock for lock in self.controls.locks
             if lock.rule_id in remaining_ids
         ])
-        self._save(imported, controls)
-        self._consume_grants(uid, grant_ids)
+        self._finalize_weakening(imported, uid, grant_ids, controls)
         return self._ok({
             "imported": len(imported.rules),
             "policy_revision": self.policy.revision,
@@ -802,15 +790,7 @@ class BlockerService:
             if old is not None and not set(old.domains) <= set(managed.domains):
                 now = self._now()
                 trusted = bool(getattr(self.clock, "trusted", True))
-                referencing = {
-                    rule.id
-                    for rule in self.policy.rules
-                    if any(
-                        target.kind == "managed_list"
-                        and target.value == managed.id
-                        for target in rule.targets
-                    )
-                }
+                referencing = self._referencing_rule_ids(managed.id)
                 used = any(
                     rule.id in referencing
                     and rule.is_active(now, clock_trusted=trusted)
@@ -830,8 +810,7 @@ class BlockerService:
             else:
                 lists[lists.index(old)] = managed
             candidate = Policy(self.policy.revision, self.policy.rules, tuple(lists))
-            self._save(candidate)
-            self._consume_grants(uid, grant_ids)
+            self._finalize_weakening(candidate, uid, grant_ids)
             del self._staged_lists[token]
             return self._ok(self._list_summary(managed))
         except ValidationError as error:
@@ -995,8 +974,7 @@ class BlockerService:
                 lock for lock in self.controls.locks
                 if lock.rule_id in remaining_ids
             ])
-            self._save(candidate, controls)
-            self._consume_grants(uid, grant_ids)
+            self._finalize_weakening(candidate, uid, grant_ids, controls)
             del self._staged_native[token]
             return self._ok({
                 "imported": len(imported.rules),
@@ -1124,6 +1102,55 @@ class BlockerService:
             replacement.to_summary(now, clock_trusted=trusted)
         )
 
+    # Command dispatch table. Each entry maps a command name to the allowed
+    # request field sets, the exact bad_request message used when the fields
+    # do not match, and the handler owning the command body.
+    # Breadcrumb: these messages are wire-contract strings; tests assert them
+    # byte-for-byte, so never reword them.
+    _COMMANDS = {
+        "status": ((frozenset({"command"}),), "unknown command field", "_cmd_status"),
+        "start_focus": ((frozenset({"command", "rule_id", "minutes"}),), "rule_id and minutes are required", "_cmd_start_focus"),
+        "daily_schedule": ((frozenset({"command", "timezone", "date"}),), "timezone and date are required", "_cmd_daily_schedule"),
+        "list_rules": ((frozenset({"command"}),), "unknown command field", "_cmd_list_rules"),
+        "list_locks": ((frozenset({"command"}),), "unknown command field", "_cmd_list_locks"),
+        "list_denial_stats": ((frozenset({"command"}),), "unknown command field", "_cmd_list_denial_stats"),
+        "clear_denial_stats": ((frozenset({"command"}),), "unknown command field", "_cmd_clear_denial_stats"),
+        "set_rule_lock": ((frozenset({"command", "rule_id", "lock"}),), "rule_id and lock are required", "_cmd_set_rule_lock"),
+        "begin_rule_authorization": ((frozenset({"command", "rule_id"}),), "rule_id is required", "_cmd_begin_rule_authorization"),
+        "complete_rule_authorization": ((frozenset({"command", "rule_id", "challenge_id", "response"}),), "authorization response fields are required", "_cmd_complete_rule_authorization"),
+        "list_managed_lists": ((frozenset({"command"}),), "unknown command field", "_cmd_list_managed_lists"),
+        "read_managed_list": (
+            (
+                frozenset({"command", "list_id", "offset"}),
+                frozenset({"command", "list_id", "offset", "limit"}),
+            ),
+            "list_id and offset are required",
+            "_cmd_read_managed_list",
+        ),
+        "begin_list_import": ((frozenset({"command", "metadata"}),), "list metadata is required", "_cmd_begin_list_import"),
+        "import_list_chunk": ((frozenset({"command", "import_id", "domains"}),), "import_id and domains are required", "_cmd_import_list_chunk"),
+        "commit_list_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_commit_list_import"),
+        "cancel_list_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_cancel_list_import"),
+        "delete_managed_list": ((frozenset({"command", "list_id"}),), "list_id is required", "_cmd_delete_managed_list"),
+        "begin_native_import": ((frozenset({"command"}),), "unknown command field", "_cmd_begin_native_import"),
+        "native_import_chunk": ((frozenset({"command", "import_id", "text"}),), "import_id and text are required", "_cmd_native_import_chunk"),
+        "commit_native_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_commit_native_import"),
+        "cancel_native_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_cancel_native_import"),
+        "put_rule": ((frozenset({"command", "rule"}),), "unknown command field", "_cmd_put_rule"),
+        "replace_rules": ((frozenset({"command", "rules"}),), "unknown command field", "_cmd_replace_rules"),
+        "delete_rule": ((frozenset({"command", "rule_id"}),), "rule_id is required", "_cmd_delete_rule"),
+        "set_enabled": ((frozenset({"command", "rule_id", "enabled"}),), "rule_id and enabled are required", "_cmd_set_enabled"),
+        "clear_clock_latch": ((frozenset({"command"}),), "unknown command field", "_cmd_clear_clock_latch"),
+    }
+
+    # Refused while enforcement is unhealthy. The gate runs before field
+    # validation, exactly as the previous if-chain ordered it.
+    _UNHEALTHY_COMMANDS = frozenset({
+        "put_rule", "delete_rule", "set_enabled", "replace_rules",
+        "commit_list_import", "commit_native_import",
+        "delete_managed_list", "set_rule_lock", "start_focus",
+    })
+
     def dispatch(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         if not self._started:
             return self._error("not_ready", "service is not ready")
@@ -1131,330 +1158,297 @@ class BlockerService:
         if not isinstance(request, dict) or not isinstance(request.get("command"), str):
             return self._error("bad_request", "command is required")
         command = request["command"]
-        if command in {"put_rule", "delete_rule", "set_enabled", "replace_rules", "commit_list_import", "commit_native_import", "delete_managed_list", "set_rule_lock", "start_focus"} and not self.healthy:
+        entry = self._COMMANDS.get(command)
+        if entry is None:
+            return self._error("bad_request", "unknown command")
+        allowed, message, handler = entry
+        if command in self._UNHEALTHY_COMMANDS and not self.healthy:
             return self._error("unhealthy", "enforcement is not healthy")
-        if command == "status":
-            if set(request) != {"command"}:
-                return self._error("bad_request", "unknown command field")
-            websites, applications, _ = self._active_targets()
-            return self._ok({"healthy": self.healthy, "clock_trusted": bool(getattr(self.clock, "trusted", True)), "clock_reason": str(getattr(self.clock, "reason", "")), "active_counts": {"website": len(websites), "application": len(applications)}})
-        if command == "start_focus":
-            if set(request) != {"command", "rule_id", "minutes"}:
-                return self._error(
-                    "bad_request", "rule_id and minutes are required"
-                )
-            return self._start_focus(
-                request["rule_id"], request["minutes"]
-            )
-        if command == "daily_schedule":
-            if set(request) != {"command", "timezone", "date"}:
-                return self._error(
-                    "bad_request", "timezone and date are required"
-                )
-            return self._daily_schedule(
-                request["timezone"], request["date"]
-            )
-        if command == "list_rules":
-            if set(request) != {"command"}:
-                return self._error("bad_request", "unknown command field")
-            return self._ok([rule.to_dict() for rule in self.policy.rules])
-        if command == "list_locks":
-            if set(request) != {"command"}:
-                return self._error(
-                    "bad_request", "unknown command field"
-                )
-            return self._ok(list(self.controls.summaries(
-                self._now(),
-                clock_trusted=bool(
-                    getattr(self.clock, "trusted", True)
-                ),
-            )))
-        if command == "list_denial_stats":
-            if set(request) != {"command"}:
-                return self._error("bad_request", "unknown command field")
-            return self._ok(self._statistics_result())
-        if command == "clear_denial_stats":
-            if set(request) != {"command"}:
-                return self._error("bad_request", "unknown command field")
-            self._statistics = self._statistics.clear()
-            discard = getattr(self.denial_buffer, "discard", None)
-            if discard is not None:
-                # Breadcrumb: queued events would otherwise reappear on the
-                # next tick and resurrect the data this command just cleared.
-                discard()
-            self._statistics_dirty = True
-            self._persist_statistics(force=True)
-            return self._ok({"cleared": True})
-        if command == "set_rule_lock":
-            if set(request) != {"command", "rule_id", "lock"}:
-                return self._error(
-                    "bad_request", "rule_id and lock are required"
-                )
-            return self._set_rule_lock(
-                uid, request["rule_id"], request["lock"]
-            )
-        if command == "begin_rule_authorization":
-            if set(request) != {"command", "rule_id"}:
-                return self._error(
-                    "bad_request", "rule_id is required"
-                )
-            return self._begin_rule_authorization(
-                uid, request["rule_id"]
-            )
-        if command == "complete_rule_authorization":
-            required = {
-                "command",
-                "rule_id",
-                "challenge_id",
-                "response",
+        if set(request) not in allowed:
+            return self._error("bad_request", message)
+        return getattr(self, handler)(uid, request)
+
+    def _cmd_status(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        websites, applications, _ = self._active_targets()
+        return self._ok({"healthy": self.healthy, "clock_trusted": bool(getattr(self.clock, "trusted", True)), "clock_reason": str(getattr(self.clock, "reason", "")), "active_counts": {"website": len(websites), "application": len(applications)}})
+
+    def _cmd_start_focus(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._start_focus(
+            request["rule_id"], request["minutes"]
+        )
+
+    def _cmd_daily_schedule(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._daily_schedule(
+            request["timezone"], request["date"]
+        )
+
+    def _cmd_list_rules(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._ok([rule.to_dict() for rule in self.policy.rules])
+
+    def _cmd_list_locks(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._ok(list(self.controls.summaries(
+            self._now(),
+            clock_trusted=bool(
+                getattr(self.clock, "trusted", True)
+            ),
+        )))
+
+    def _cmd_list_denial_stats(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._ok(self._statistics_result())
+
+    def _cmd_clear_denial_stats(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        self._statistics = self._statistics.clear()
+        discard = getattr(self.denial_buffer, "discard", None)
+        if discard is not None:
+            # Breadcrumb: queued events would otherwise reappear on the
+            # next tick and resurrect the data this command just cleared.
+            discard()
+        self._statistics_dirty = True
+        self._persist_statistics(force=True)
+        return self._ok({"cleared": True})
+
+    def _cmd_set_rule_lock(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._set_rule_lock(
+            uid, request["rule_id"], request["lock"]
+        )
+
+    def _cmd_begin_rule_authorization(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._begin_rule_authorization(
+            uid, request["rule_id"]
+        )
+
+    def _cmd_complete_rule_authorization(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._complete_rule_authorization(
+            uid,
+            request["rule_id"],
+            request["challenge_id"],
+            request["response"],
+        )
+
+    def _cmd_list_managed_lists(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._ok([self._list_summary(item) for item in self.policy.managed_lists])
+
+    def _cmd_read_managed_list(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        list_id, offset = request.get("list_id"), request.get("offset")
+        limit = request.get("limit", self._CHUNK_SIZE)
+        if (
+            not isinstance(list_id, str)
+            or not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit < 1
+            or limit > self._CHUNK_SIZE
+            or offset < 0
+        ):
+            return self._error("bad_request", "invalid list chunk")
+        managed = next(
+            (item for item in self.policy.managed_lists if item.id == list_id),
+            None,
+        )
+        if managed is None:
+            return self._error("not_found", "managed list was not found")
+        domains = managed.domains[offset:offset + limit]
+        following = offset + len(domains)
+        return self._ok({
+            "id": list_id,
+            "offset": offset,
+            "domains": list(domains),
+            "next_offset": following if following < len(managed.domains) else None,
+        })
+
+    def _cmd_begin_list_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        metadata = request["metadata"]
+        if self._staged_count() >= self._MAX_STAGED:
+            return self._error("busy", "too many staged imports")
+        if not isinstance(metadata, dict):
+            return self._error("bad_type", "list metadata must be an object")
+        try:
+            required = {"id", "name", "source", "version", "license"}
+            if set(metadata) != required:
+                raise ValidationError("bad_request", "list metadata fields are invalid")
+            metadata = {
+                **metadata,
+                "imported_utc": self._now().isoformat(timespec="microseconds").replace("+00:00", "Z"),
             }
-            if set(request) != required:
-                return self._error(
-                    "bad_request",
-                    "authorization response fields are required",
+            ManagedList.from_dict({**metadata, "domains": []})
+        except ValidationError as error:
+            return self._error(error.code, error.message)
+        token = str(uuid.uuid4())
+        self._staged_lists[token] = {
+            "owner": uid,
+            "expires": time.monotonic() + self._STAGE_SECONDS,
+            "metadata": metadata,
+            "domains": [],
+        }
+        return self._ok({"import_id": token, "expires_in": self._STAGE_SECONDS})
+
+    def _cmd_import_list_chunk(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        stage = self._stage(self._staged_lists, uid, request.get("import_id"))
+        domains = request.get("domains")
+        if stage is None:
+            return self._error("not_found", "staged list was not found")
+        if not isinstance(domains, list) or not domains or len(domains) > self._CHUNK_SIZE:
+            return self._error("bad_request", "list chunks need 1 to 200 domains")
+        try:
+            candidate = ManagedList.from_dict({**stage["metadata"], "domains": stage["domains"] + domains})
+            size = sum(len(domain.encode("utf-8")) for domain in candidate.domains)
+            if size > self._MAX_LIST_IMPORT_BYTES:
+                return self._error("too_large", "list import is too large")
+            stage["domains"] = list(candidate.domains)
+        except ValidationError as error:
+            return self._error(error.code, error.message)
+        return self._ok({"import_id": request["import_id"], "received": len(stage["domains"])})
+
+    def _cmd_commit_list_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._commit_list(uid, request.get("import_id"))
+
+    def _cmd_cancel_list_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        stage = self._stage(self._staged_lists, uid, request.get("import_id"))
+        if stage is None:
+            return self._error("not_found", "staged list was not found")
+        del self._staged_lists[request["import_id"]]
+        return self._ok({"cancelled": True})
+
+    # The field-set half of the original compound guard lives in _COMMANDS;
+    # the list_id type check below completes it with the same message.
+    def _cmd_delete_managed_list(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(request.get("list_id"), str):
+            return self._error("bad_request", "list_id is required")
+        list_id = request["list_id"]
+        if any(target.kind == "managed_list" and target.value == list_id for rule in self.policy.rules for target in rule.targets):
+            return self._error("in_use", "managed list is used by a rule")
+        lists = tuple(item for item in self.policy.managed_lists if item.id != list_id)
+        if len(lists) == len(self.policy.managed_lists):
+            return self._error("not_found", "managed list was not found")
+        self._save(Policy(self.policy.revision, self.policy.rules, lists))
+        return self._ok({"deleted": list_id})
+
+    def _cmd_begin_native_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        if self._staged_count() >= self._MAX_STAGED:
+            return self._error("busy", "too many staged imports")
+        token = str(uuid.uuid4())
+        self._staged_native[token] = {
+            "owner": uid,
+            "expires": time.monotonic() + self._STAGE_SECONDS,
+            "chunks": [],
+            "bytes": 0,
+        }
+        return self._ok({"import_id": token, "expires_in": self._STAGE_SECONDS})
+
+    def _cmd_native_import_chunk(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        stage = self._stage(self._staged_native, uid, request.get("import_id"))
+        text = request.get("text")
+        if stage is None:
+            return self._error("not_found", "staged native import was not found")
+        if not isinstance(text, str) or not text:
+            return self._error("bad_type", "native import chunk must be text")
+        size = stage["bytes"] + len(text.encode("utf-8"))
+        if size > self._MAX_NATIVE_IMPORT_BYTES:
+            return self._error("too_large", "native state is too large")
+        stage["chunks"].append(text)
+        stage["bytes"] = size
+        return self._ok({"import_id": request["import_id"], "received_bytes": size})
+
+    def _cmd_commit_native_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._commit_native(uid, request.get("import_id"))
+
+    def _cmd_cancel_native_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        stage = self._stage(self._staged_native, uid, request.get("import_id"))
+        if stage is None:
+            return self._error("not_found", "staged native import was not found")
+        del self._staged_native[request["import_id"]]
+        return self._ok({"cancelled": True})
+
+    def _cmd_put_rule(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._put_rule(uid, request["rule"])
+        except ValidationError as error:
+            return self._error(error.code, error.message)
+
+    def _cmd_replace_rules(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._replace_rules(uid, request["rules"])
+        except ValidationError as error:
+            return self._error(error.code, error.message)
+
+    # The field-set half of the original compound guard lives in _COMMANDS;
+    # the rule_id type check below completes it with the same message.
+    def _cmd_delete_rule(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(request.get("rule_id"), str):
+            return self._error("bad_request", "rule_id is required")
+        for rule in self.policy.rules:
+            if rule.id == request["rule_id"]:
+                now = self._now()
+                if rule.is_active(now, bool(getattr(self.clock, "trusted", True))):
+                    return self._error("active_rule", "active rule must be disabled before deletion")
+                refusal = self._lock_refusal(uid, {rule.id})
+                if refusal:
+                    return refusal
+                controls = self.controls.with_locks([
+                    lock for lock in self.controls.locks
+                    if lock.rule_id != rule.id
+                ])
+                self._finalize_weakening(
+                    Policy(
+                        self.policy.revision,
+                        tuple(
+                            item for item in self.policy.rules
+                            if item.id != rule.id
+                        ),
+                        self.policy.managed_lists,
+                    ),
+                    uid,
+                    {rule.id},
+                    controls,
                 )
-            return self._complete_rule_authorization(
-                uid,
-                request["rule_id"],
-                request["challenge_id"],
-                request["response"],
-            )
-        if command == "list_managed_lists":
-            if set(request) != {"command"}:
-                return self._error("bad_request", "unknown command field")
-            return self._ok([self._list_summary(item) for item in self.policy.managed_lists])
-        if command == "read_managed_list":
-            allowed_fields = (
-                {"command", "list_id", "offset"},
-                {"command", "list_id", "offset", "limit"},
-            )
-            if set(request) not in allowed_fields:
-                return self._error("bad_request", "list_id and offset are required")
-            list_id, offset = request.get("list_id"), request.get("offset")
-            limit = request.get("limit", self._CHUNK_SIZE)
-            if (
-                not isinstance(list_id, str)
-                or not isinstance(offset, int)
-                or isinstance(offset, bool)
-                or not isinstance(limit, int)
-                or isinstance(limit, bool)
-                or limit < 1
-                or limit > self._CHUNK_SIZE
-                or offset < 0
-            ):
-                return self._error("bad_request", "invalid list chunk")
-            managed = next(
-                (item for item in self.policy.managed_lists if item.id == list_id),
-                None,
-            )
-            if managed is None:
-                return self._error("not_found", "managed list was not found")
-            domains = managed.domains[offset:offset + limit]
-            following = offset + len(domains)
-            return self._ok({
-                "id": list_id,
-                "offset": offset,
-                "domains": list(domains),
-                "next_offset": following if following < len(managed.domains) else None,
-            })
-        if command == "begin_list_import":
-            if set(request) != {"command", "metadata"}:
-                return self._error("bad_request", "list metadata is required")
-            metadata = request["metadata"]
-            if self._staged_count() >= self._MAX_STAGED:
-                return self._error("busy", "too many staged imports")
-            if not isinstance(metadata, dict):
-                return self._error("bad_type", "list metadata must be an object")
-            try:
-                required = {"id", "name", "source", "version", "license"}
-                if set(metadata) != required:
-                    raise ValidationError("bad_request", "list metadata fields are invalid")
-                metadata = {
-                    **metadata,
-                    "imported_utc": self._now().isoformat(timespec="microseconds").replace("+00:00", "Z"),
-                }
-                ManagedList.from_dict({**metadata, "domains": []})
-            except ValidationError as error:
-                return self._error(error.code, error.message)
-            token = str(uuid.uuid4())
-            self._staged_lists[token] = {
-                "owner": uid,
-                "expires": time.monotonic() + self._STAGE_SECONDS,
-                "metadata": metadata,
-                "domains": [],
-            }
-            return self._ok({"import_id": token, "expires_in": self._STAGE_SECONDS})
-        if command == "import_list_chunk":
-            if set(request) != {"command", "import_id", "domains"}:
-                return self._error("bad_request", "import_id and domains are required")
-            stage = self._stage(self._staged_lists, uid, request.get("import_id"))
-            domains = request.get("domains")
-            if stage is None:
-                return self._error("not_found", "staged list was not found")
-            if not isinstance(domains, list) or not domains or len(domains) > self._CHUNK_SIZE:
-                return self._error("bad_request", "list chunks need 1 to 200 domains")
-            try:
-                candidate = ManagedList.from_dict({**stage["metadata"], "domains": stage["domains"] + domains})
-                size = sum(len(domain.encode("utf-8")) for domain in candidate.domains)
-                if size > self._MAX_LIST_IMPORT_BYTES:
-                    return self._error("too_large", "list import is too large")
-                stage["domains"] = list(candidate.domains)
-            except ValidationError as error:
-                return self._error(error.code, error.message)
-            return self._ok({"import_id": request["import_id"], "received": len(stage["domains"])})
-        if command == "commit_list_import":
-            if set(request) != {"command", "import_id"}:
-                return self._error("bad_request", "import_id is required")
-            return self._commit_list(uid, request.get("import_id"))
-        if command == "cancel_list_import":
-            if set(request) != {"command", "import_id"}:
-                return self._error("bad_request", "import_id is required")
-            stage = self._stage(self._staged_lists, uid, request.get("import_id"))
-            if stage is None:
-                return self._error("not_found", "staged list was not found")
-            del self._staged_lists[request["import_id"]]
-            return self._ok({"cancelled": True})
-        if command == "delete_managed_list":
-            if set(request) != {"command", "list_id"} or not isinstance(request.get("list_id"), str):
-                return self._error("bad_request", "list_id is required")
-            list_id = request["list_id"]
-            if any(target.kind == "managed_list" and target.value == list_id for rule in self.policy.rules for target in rule.targets):
-                return self._error("in_use", "managed list is used by a rule")
-            lists = tuple(item for item in self.policy.managed_lists if item.id != list_id)
-            if len(lists) == len(self.policy.managed_lists):
-                return self._error("not_found", "managed list was not found")
-            self._save(Policy(self.policy.revision, self.policy.rules, lists))
-            return self._ok({"deleted": list_id})
-        if command == "begin_native_import":
-            if set(request) != {"command"}:
-                return self._error("bad_request", "unknown command field")
-            if self._staged_count() >= self._MAX_STAGED:
-                return self._error("busy", "too many staged imports")
-            token = str(uuid.uuid4())
-            self._staged_native[token] = {
-                "owner": uid,
-                "expires": time.monotonic() + self._STAGE_SECONDS,
-                "chunks": [],
-                "bytes": 0,
-            }
-            return self._ok({"import_id": token, "expires_in": self._STAGE_SECONDS})
-        if command == "native_import_chunk":
-            if set(request) != {"command", "import_id", "text"}:
-                return self._error("bad_request", "import_id and text are required")
-            stage = self._stage(self._staged_native, uid, request.get("import_id"))
-            text = request.get("text")
-            if stage is None:
-                return self._error("not_found", "staged native import was not found")
-            if not isinstance(text, str) or not text:
-                return self._error("bad_type", "native import chunk must be text")
-            size = stage["bytes"] + len(text.encode("utf-8"))
-            if size > self._MAX_NATIVE_IMPORT_BYTES:
-                return self._error("too_large", "native state is too large")
-            stage["chunks"].append(text)
-            stage["bytes"] = size
-            return self._ok({"import_id": request["import_id"], "received_bytes": size})
-        if command == "commit_native_import":
-            if set(request) != {"command", "import_id"}:
-                return self._error("bad_request", "import_id is required")
-            return self._commit_native(uid, request.get("import_id"))
-        if command == "cancel_native_import":
-            if set(request) != {"command", "import_id"}:
-                return self._error("bad_request", "import_id is required")
-            stage = self._stage(self._staged_native, uid, request.get("import_id"))
-            if stage is None:
-                return self._error("not_found", "staged native import was not found")
-            del self._staged_native[request["import_id"]]
-            return self._ok({"cancelled": True})
-        if command == "put_rule":
-            if set(request) != {"command", "rule"}:
-                return self._error("bad_request", "unknown command field")
-            try:
-                return self._put_rule(uid, request["rule"])
-            except ValidationError as error:
-                return self._error(error.code, error.message)
-        if command == "replace_rules":
-            if set(request) != {"command", "rules"}:
-                return self._error("bad_request", "unknown command field")
-            try:
-                return self._replace_rules(uid, request["rules"])
-            except ValidationError as error:
-                return self._error(error.code, error.message)
-        if command == "delete_rule":
-            if set(request) != {"command", "rule_id"} or not isinstance(request.get("rule_id"), str):
-                return self._error("bad_request", "rule_id is required")
-            for rule in self.policy.rules:
-                if rule.id == request["rule_id"]:
-                    now = self._now()
-                    if rule.is_active(now, bool(getattr(self.clock, "trusted", True))):
-                        return self._error("active_rule", "active rule must be disabled before deletion")
+                return self._ok({"deleted": rule.id})
+        return self._error("not_found", "rule was not found")
+
+    # The field-set half of the original compound guard lives in _COMMANDS;
+    # the rule_id/enabled type checks below complete it with the same message.
+    def _cmd_set_enabled(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(request.get("rule_id"), str) or not isinstance(request.get("enabled"), bool):
+            return self._error("bad_request", "rule_id and enabled are required")
+        for index, rule in enumerate(self.policy.rules):
+            if rule.id == request["rule_id"]:
+                data = rule.to_dict()
+                data["enabled"] = request["enabled"]
+                data["revision"] = rule.revision + 1
+                replacement = Rule.from_dict(data)
+                # Indefinite rules remain manually disable-able, as in v1.1.
+                reason = None
+                if request["enabled"] or rule.schedule.kind != "indefinite":
+                    reason = self._weakened_active_change(rule, replacement)
+                if reason:
+                    return self._error("active_rule", reason)
+                if rule.enabled and not replacement.enabled:
                     refusal = self._lock_refusal(uid, {rule.id})
                     if refusal:
                         return refusal
-                    controls = self.controls.with_locks([
-                        lock for lock in self.controls.locks
-                        if lock.rule_id != rule.id
-                    ])
-                    self._save(
-                        Policy(
-                            self.policy.revision,
-                            tuple(
-                                item for item in self.policy.rules
-                                if item.id != rule.id
-                            ),
-                            self.policy.managed_lists,
-                        ),
-                        controls,
+                rules = list(self.policy.rules)
+                rules[index] = replacement
+                weakened = rule.enabled and not replacement.enabled
+                self._save(
+                    Policy(
+                        self.policy.revision,
+                        tuple(rules),
+                        self.policy.managed_lists,
                     )
+                )
+                if weakened:
                     self._consume_grants(uid, {rule.id})
-                    return self._ok({"deleted": rule.id})
-            return self._error("not_found", "rule was not found")
-        if command == "set_enabled":
-            if set(request) != {"command", "rule_id", "enabled"} or not isinstance(request.get("rule_id"), str) or not isinstance(request.get("enabled"), bool):
-                return self._error("bad_request", "rule_id and enabled are required")
-            for index, rule in enumerate(self.policy.rules):
-                if rule.id == request["rule_id"]:
-                    data = rule.to_dict()
-                    data["enabled"] = request["enabled"]
-                    data["revision"] = rule.revision + 1
-                    replacement = Rule.from_dict(data)
-                    # Indefinite rules remain manually disable-able, as in v1.1.
-                    reason = None
-                    if request["enabled"] or rule.schedule.kind != "indefinite":
-                        reason = self._weakened_active_change(rule, replacement)
-                    if reason:
-                        return self._error("active_rule", reason)
-                    if rule.enabled and not replacement.enabled:
-                        refusal = self._lock_refusal(uid, {rule.id})
-                        if refusal:
-                            return refusal
-                    rules = list(self.policy.rules)
-                    rules[index] = replacement
-                    weakened = rule.enabled and not replacement.enabled
-                    self._save(
-                        Policy(
-                            self.policy.revision,
-                            tuple(rules),
-                            self.policy.managed_lists,
-                        )
-                    )
-                    if weakened:
-                        self._consume_grants(uid, {rule.id})
-                    return self._ok(replacement.to_dict())
-            return self._error("not_found", "rule was not found")
-        if command == "clear_clock_latch":
-            if set(request) != {"command"}:
-                return self._error("bad_request", "unknown command field")
-            if uid != 0:
-                return self._error("forbidden", "root access is required")
-            clear_latch = getattr(self.clock, "clear_latch", None)
-            if clear_latch is None:
-                return self._error("unavailable", "clock recovery is not available")
-            try:
-                recovered = clear_latch()
-            except RuntimeError as error:
-                return self._error("clock_untrusted", str(error))
-            return self._ok({"clock_trusted": True, "time_utc": recovered.isoformat()})
-        return self._error("bad_request", "unknown command")
+                return self._ok(replacement.to_dict())
+        return self._error("not_found", "rule was not found")
+
+    def _cmd_clear_clock_latch(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        if uid != 0:
+            return self._error("forbidden", "root access is required")
+        try:
+            recovered = self.clock.clear_latch()
+        except RuntimeError as error:
+            return self._error("clock_untrusted", str(error))
+        return self._ok({"clock_trusted": True, "time_utc": recovered.isoformat()})
 
 
 _MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
