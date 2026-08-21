@@ -241,6 +241,17 @@ class Schedule:
             return {"kind": self.kind, "timezone": self.timezone_name, "periods": [period.to_dict() for period in self.periods]}
         return {"kind": self.kind}
 
+
+    def pomodoro_end_utc(self) -> datetime:
+        """Return the final work-block end of an anchored pomodoro schedule."""
+        if self.kind != "pomodoro":
+            _error("bad_value", "schedule is not a pomodoro schedule")
+        # Breadcrumb: the last cycle has no following break, so the span ends
+        # one break earlier than cycles * (work + break).
+        work = timedelta(minutes=self.work_minutes)
+        pause = timedelta(minutes=self.break_minutes)
+        return self.start_utc + work * self.cycles + pause * (self.cycles - 1)
+
     def is_active(self, now_utc: datetime) -> bool:
         if not isinstance(now_utc, datetime) or now_utc.tzinfo is None or now_utc.utcoffset() != timedelta(0):
             _error("bad_value", "now_utc must be an aware UTC time")
@@ -256,7 +267,7 @@ class Schedule:
             elapsed = now - self.start_utc
             if elapsed < timedelta(0):
                 return False
-            final_end = self.start_utc + work * self.cycles + pause * (self.cycles - 1)
+            final_end = self.pomodoro_end_utc()
             if now >= final_end:
                 return False
             _, offset = divmod(elapsed, cycle)

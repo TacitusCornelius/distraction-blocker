@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 from .control import ControlError, ControlState, RuleLock
 from .model import ManagedList, Policy, Rule, ValidationError
+from .schedule_view import ScheduleViewError, project_daily_schedule
 from .statistics import DenialBuffer, StatisticsState
 
 
@@ -903,14 +904,11 @@ class BlockerService:
             return self._error(
                 "bad_value", "date must be in YYYY-MM-DD form"
             )
-        # The GUI module keeps GTK behind load_gtk. This import uses only its
-        # pure schedule projection and never loads the optional binding.
-        from .gui import FormError, project_daily_schedule
         try:
             intervals = project_daily_schedule(
                 self.policy.rules, local_day, timezone_name
             )
-        except (FormError, ValidationError, ValueError) as error:
+        except (ScheduleViewError, ValidationError, ValueError) as error:
             return self._error("bad_value", str(error))
         if len(intervals) > 512:
             return self._error(

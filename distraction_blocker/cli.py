@@ -221,7 +221,7 @@ def _today(
     arguments: argparse.Namespace,
     now: Callable[[], datetime],
 ) -> dict[str, Any]:
-    from .gui import system_timezone_name
+    from .schedule_view import system_timezone_name
 
     timezone_name = arguments.timezone or system_timezone_name()
     try:
