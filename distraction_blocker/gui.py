@@ -135,7 +135,7 @@ class LockSummary:
 
 
 @dataclass(frozen=True)
-class DenialStat:
+class DenialStatView:
     """One bounded application-denial row returned by the service."""
 
     path: str
@@ -149,7 +149,7 @@ class DenialStat:
 class DenialStatistics:
     """One immutable denial-statistics response."""
 
-    items: tuple[DenialStat, ...]
+    items: tuple[DenialStatView, ...]
     dropped: int
 
 
@@ -692,7 +692,7 @@ def denial_statistics_from_result(result: Mapping[str, object]) -> DenialStatist
         raise FormError("The service returned an invalid dropped-event count.")
 
     expected = {"path", "count", "first_utc", "last_utc", "rule_ids"}
-    parsed_items: list[DenialStat] = []
+    parsed_items: list[DenialStatView] = []
     seen_paths: set[str] = set()
     for item in items:
         # Breadcrumb for reviewers: this fixed shape keeps the observational
@@ -736,12 +736,12 @@ def denial_statistics_from_result(result: Mapping[str, object]) -> DenialStatist
             raise FormError("The service returned invalid denial rule IDs.")
         seen_paths.add(path)
         parsed_items.append(
-            DenialStat(path, count, first_utc, last_utc, rule_ids)
+            DenialStatView(path, count, first_utc, last_utc, rule_ids)
         )
     return DenialStatistics(tuple(parsed_items), dropped)
 
 
-def denial_stat_display(stat: DenialStat) -> DenialStatDisplay:
+def denial_stat_display(stat: DenialStatView) -> DenialStatDisplay:
     """Format one denial row without GTK, I/O, or local-time ambiguity."""
     return DenialStatDisplay(
         stat.path,
@@ -4650,7 +4650,7 @@ class DenialStatisticsWindow:
         )
         self._render(statistics.items)
 
-    def _render(self, items: Sequence[DenialStat]) -> None:
+    def _render(self, items: Sequence[DenialStatView]) -> None:
         Gtk = self.Gtk
         self._clear_rows()
         if not items:

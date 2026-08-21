@@ -13,7 +13,7 @@ from distraction_blocker.gui import (
     _state_change_action,
     AuthorizationChallenge,
     AuthorizationGrant,
-    DenialStat,
+    DenialStatView,
     DenialStatDisplay,
     DenialStatistics,
     FormError,
@@ -1003,7 +1003,7 @@ class DenialStatisticsTests(unittest.TestCase):
             statistics,
             DenialStatistics(
                 (
-                    DenialStat(
+                    DenialStatView(
                         "/usr/bin/example-app",
                         1200,
                         datetime(2026, 8, 14, 12, tzinfo=UTC),

@@ -1,7 +1,15 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from distraction_blocker.control import ControlError, ControlState, RuleLock
+from distraction_blocker.control import (
+    SCRYPT_N,
+    SCRYPT_R,
+    SCRYPT_P,
+    ControlError,
+    ControlState,
+    RuleLock,
+    _password_digest,
+)
 
 
 RULE_ID = "12345678-1234-5678-9234-567812345678"
@@ -51,6 +59,61 @@ class ControlTests(unittest.TestCase):
         reset = failed.with_password_success()
         self.assertEqual(reset.failures, 0)
         self.assertIsNone(reset.retry_after_utc)
+
+    def test_password_lock_persists_scrypt_parameters(self):
+        lock = RuleLock.password_lock(
+            RULE_ID, "correct horse", salt=b"s" * 16
+        )
+        self.assertEqual(
+            (lock.scrypt_n, lock.scrypt_r, lock.scrypt_p),
+            (SCRYPT_N, SCRYPT_R, SCRYPT_P),
+        )
+        restored = RuleLock.from_dict(lock.to_dict())
+        self.assertEqual(restored, lock)
+
+    def test_legacy_password_lock_without_parameters_uses_defaults(self):
+        serialized = RuleLock.password_lock(
+            RULE_ID, "correct horse", salt=b"s" * 16
+        ).to_dict()
+        del serialized["scrypt_n"], serialized["scrypt_r"], serialized["scrypt_p"]
+        restored = RuleLock.from_dict(serialized)
+        self.assertEqual(
+            (restored.scrypt_n, restored.scrypt_r, restored.scrypt_p),
+            (SCRYPT_N, SCRYPT_R, SCRYPT_P),
+        )
+        self.assertTrue(restored.verify_password("correct horse"))
+
+    def test_custom_scrypt_parameters_verify_and_survive_rebuilds(self):
+        salt = b"s" * 16
+        digest = _password_digest("pw password", salt, n=4096, r=8, p=1)
+        lock = RuleLock(
+            RULE_ID,
+            "password",
+            salt_hex=salt.hex(),
+            digest_hex=digest.hex(),
+            scrypt_n=4096,
+            scrypt_r=8,
+            scrypt_p=1,
+        )
+        self.assertTrue(lock.verify_password("pw password"))
+        failed = lock.with_password_failure(NOW)
+        self.assertEqual(failed.scrypt_n, 4096)
+        reset = failed.with_password_success()
+        self.assertTrue(reset.verify_password("pw password"))
+        self.assertEqual(RuleLock.from_dict(reset.to_dict()), reset)
+
+    def test_invalid_scrypt_parameters_are_refused(self):
+        fields = {
+            "salt_hex": (b"s" * 16).hex(),
+            "digest_hex": ("ab" * 32),
+        }
+        with self.assertRaises(ControlError):
+            RuleLock(RULE_ID, "password", scrypt_n=1000, **fields)
+        with self.assertRaises(ControlError):
+            RuleLock(RULE_ID, "password", scrypt_n=4096, **fields)
+        partial = dict(fields, scrypt_n=4096)
+        with self.assertRaises(ControlError):
+            RuleLock(RULE_ID, "password", **partial)
 
     def test_control_state_rejects_unknown_or_duplicate_records(self):
         with self.assertRaises(ControlError):

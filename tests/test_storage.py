@@ -114,6 +114,19 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(Path(directory, "statistics.json").stat().st_mode & 0o777, 0o600)
             self.assertFalse(Path(directory, "policy.json").exists())
 
+    def test_worst_case_legal_statistics_state_saves_within_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            state = StatisticsState.empty()
+            for index in range(256):
+                state = state.record(
+                    f"/usr/lib/app-{index:03d}/" + "x" * 3900,
+                    (),
+                    "2026-01-01T00:00:00Z",
+                )
+            store.save_statistics(state)
+            self.assertEqual(store.load_statistics(), state)
+
     def test_missing_statistics_is_empty_and_bad_signature_refuses(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ProtectedStore(directory, key_source=b"k" * 32)

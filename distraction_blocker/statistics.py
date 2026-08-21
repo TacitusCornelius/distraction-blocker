@@ -7,6 +7,7 @@ local to statistics.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
@@ -18,6 +19,10 @@ from typing import Any, Iterable, Mapping
 MAX_QUEUE_SIZE = 1024
 MAX_PATHS = 256
 MAX_COUNT = 2**63 - 1
+# Breadcrumb: storage refuses a statistics envelope above MAX_STATISTICS_BYTES
+# (1 MiB). This smaller state budget guarantees every legal state fits that
+# file, even with 256 paths of the maximum 4096-byte length.
+MAX_STATE_BYTES = 768 * 1024
 
 
 def _utc_text(value: datetime | str | None) -> str:
@@ -107,10 +112,6 @@ class DenialStat:
         object.__setattr__(self, "last_utc", last)
         object.__setattr__(self, "rule_ids", _rule_ids(self.rule_ids))
 
-    @property
-    def rules(self) -> tuple[str, ...]:
-        return self.rule_ids
-
     def to_dict(self) -> dict[str, Any]:
         return {"path": self.path, "count": self.count, "first_utc": self.first_utc, "last_utc": self.last_utc, "rule_ids": list(self.rule_ids)}
 
@@ -121,6 +122,14 @@ class DenialStat:
         if not isinstance(data["rule_ids"], list):
             raise ValueError("statistics rule_ids must be a list")
         return cls(data["path"], data["count"], data["first_utc"], data["last_utc"], tuple(data["rule_ids"]))
+
+
+def _row_bytes(row: "DenialStat") -> int:
+    """Return the canonical JSON size of one row inside the signed envelope."""
+    payload = json.dumps(
+        row.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return len(payload) + 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +160,19 @@ class StatisticsState:
             seen.add(row.path)
             rows.append(row)
         rows.sort(key=lambda row: row.path)
+        total = sum(_row_bytes(row) for row in rows)
+        # Breadcrumb: eviction uses the same deterministic key as record(),
+        # so an over-budget state sheds its oldest rows instead of failing
+        # to persist later.
+        while total > MAX_STATE_BYTES:
+            if len(rows) == 1:
+                raise ValueError("statistics row exceeds the state byte budget")
+            victim = min(
+                range(len(rows)),
+                key=lambda i: (_time_key(rows[i].last_utc), rows[i].path),
+            )
+            total -= _row_bytes(rows[victim])
+            rows.pop(victim)
         object.__setattr__(self, "items", tuple(rows))
 
     @classmethod
@@ -184,17 +206,13 @@ class StatisticsState:
         path: str | os.PathLike[str],
         rule_ids: Iterable[str] | str | None = (),
         now: datetime | str | None = None,
-        *,
-        at_utc: datetime | str | None = None,
     ) -> "StatisticsState":
         """Return a state with one denial merged for ``path``.
 
         ``rule_ids`` is the complete active-rule set for the denial, not a
-        single rule. ``at_utc`` remains as a keyword alias for older callers.
+        single rule.
         """
-        if now is not None and at_utc is not None:
-            raise TypeError("specify now or at_utc, not both")
-        stamp = _utc_text(now if now is not None else at_utc)
+        stamp = _utc_text(now)
         canonical = canonical_path(path)
         incoming = _rule_ids(rule_ids)
         index = next((i for i, row in enumerate(self.items) if row.path == canonical), None)
@@ -282,10 +300,6 @@ class DenialBuffer:
             return False
         return True
 
-    put = record
-    append = record
-    push = record
-
     def drain(self, limit: int | None = None) -> list[DenialEvent]:
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
             raise ValueError("drain limit is invalid")
@@ -307,8 +321,20 @@ class DenialBuffer:
             self._dropped = 0
         return current.add_dropped(dropped)
 
+    def discard(self) -> int:
+        """Drop every queued event and the overflow counter.
+
+        Returns how many events and counted drops were discarded. Used by
+        clear_denial_stats so pending work cannot resurrect cleared data.
+        """
+        count = len(self.drain())
+        with self._drop_lock:
+            count += self._dropped
+            self._dropped = 0
+        return count
+
     def __len__(self) -> int:
         return self._queue.qsize()
 
 
-__all__ = ["MAX_COUNT", "MAX_PATHS", "MAX_QUEUE_SIZE", "DenialBuffer", "DenialEvent", "DenialStat", "StatisticsState", "canonical_path"]
+__all__ = ["MAX_COUNT", "MAX_PATHS", "MAX_QUEUE_SIZE", "MAX_STATE_BYTES", "DenialBuffer", "DenialEvent", "DenialStat", "StatisticsState", "canonical_path"]

@@ -906,6 +906,59 @@ class ServiceTests(unittest.TestCase):
         recovered = service.dispatch(0, {"command": "clear_clock_latch"})
         self.assertTrue(recovered["ok"])
 
+    def test_clear_denial_stats_discards_pending_buffer_events(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "App",
+            "enabled": True,
+            "targets": [{"kind": "application", "value": "/usr/bin/app"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,))), FakeClock(), FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        buffer = service.denial_buffer
+        self.assertTrue(buffer.record("/usr/bin/app"))
+        cleared = service.dispatch(1000, {"command": "clear_denial_stats"})
+        self.assertTrue(cleared["ok"])
+        service.tick()
+        result = service.dispatch(1000, {"command": "list_denial_stats"})
+        self.assertEqual(result["result"], {"items": [], "dropped": 0})
+
+    def test_friction_authorization_treats_non_ascii_as_incorrect(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Friction",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,))), FakeClock(), FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        service.dispatch(1000, {
+            "command": "set_rule_lock",
+            "rule_id": rule.id,
+            "lock": {"kind": "friction"},
+        })
+        challenge = service.dispatch(1000, {
+            "command": "begin_rule_authorization",
+            "rule_id": rule.id,
+        })["result"]
+        wrong = service.dispatch(1000, {
+            "command": "complete_rule_authorization",
+            "rule_id": rule.id,
+            "challenge_id": challenge["challenge_id"],
+            "response": challenge["prompt"][:-1] + "\u00e9",
+        })
+        self.assertEqual(wrong["error"]["code"], "incorrect_response")
+
 
     def test_closed_peer_does_not_escape_connection_handler(self):
         service = type("Service", (), {

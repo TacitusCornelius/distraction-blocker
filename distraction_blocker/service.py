@@ -8,6 +8,7 @@ import re
 import stat
 import subprocess
 import secrets
+import sys
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -57,6 +58,7 @@ class BlockerService:
         self._statistics = StatisticsState.empty()
         self._statistics_dirty = False
         self._last_statistics_persist = time.monotonic()
+        self._last_statistics_error: str | None = None
         self._active_application_rules: dict[str, tuple[str, ...]] = {}
         self._started = False
         self._closed = False
@@ -219,9 +221,22 @@ class BlockerService:
             return
         try:
             saver(self._statistics)
-        except Exception:
+        except Exception as error:
+            # Statistics are observational, but silent permanent loss hid
+            # real faults. Report each distinct failure once and throttle
+            # retries; the state stays dirty so close() tries again.
+            message = f"{type(error).__name__}: {error}"
+            if message != self._last_statistics_error:
+                print(
+                    f"distraction-blocker: statistics persist failed: {message}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._last_statistics_error = message
+            self._last_statistics_persist = time.monotonic()
             return
         self._statistics_dirty = False
+        self._last_statistics_error = None
         self._last_statistics_persist = time.monotonic()
     def _statistics_result(self) -> dict[str, Any]:
         result = self._statistics.to_dict()
@@ -691,7 +706,8 @@ class BlockerService:
             )
         if lock.kind == "friction":
             if not hmac.compare_digest(
-                response, challenge["prompt"] or ""
+                response.encode("utf-8"),
+                (challenge["prompt"] or "").encode("utf-8"),
             ):
                 return self._error(
                     "incorrect_response",
@@ -1163,6 +1179,11 @@ class BlockerService:
             if set(request) != {"command"}:
                 return self._error("bad_request", "unknown command field")
             self._statistics = self._statistics.clear()
+            discard = getattr(self.denial_buffer, "discard", None)
+            if discard is not None:
+                # Breadcrumb: queued events would otherwise reappear on the
+                # next tick and resurrect the data this command just cleared.
+                discard()
             self._statistics_dirty = True
             self._persist_statistics(force=True)
             return self._ok({"cleared": True})

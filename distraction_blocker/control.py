@@ -1,7 +1,8 @@
-"""Protected timed rule-lock state.
+"""Protected rule-lock state.
 
 Control records stay separate from :class:`~distraction_blocker.model.Policy`.
-Version 1.3 supports one lock kind, ``timed``.
+Version 1.3 supports timed, friction, and password locks. A password lock
+stores its scrypt parameter values beside the hash.
 """
 from __future__ import annotations
 
@@ -67,17 +68,48 @@ def _password_bytes(value: Any) -> bytes:
         raise ControlError("password must contain 8 to 1024 UTF-8 bytes")
     return encoded
 
-
-def _password_digest(password: str, salt: bytes) -> bytes:
+def _password_digest(
+    password: str,
+    salt: bytes,
+    *,
+    n: int = SCRYPT_N,
+    r: int = SCRYPT_R,
+    p: int = SCRYPT_P,
+) -> bytes:
     return hashlib.scrypt(
         _password_bytes(password),
         salt=salt,
-        n=SCRYPT_N,
-        r=SCRYPT_R,
-        p=SCRYPT_P,
+        n=n,
+        r=r,
+        p=p,
         dklen=32,
         maxmem=32 * 1024 * 1024,
     )
+
+
+def _validated_scrypt_params(n: Any, r: Any, p: Any) -> tuple[int, int, int]:
+    """Normalize optional scrypt parameters; absent values take the defaults."""
+    if n is None and r is None and p is None:
+        return SCRYPT_N, SCRYPT_R, SCRYPT_P
+    if n is None or r is None or p is None:
+        raise ControlError("password scrypt parameters are incomplete")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (n, r, p)
+    ):
+        raise ControlError("password scrypt parameters are invalid")
+    if not (
+        (1 << 10) <= n <= (1 << 22)
+        and n & (n - 1) == 0
+        and 1 <= r <= 64
+        and 1 <= p <= 8
+    ):
+        raise ControlError("password scrypt parameters are out of range")
+    # Breadcrumb: hashlib.scrypt fails when 128*n*r exceeds maxmem, so this
+    # bound keeps every stored hash verifiable with the same memory budget.
+    if 128 * n * r > 32 * 1024 * 1024:
+        raise ControlError("password scrypt parameters exceed the memory budget")
+    return n, r, p
 
 
 @dataclass(frozen=True)
@@ -90,6 +122,9 @@ class RuleLock:
     salt_hex: str | None = None
     digest_hex: str | None = None
     failures: int = 0
+    scrypt_n: int | None = None
+    scrypt_r: int | None = None
+    scrypt_p: int | None = None
     retry_after_utc: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -101,6 +136,9 @@ class RuleLock:
                 or self.digest_hex is not None
                 or self.failures != 0
                 or self.retry_after_utc is not None
+                or self.scrypt_n is not None
+                or self.scrypt_r is not None
+                or self.scrypt_p is not None
             ):
                 raise ControlError("timed lock fields are invalid")
             object.__setattr__(
@@ -113,6 +151,9 @@ class RuleLock:
                 self.digest_hex is not None,
                 self.failures != 0,
                 self.retry_after_utc is not None,
+                self.scrypt_n is not None,
+                self.scrypt_r is not None,
+                self.scrypt_p is not None,
             )):
                 raise ControlError("friction lock fields are invalid")
         elif self.kind == "password":
@@ -137,6 +178,12 @@ class RuleLock:
             if self.failures == 0 and retry is not None:
                 raise ControlError("password retry state is invalid")
             object.__setattr__(self, "retry_after_utc", retry)
+            params = _validated_scrypt_params(
+                self.scrypt_n, self.scrypt_r, self.scrypt_p
+            )
+            object.__setattr__(self, "scrypt_n", params[0])
+            object.__setattr__(self, "scrypt_r", params[1])
+            object.__setattr__(self, "scrypt_p", params[2])
         else:
             raise ControlError("lock kind is not supported")
 
@@ -181,7 +228,7 @@ class RuleLock:
                 raise ControlError("friction lock fields are invalid")
             return cls.friction(data["rule_id"])
         if kind == "password":
-            expected = {
+            base = {
                 "rule_id",
                 "kind",
                 "salt_hex",
@@ -189,7 +236,10 @@ class RuleLock:
                 "failures",
                 "retry_after_utc",
             }
-            if set(data) != expected:
+            # Breadcrumb: records written before parameter persistence lack
+            # the three scrypt keys, so both shapes load.
+            extended = base | {"scrypt_n", "scrypt_r", "scrypt_p"}
+            if set(data) not in (base, extended):
                 raise ControlError("password lock fields are invalid")
             return cls(
                 data["rule_id"],
@@ -198,6 +248,9 @@ class RuleLock:
                 digest_hex=data["digest_hex"],
                 failures=data["failures"],
                 retry_after_utc=data["retry_after_utc"],
+                scrypt_n=data.get("scrypt_n"),
+                scrypt_r=data.get("scrypt_r"),
+                scrypt_p=data.get("scrypt_p"),
             )
         raise ControlError("lock kind is not supported")
 
@@ -214,6 +267,9 @@ class RuleLock:
                 "digest_hex": self.digest_hex,
                 "failures": self.failures,
                 "retry_after_utc": _utc_text(self.retry_after_utc),
+                "scrypt_n": self.scrypt_n,
+                "scrypt_r": self.scrypt_r,
+                "scrypt_p": self.scrypt_p,
             })
         return result
 
@@ -249,7 +305,11 @@ class RuleLock:
         if self.kind != "password":
             raise ControlError("lock does not use a password")
         actual = _password_digest(
-            password, bytes.fromhex(self.salt_hex or "")
+            password,
+            bytes.fromhex(self.salt_hex or ""),
+            n=self.scrypt_n,
+            r=self.scrypt_r,
+            p=self.scrypt_p,
         )
         return hmac.compare_digest(
             actual, bytes.fromhex(self.digest_hex or "")
@@ -265,6 +325,9 @@ class RuleLock:
             "password",
             salt_hex=self.salt_hex,
             digest_hex=self.digest_hex,
+            scrypt_n=self.scrypt_n,
+            scrypt_r=self.scrypt_r,
+            scrypt_p=self.scrypt_p,
             failures=failures,
             retry_after_utc=_utc(now_utc, "now_utc")
             + timedelta(seconds=delay),
@@ -278,6 +341,9 @@ class RuleLock:
             "password",
             salt_hex=self.salt_hex,
             digest_hex=self.digest_hex,
+            scrypt_n=self.scrypt_n,
+            scrypt_r=self.scrypt_r,
+            scrypt_p=self.scrypt_p,
         )
 
     def to_summary(
@@ -307,7 +373,6 @@ class RuleLock:
             ),
         }
 
-    summary = to_summary
 
 
 

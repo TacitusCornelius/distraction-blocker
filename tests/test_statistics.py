@@ -1,8 +1,15 @@
+import json
 import unittest
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 
-from distraction_blocker.statistics import MAX_COUNT, DenialBuffer, DenialStat, StatisticsState
+from distraction_blocker.statistics import (
+    MAX_COUNT,
+    MAX_STATE_BYTES,
+    DenialBuffer,
+    DenialStat,
+    StatisticsState,
+)
 RULE_A = "11111111-1111-4111-8111-111111111111"
 RULE_B = "22222222-2222-4222-8222-222222222222"
 RULE_C = "33333333-3333-4333-8333-333333333333"
@@ -61,6 +68,34 @@ class StatisticsTests(unittest.TestCase):
     def test_clear_resets_rows_and_dropped(self):
         state = StatisticsState.empty().record("/app", (), "2026-01-01T00:00:00Z").add_dropped(4)
         self.assertEqual(state.clear(), StatisticsState.empty())
+
+    def test_byte_budget_evicts_oldest_rows_until_state_fits(self):
+        state = StatisticsState.empty()
+        state = state.record("/old", (), "2025-12-31T00:00:00Z")
+        for index in range(255):
+            state = state.record(
+                f"/app-{index:03d}/" + "x" * 3900,
+                (),
+                "2026-01-01T00:00:00Z",
+            )
+        state = state.record("/new", (), "2026-01-02T00:00:00Z")
+        size = len(json.dumps(
+            state.to_dict(), ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8"))
+        self.assertLessEqual(size, MAX_STATE_BYTES)
+        paths = {row.path for row in state.items}
+        self.assertNotIn("/old", paths)
+        self.assertIn("/new", paths)
+
+    def test_buffer_discard_drops_pending_events_and_overflow(self):
+        buffer = DenialBuffer(maxsize=2)
+        self.assertTrue(buffer.record("/a"))
+        self.assertTrue(buffer.record("/b"))
+        self.assertFalse(buffer.record("/c"))
+        self.assertEqual(buffer.discard(), 3)
+        self.assertEqual(len(buffer), 0)
+        self.assertEqual(buffer.dropped, 0)
+        self.assertEqual(buffer.drain_into().dropped, 0)
 
 
 if __name__ == "__main__":

@@ -147,7 +147,7 @@ The root service enforces timed, friction, and password locks.
 - A timed lock can last up to 366 days.
 - An untrusted clock keeps a timed lock effective.
 - A friction challenge uses 12 service-generated characters.
-- A password uses a root-owned scrypt hash.
+- A password uses a root-owned scrypt hash, stored with its own parameter values.
 - Failed password attempts add a persisted delay of up to 64 seconds.
 - Friction and password grants are memory-only, single-use, and valid for 60 seconds.
 
@@ -163,7 +163,9 @@ The service derives each phase from trusted UTC. GUI exit and reboot do not rese
 
 Fanotify reports a denial only after it sends `FAN_DENY`. A bounded queue moves observational work to the service thread.
 
-The signed statistics file stores at most 256 application paths. The queue holds at most 1,024 pending events.
+The signed statistics file stores at most 256 application paths. The whole
+state also stays under a total byte budget, so every legal state fits the file.
+The queue holds at most 1,024 pending events.
 
 Statistics count denied starts. They do not measure foreground use or time spent.
 
