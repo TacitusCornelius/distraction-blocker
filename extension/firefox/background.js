@@ -10,8 +10,10 @@
 "use strict";
 
 /* global browser, compile */
+
 const HOST_NAME = "org.distraction_blocker.extension";
 const REFRESH_MS = 60 * 1000;
+const CANARY_PORT = 8765;
 const INACTIVE_KEY = "inactive-tab";
 
 let match = compile([]);
@@ -19,9 +21,27 @@ let last_error = "No policy loaded yet.";
 let last_refresh_ms = 0;
 let block_inactive = false;
 const pending_denials = new Map(); // "rule_id\u0000value" -> count
+probe("event-page-start");
+
+// Breadcrumb: MV3 event pages do not reliably load at browser startup
+// unless a startup event is handled, so pin the policy refresh to them.
+browser.runtime.onStartup.addListener(() => {
+  probe("onstartup");
+  refresh();
+});
+browser.runtime.onInstalled.addListener(() => {
+  probe("oninstalled");
+  refresh();
+});
+// Temporary acceptance probes: the local canary server logs these hits.
+function probe(marker) {
+  console.log("DB-PROBE", marker);
+  fetch(`http://localhost:${CANARY_PORT}/probe?m=${marker}`).catch(() => {});
+}
 
 browser.storage.local.get("block_inactive").then((stored) => {
   block_inactive = stored.block_inactive === true;
+  probe("prefs-loaded");
 });
 
 browser.storage.onChanged.addListener((changes, area) => {
@@ -40,7 +60,7 @@ function denial_snapshot() {
 }
 
 function record_state(error) {
-  last_error = error;
+  probe(`state-${error === null ? "ok" : "error"}`);
   try {
     browser.storage.local.set({
       policy_ok: error === null,
@@ -66,12 +86,21 @@ function apply_rules(rules) {
 /** Send one native-messaging request and resolve with its response. */
 function host_request(message) {
   return new Promise((resolve) => {
-    const port = browser.runtime.connectNative(HOST_NAME);
+    let port;
+    try {
+      port = browser.runtime.connectNative(HOST_NAME);
+    } catch (error) {
+      probe(`nm-throw-${error.message ?? "unknown"}`);
+      resolve({ ok: false, error: { code: "host_error", message: String(error) } });
+      return;
+    }
     port.onMessage.addListener((response) => {
+      probe("nm-response");
       port.disconnect();
       resolve(response);
     });
     port.onDisconnect.addListener(() => {
+      probe(`nm-disconnect-${browser.runtime.lastError?.message ?? "clean"}`);
       resolve({
         ok: false,
         error: {
@@ -82,6 +111,7 @@ function host_request(message) {
         },
       });
     });
+    probe("nm-post");
     port.postMessage(message);
   });
 }
@@ -117,6 +147,8 @@ async function flush_denials() {
     record_state(
       `Denial report refused: ${response.error.code}: ${response.error.message}`,
     );
+  } else {
+    probe("report-ok");
   }
 }
 
@@ -157,6 +189,7 @@ browser.webRequest.onBeforeRequest.addListener(
       const key = `${hit.rule_id}\u0000${hit.value}`;
       pending_denials.set(key, (pending_denials.get(key) ?? 0) + 1);
       record_state(null);
+      probe("blocked-" + hit.kind);
       return { cancel: true };
     }
     if (block_inactive && (await tab_is_inactive(details.tabId))) {

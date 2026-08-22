@@ -10,7 +10,8 @@
     }
   },
   "background": {
-    "scripts": ["engine.js", "background.js"]
+    "scripts": ["engine.js", "background.js"],
+    "type": "module"
   },
   "permissions": [
     "nativeMessaging",

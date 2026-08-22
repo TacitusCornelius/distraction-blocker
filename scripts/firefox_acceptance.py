@@ -6,7 +6,8 @@ ubuntu_acceptance.py phase 1 has installed the service. The script:
 
 1. Downloads Firefox ESR into /opt when absent (ESR honors
    ``xpinstall.signatures.required = false`` so our unsigned extension can
-   be sideloaded persistently).
+   be sideloaded persistently) and installs the runtime libraries the
+   tarball build needs.
 2. Builds a disposable profile with the extension unpacked into it.
 3. Creates one URL-path rule through the service socket.
 4. Serves a canary on localhost, then starts headless Firefox as the
@@ -54,6 +55,15 @@ TARGET_VALUE = "localhost/canary"
 STATS_FILE = Path("/var/lib/distraction-blocker/website-statistics.json")
 POLL_SECONDS = 150
 
+# Breadcrumb: qemu guests often cannot create user namespaces, so every
+# content-process sandbox is disabled for this disposable environment.
+FIREFOX_ENV = {
+    "MOZ_DISABLE_CONTENT_SANDBOX": "1",
+    "MOZ_DISABLE_RDD_SANDBOX": "1",
+    "MOZ_DISABLE_SOCKET_PROCESS_SANDBOX": "1",
+    "MOZ_DISABLE_GPU_SANDBOX": "1",
+}
+
 PREFS = {
     "xpinstall.signatures.required": False,
     "extensions.autoDisableScopes": 0,
@@ -63,6 +73,14 @@ PREFS = {
     "toolkit.telemetry.enabled": False,
     "app.update.auto": False,
 }
+
+RUNTIME_PACKAGES = (
+    "libgtk-3-0",
+    "libdbus-glib-1-2",
+    "libxt6",
+    "libasound2t64",
+    "libasound2",
+)
 
 
 def command(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
@@ -88,6 +106,11 @@ def ensure_firefox(download: bool) -> Path:
     command(["/usr/bin/tar", "-xJf", str(archive), "-C", str(FIREFOX_ROOT)])
     if not FIREFOX_BIN.is_file():
         raise AcceptanceError("the Firefox ESR archive had no firefox binary")
+    # Breadcrumb: the tarball build links GTK, ALSA, and X11 directly; the
+    # server cloud image ships none of them. Package names differ between
+    # releases, so both ALSA spellings are attempted and failures ignored.
+    for package in RUNTIME_PACKAGES:
+        command(["/usr/bin/apt-get", "install", "-y", "-q", package], check=False)
     return FIREFOX_BIN
 
 
@@ -147,7 +170,8 @@ class _QuietHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, *args) -> None:
-        pass
+        # Temporary acceptance probes arrive here as /probe?m=… requests.
+        print("CANARY:", self.path, flush=True)
 
 
 def _recorded_denials() -> dict:
@@ -178,10 +202,10 @@ def check_extension_blocks(firefox_bin: Path, profile: Path) -> None:
                 "--",
                 "/usr/bin/env",
                 f"HOME={account.pw_dir}",
+                *sum(([k, v] for k, v in FIREFOX_ENV.items()), []),
                 str(firefox_bin),
                 "-profile",
                 str(profile),
-                "-headless",
                 f"http://localhost:{CANARY_PORT}/canary",
             ],
             stdout=subprocess.DEVNULL,
