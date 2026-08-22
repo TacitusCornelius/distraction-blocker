@@ -151,9 +151,6 @@ class NativeHostTests(unittest.TestCase):
         self.assertIsNone(host_entry.read_message(Stream(b"")))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class InstallerSourceTests(unittest.TestCase):
     def test_install_files_uses_only_its_parameters(self):
