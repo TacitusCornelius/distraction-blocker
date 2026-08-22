@@ -30,6 +30,15 @@ browser.runtime.sendMessage({ topic: "status" }).then((state) => {
       state.last_refresh_ms,
     ).toLocaleTimeString();
   }
+  // Breadcrumb: the live variables can lag the recorded truth when the
+  // event page restarts; storage holds every recorded state change.
+  browser.storage.local.get().then((recorded) => {
+    const note = document.getElementById("recorded");
+    if (note) {
+      note.textContent = JSON.stringify(recorded).slice(0, 400);
+    }
+  });
+
   const list = document.getElementById("denials");
   list.replaceChildren();
   const entries = Object.entries(state.denials ?? {});
