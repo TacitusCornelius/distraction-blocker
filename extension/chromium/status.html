@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Distraction Blocker</title>
+  <style>
+    body { font: 14px sans-serif; margin: 12px; min-width: 320px; }
+    h1 { font-size: 16px; margin: 0 0 8px; }
+    .ok { color: #1a7f37; }
+    .bad { color: #c62828; }
+    dl { margin: 8px 0; }
+    dt { font-weight: bold; margin-top: 6px; }
+    dd { margin: 0 0 4px 0; }
+    li { margin: 2px 0; }
+  </style>
+</head>
+<body>
+  <h1>Distraction Blocker</h1>
+  <p id="state">Checking the service…</p>
+  <dl>
+    <dt>Last policy refresh</dt>
+    <dd id="refresh">never</dd>
+    <dt>Recorded state</dt>
+    <dd><code id="recorded" style="word-break: break-all;"></code></dd>
+    <dt>Denied loads by rule</dt>
+    <dd><ul id="denials"><li>none yet</li></ul></dd>
+    <dt>Inactive-tab blocking</dt>
+    <dd>
+      <label>
+        <input type="checkbox" id="block_inactive" />
+        Block network loads in background tabs
+      </label>
+    </dd>
+  </dl>
+  <script src="status.js"></script>
+</body>
+</html>

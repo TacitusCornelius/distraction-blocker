@@ -20,10 +20,16 @@ DESKTOP = Path("/usr/share/applications/org.distraction_blocker.App.desktop")
 LEGACY_DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
 CLI_PATH = Path("/usr/local/bin/distraction-blocker")
 NATIVE_MANIFESTS = tuple(
-    Path(directory) / "org.distraction_blocker.firefox.json"
+    Path(directory) / manifest_name
     for directory in (
         "/usr/lib/mozilla/native-messaging-hosts",
         "/usr/lib/librewolf/native-messaging-hosts",
+        "/etc/chromium/native-messaging-hosts",
+        "/etc/opt/chrome/native-messaging-hosts",
+    )
+    for manifest_name in (
+        "org.distraction_blocker.firefox.json",
+        "org.distraction_blocker.chromium.json",
     )
 )
 POLICY_FILES = ("hmac.key", "policy.json", "policy.json.bak", "statistics.json")
@@ -94,7 +100,7 @@ def remove_native_manifests() -> None:
         except (OSError, ValueError, KeyError):
             pass
     for home in homes:
-        for subdir in (".mozilla", ".librewolf"):
+        for subdir in (".mozilla", ".librewolf", ".config/chromium/NativeMessagingHosts", ".config/google-chrome/NativeMessagingHosts"):
             path = home / subdir / "native-messaging-hosts" / "org.distraction_blocker.firefox.json"
             if path.is_symlink():
                 fail(f"refusing to remove a symlink at {path}")

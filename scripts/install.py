@@ -290,6 +290,35 @@ def install_files(source_root: Path, owner_uid: int) -> None:
                 ],
                 check=True,
             )
+            for browser_dir in (
+                Path("/etc/chromium/native-messaging-hosts"),
+                Path("/etc/opt/chrome/native-messaging-hosts"),
+            ):
+                copy_asset(
+                    packaging_fd,
+                    "org.distraction_blocker.chromium.json",
+                    browser_dir / "org.distraction_blocker.chromium.json",
+                )
+            for user_dir in (
+                owner_home / ".config" / "chromium" / "NativeMessagingHosts",
+                owner_home / ".config" / "google-chrome" / "NativeMessagingHosts",
+            ):
+                copy_asset(
+                    packaging_fd,
+                    "org.distraction_blocker.chromium.json",
+                    user_dir / "org.distraction_blocker.chromium.json",
+                    0o644,
+                )
+            subprocess.run(
+                [
+                    "/usr/bin/chown",
+                    "-R",
+                    f"{owner_uid}:{owner_uid}",
+                    str(owner_home / ".config" / "chromium"),
+                    str(owner_home / ".config" / "google-chrome"),
+                ],
+                check=False,
+            )
         finally:
             os.close(packaging_fd)
             os.close(package_fd)

@@ -1,0 +1,7 @@
+{
+  "name": "org.distraction_blocker.extension",
+  "description": "Distraction Blocker policy link between the browser extension and the root service",
+  "path": "/usr/lib/distraction-blocker/host_entry.py",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://kcoacponjklfkboekihkibdlnpdijnmn/*"]
+}

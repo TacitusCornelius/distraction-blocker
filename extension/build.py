@@ -15,7 +15,7 @@ from pathlib import Path
 import shutil
 
 ROOT = Path(__file__).resolve().parent
-CORE = ROOT / "core" / "engine.js"
+CORE_FILES = sorted((ROOT / "core").glob("*.js"))
 TARGETS = ("firefox", "chromium")
 
 
@@ -23,12 +23,11 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def sync(target: str) -> Path:
+def sync(target: str) -> None:
     destination = ROOT / target / "core"
     destination.mkdir(parents=True, exist_ok=True)
-    copied = destination / "engine.js"
-    shutil.copyfile(CORE, copied)
-    return copied
+    for source in CORE_FILES:
+        shutil.copyfile(source, destination / source.name)
 
 
 def main() -> int:
@@ -42,12 +41,13 @@ def main() -> int:
     for target in TARGETS:
         if not (ROOT / target / "manifest.json").is_file():
             continue  # adapter not started yet; nothing to keep in sync
-        destination = ROOT / target / "core" / "engine.js"
-        if args.check:
-            if not destination.exists() or digest(destination) != digest(CORE):
-                failures.append(f"{target}/core/engine.js is stale")
-        else:
-            sync(target)
+        for source in CORE_FILES:
+            destination = ROOT / target / "core" / source.name
+            if args.check:
+                if not destination.exists() or digest(destination) != digest(source):
+                    failures.append(f"{target}/core/{source.name} is stale")
+            else:
+                sync(target)
         synced.append(target)
 
     if args.check and failures:

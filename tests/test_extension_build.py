@@ -35,6 +35,16 @@ class ExtensionCoreSyncTests(unittest.TestCase):
         for banned in ("browser.", "chrome.", "webRequest", "connectNative"):
             self.assertNotIn(banned, source)
 
+    def test_adapter_manifests_share_version(self):
+        import json
+
+        versions = set()
+        for target in ("firefox", "chromium"):
+            manifest = self.root / "extension" / target / "manifest.json"
+            if manifest.is_file():
+                versions.add(json.loads(manifest.read_text())["version"])
+        self.assertEqual(len(versions), 1, f"manifest versions diverge: {versions}")
+
 
 if __name__ == "__main__":
     unittest.main()
