@@ -115,6 +115,13 @@ def ensure_firefox(download: bool) -> Path:
 
 
 def build_profile(extension_source: Path) -> Path:
+    # Breadcrumb: the adapter directory needs a current copy of the shared
+    # core before packaging; build.py fails loudly on drift.
+    command([
+        "/usr/bin/python3",
+        str(extension_source.parent / "build.py"),
+        "--check",
+    ])
     profile = PROFILE_ROOT / "profile"
     if profile.exists():
         shutil.rmtree(profile)

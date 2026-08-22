@@ -10,7 +10,7 @@
     }
   },
   "background": {
-    "scripts": ["engine.js", "background.js"],
+    "scripts": ["core/engine.js", "background.js"],
     "type": "module"
   },
   "permissions": [
