@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pwd
 from pathlib import Path
 import shutil
 import subprocess
@@ -82,6 +83,23 @@ def remove_native_manifests() -> None:
             fail(f"refusing to remove a symlink at {path}")
         if path.is_file():
             path.unlink()
+    # Breadcrumb: the installer also placed per-owner copies under the
+    # desktop user's home; remove those for the recorded owner UID.
+    owner_file = Path("/var/lib/distraction-blocker/owner.uid")
+    homes = []
+    if owner_file.is_file():
+        try:
+            uid = int(owner_file.read_text(encoding="ascii").strip())
+            homes.append(Path(pwd.getpwuid(uid).pw_dir))
+        except (OSError, ValueError, KeyError):
+            pass
+    for home in homes:
+        for subdir in (".mozilla", ".librewolf"):
+            path = home / subdir / "native-messaging-hosts" / "org.distraction_blocker.firefox.json"
+            if path.is_symlink():
+                fail(f"refusing to remove a symlink at {path}")
+            if path.is_file():
+                path.unlink()
 
 
 

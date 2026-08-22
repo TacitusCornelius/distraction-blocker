@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import pwd
 import shutil
 import stat
 import subprocess
@@ -252,8 +253,10 @@ def install_files(source_root: Path, owner_uid: int) -> None:
                 PREFIX / "host_entry.py",
                 0o755,
             )
-            # Breadcrumb: Firefox and LibreWolf each read only their own
-            # system-wide native-messaging directory, so both get the manifest.
+            # Breadcrumb: Firefox reads the system-wide mozilla directory,
+            # but LibreWolf builds commonly ignore it and some ignore the
+            # system librewolf directory too. The owner's home directories
+            # are the locations every Firefox-family browser honors.
             for browser_dir in (
                 Path("/usr/lib/mozilla/native-messaging-hosts"),
                 Path("/usr/lib/librewolf/native-messaging-hosts"),
@@ -263,6 +266,30 @@ def install_files(source_root: Path, owner_uid: int) -> None:
                     "org.distraction_blocker.firefox.json",
                     browser_dir / "org.distraction_blocker.firefox.json",
                 )
+            try:
+                owner_home = Path(pwd.getpwuid(args.owner_uid).pw_dir)
+            except KeyError:
+                fail("the owner UID has no user account")
+            for home_dir in (
+                owner_home / ".mozilla" / "native-messaging-hosts",
+                owner_home / ".librewolf" / "native-messaging-hosts",
+            ):
+                copy_asset(
+                    packaging_fd,
+                    "org.distraction_blocker.firefox.json",
+                    home_dir / "org.distraction_blocker.firefox.json",
+                    0o644,
+                )
+            subprocess.run(
+                [
+                    "/usr/bin/chown",
+                    "-R",
+                    f"{args.owner_uid}:{args.owner_uid}",
+                    str(owner_home / ".mozilla" / "native-messaging-hosts"),
+                    str(owner_home / ".librewolf" / "native-messaging-hosts"),
+                ],
+                check=True,
+            )
         finally:
             os.close(packaging_fd)
             os.close(package_fd)
