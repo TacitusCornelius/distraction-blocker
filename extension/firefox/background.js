@@ -10,9 +10,8 @@
 "use strict";
 
 /* global browser, compile */
-
 const HOST_NAME = "org.distraction_blocker.extension";
-const REFRESH_MS = 5 * 60 * 1000;
+const REFRESH_MS = 60 * 1000;
 const INACTIVE_KEY = "inactive-tab";
 
 let match = compile([]);
