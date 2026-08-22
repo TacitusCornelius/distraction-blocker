@@ -267,7 +267,7 @@ def install_files(source_root: Path, owner_uid: int) -> None:
                     browser_dir / "org.distraction_blocker.firefox.json",
                 )
             try:
-                owner_home = Path(pwd.getpwuid(args.owner_uid).pw_dir)
+                owner_home = Path(pwd.getpwuid(owner_uid).pw_dir)
             except KeyError:
                 fail("the owner UID has no user account")
             for home_dir in (
@@ -284,7 +284,7 @@ def install_files(source_root: Path, owner_uid: int) -> None:
                 [
                     "/usr/bin/chown",
                     "-R",
-                    f"{args.owner_uid}:{args.owner_uid}",
+                    f"{owner_uid}:{owner_uid}",
                     str(owner_home / ".mozilla" / "native-messaging-hosts"),
                     str(owner_home / ".librewolf" / "native-messaging-hosts"),
                 ],

@@ -23,6 +23,7 @@ let last_error = "No policy loaded yet.";
 let last_refresh_ms = 0;
 let block_inactive = false;
 const pending_denials = new Map(); // "rule_id\u0000value" -> count
+console.log("DB-VERSION-282bfb8-plus");
 probe("event-page-start");
 
 // Breadcrumb: MV3 event pages do not reliably load at browser startup

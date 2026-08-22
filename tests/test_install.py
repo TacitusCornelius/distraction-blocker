@@ -153,3 +153,24 @@ class NativeHostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstallerSourceTests(unittest.TestCase):
+    def test_install_files_uses_only_its_parameters(self):
+        # Breadcrumb: install_files receives owner_uid as a parameter; a
+        # reference to main()'s local `args` inside it is a latent NameError
+        # that only detonates on a real install run.
+        import ast
+
+        source = Path(install.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "install_files"
+        )
+        names = {node.id for node in ast.walk(function) if isinstance(node, ast.Name)}
+        self.assertNotIn("args", names)
+
+
+if __name__ == "__main__":
+    unittest.main()
