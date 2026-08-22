@@ -28,12 +28,13 @@ class ExtensionCoreSyncTests(unittest.TestCase):
             f"adapter core is stale; run: python3 extension/build.py\n{result.stdout}",
         )
 
-    def test_core_module_stays_browser_agnostic(self):
+    def test_core_modules_stay_browser_agnostic(self):
         # Breadcrumb: the core answers policy questions only; if it ever
         # references a browser API, adapters can no longer share it safely.
-        source = (self.root / "extension" / "core" / "engine.js").read_text()
-        for banned in ("browser.", "chrome.", "webRequest", "connectNative"):
-            self.assertNotIn(banned, source)
+        for source_path in (self.root / "extension" / "core").glob("*.js"):
+            source = source_path.read_text()
+            for banned in ("browser.", "chrome.", "webRequest", "connectNative"):
+                self.assertNotIn(banned, f"{source_path.name}: {source}")
 
     def test_adapter_manifests_share_version(self):
         import json

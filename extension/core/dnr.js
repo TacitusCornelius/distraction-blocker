@@ -139,6 +139,20 @@ export function compile_dnr(rules) {
       condition: {
         regexFilter: entry.pattern,
         isUrlFilterCaseSensitive: case_sensitive(entry.kind),
+        // Breadcrumb: DNR omits main_frame from its default resource
+        // types, which would let top-level navigations through.
+        resourceTypes: [
+          "main_frame",
+          "sub_frame",
+          "xmlhttprequest",
+          "script",
+          "stylesheet",
+          "image",
+          "media",
+          "font",
+          "websocket",
+          "other",
+        ],
       },
     },
   }));
