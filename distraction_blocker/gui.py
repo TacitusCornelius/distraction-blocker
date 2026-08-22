@@ -344,7 +344,16 @@ def form_to_rule(
     targets: list[Target] = []
     for domain in form.websites:
         if domain.strip():
-            targets.append(Target.from_dict({"kind": "website", "value": domain.strip()}))
+            try:
+                targets.append(Target.from_dict({"kind": "website", "value": domain.strip()}))
+            except ValidationError as error:
+                # Breadcrumb: the most common confusion is pasting a URL
+                # here; point the user at the URL rules section.
+                raise FormError(
+                    f"{domain.strip()} was rejected: websites accept bare"
+                    " hostnames only. Use the URL rules section for paths,"
+                    " wildcards, keywords, or YouTube targets."
+                ) from error
     for path in form.applications:
         if path.strip():
             targets.append(Target.from_dict({"kind": "application", "value": path.strip()}))

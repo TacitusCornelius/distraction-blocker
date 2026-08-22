@@ -9,7 +9,9 @@
  */
 "use strict";
 
-/* global browser, compile */
+// Breadcrumb: the manifest declares this page as a module, so engine.js
+// must be imported explicitly - module scopes are not shared globals.
+import { compile } from "./engine.js";
 
 const HOST_NAME = "org.distraction_blocker.extension";
 const REFRESH_MS = 60 * 1000;
