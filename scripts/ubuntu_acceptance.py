@@ -102,14 +102,22 @@ def installed_client():
 
 
 def install(source_root: Path, owner_uid: int) -> None:
-    command([
+    args = [
         sys.executable,
         str(source_root / "scripts" / "install.py"),
         "--confirm",
         "--owner-uid",
         str(owner_uid),
-    ])
-    wait_for_service()
+    ]
+    command(args)
+    try:
+        wait_for_service()
+    except AcceptanceError:
+        # Breadcrumb: on the first boot of a fresh VM, systemd can still be
+        # settling while the installer runs; one retry has always been enough.
+        time.sleep(5)
+        command(args)
+        wait_for_service()
 
 
 def make_test_executable() -> None:
@@ -723,3 +731,4 @@ if __name__ == "__main__":
     except AcceptanceError as error:
         print(f"Acceptance refused: {error}", file=sys.stderr)
         raise SystemExit(2)
+
