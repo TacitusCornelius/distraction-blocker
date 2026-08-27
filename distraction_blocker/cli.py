@@ -1,8 +1,7 @@
 """Socket-only public command-line client.
 
-This module imports only the standard library and the small RPC client.  It
-never reads protected files and keeps optional GTK and service imports outside
-all CLI command paths.
+This module imports only the standard library and small data-contract modules.
+It never reads protected files. It does not import GTK or the root service.
 """
 from __future__ import annotations
 
@@ -16,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .canonical import CanonicalError, canonical_uuid
+from .model import PolicyProjection
 from .rpc import Client, RpcError
 
 UTC = timezone.utc
@@ -88,16 +88,17 @@ def _human_lines(command: str, value: Any) -> list[str]:
             f"Active websites: {counts.get('website', 0)}",
             f"Active applications: {counts.get('application', 0)}",
         ]
-    if command == "rules" and isinstance(value, list):
-        if not value:
+    if command == "rules" and isinstance(value, dict):
+        rules = value["rules"]
+        if not rules:
             return ["No rules."]
         return [
             (
-                f"{item.get('id', '')}  {item.get('name', '')}  "
-                f"{'enabled' if item.get('enabled') else 'disabled'}  "
-                f"{item.get('schedule', {}).get('kind', 'unknown')}"
+                f"{item['id']}  {item['name']}  "
+                f"{'enabled' if item['enabled'] else 'disabled'}  "
+                f"{item['schedule']['kind']}"
             )
-            for item in value
+            for item in rules
         ]
     if command == "managed-lists" and isinstance(value, list):
         if not value:
@@ -159,6 +160,10 @@ def _write_result(
     json_output: bool,
     output: Callable[[str], None],
 ) -> None:
+    if command == "rules":
+        # Breadcrumb: validate before either JSON or human output. This keeps
+        # malformed service data out of every CLI presentation path.
+        value = PolicyProjection.from_dict(value).to_dict()
     safe = _json_safe(value)
     if json_output:
         output(json.dumps(

@@ -10,7 +10,7 @@ import stat
 import tempfile
 from typing import Iterable, Mapping, Any
 
-from .model import ManagedList, Policy, Rule, Target, ValidationError
+from .model import POLICY_SCHEMA_VERSION, ManagedList, Policy, Rule, Target, ValidationError
 
 NATIVE_FORMAT = "distraction-blocker"
 NATIVE_VERSION = 2
@@ -196,7 +196,12 @@ def parse_native_export(text: str) -> Policy:
         raise TransferError("native export time is invalid") from error
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         raise TransferError("native export time must be UTC")
-    policy_data = {"revision": 0 if version == 1 else value["revision"], "rules": value["rules"], "managed_lists": [] if version == 1 else value["managed_lists"]}
+    policy_data = {
+        "schema_version": POLICY_SCHEMA_VERSION,
+        "revision": 0 if version == 1 else value["revision"],
+        "rules": value["rules"],
+        "managed_lists": [] if version == 1 else value["managed_lists"],
+    }
     if version == 1:
         # Breadcrumb for reviewers: old native files are converted before strict v2 model parsing.
         converted_rules = []

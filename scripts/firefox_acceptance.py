@@ -170,14 +170,18 @@ def remove_rule() -> None:
 
 class _QuietHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - http.server naming
-        body = b"canary\n"
+        # Breadcrumb: Firefox navigates before the background finishes its
+        # first policy fetch, so the page reloads every 3 s until a compiled
+        # rule starts cancelling it.
+        body = (
+            b"<!doctype html><meta http-equiv=\"refresh\" content=\"3\">\n"
+        )
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def log_message(self, *args) -> None:
-        # Temporary acceptance probes arrive here as /probe?m=… requests.
         print("CANARY:", self.path, flush=True)
 
 
@@ -209,8 +213,15 @@ def check_extension_blocks(firefox_bin: Path, profile: Path) -> None:
                 "--",
                 "/usr/bin/env",
                 f"HOME={account.pw_dir}",
-                *sum(([k, v] for k, v in FIREFOX_ENV.items()), []),
+                # Breadcrumb: /usr/bin/env only accepts VAR=value tokens;
+                # splitting keys and values makes it treat a bare key as
+                # the program name and exit before Firefox starts.
+                *(f"{name}={value}" for name, value in FIREFOX_ENV.items()),
                 str(firefox_bin),
+                # Breadcrumb: acceptance VMs have no X display; without
+                # this flag Firefox exits at once and stderr is discarded.
+                "--headless",
+                "-no-remote",
                 "-profile",
                 str(profile),
                 f"http://localhost:{CANARY_PORT}/canary",

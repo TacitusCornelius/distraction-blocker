@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+import re
 import os
 from pathlib import Path
 import queue
@@ -133,63 +134,119 @@ def _row_bytes(row: "DenialStat") -> int:
     return len(payload) + 1
 
 
+def _victim_index(rows: list, victim_key) -> int:
+    """Return the index of the row shed first under ``victim_key``."""
+    return min(range(len(rows)), key=lambda i: victim_key(rows[i]))
+
+
+def _bounded_state_items(
+    raw_items: Any,
+    dropped: int,
+    *,
+    row_type: type,
+    type_error: str,
+    capacity_error: str,
+    duplicate_error: str,
+    row_key,
+    victim_key,
+    row_bytes,
+    budget_error: str,
+):
+    """Normalize one bounded signed state's rows.
+
+    Breadcrumb: this hosts the single eviction-loop implementation for all
+    three signed states; victims shed oldest-first with the row key as tie
+    breaker, matching the record() paths that reuse _victim_index.
+    """
+    if not isinstance(raw_items, tuple):
+        raw_items = tuple(raw_items)
+    if len(raw_items) > MAX_PATHS:
+        raise ValueError(capacity_error)
+    if (
+        isinstance(dropped, bool)
+        or not isinstance(dropped, int)
+        or not 0 <= dropped <= MAX_COUNT
+    ):
+        raise ValueError("statistics dropped count is invalid")
+    rows: list[Any] = []
+    seen: set[Any] = set()
+    for row in raw_items:
+        if not isinstance(row, row_type):
+            raise TypeError(type_error)
+        key = row_key(row)
+        if key in seen:
+            raise ValueError(duplicate_error)
+        seen.add(key)
+        rows.append(row)
+    rows.sort(key=row_key)
+    total = sum(row_bytes(row) for row in rows)
+    while total > MAX_STATE_BYTES:
+        if len(rows) == 1:
+            raise ValueError(budget_error)
+        victim = _victim_index(rows, victim_key)
+        total -= row_bytes(rows[victim])
+        rows.pop(victim)
+    return tuple(rows)
+
+
+class _BoundedState:
+    """Shared envelope mapping for bounded signed statistics states.
+
+    Breadcrumb: subclasses keep their public names, wire shapes, and exact
+    error text; only row normalization and the ``items``/``dropped`` JSON
+    mapping are unified here.
+    """
+
+    __slots__ = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"items": [row.to_dict() for row in self.items], "dropped": self.dropped}
+
+    @classmethod
+    def empty(cls) -> "_BoundedState":
+        return cls()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "_BoundedState":
+        if not isinstance(data, Mapping) or set(data) != {"items", "dropped"}:
+            raise ValueError(cls._shape_error)
+        if not isinstance(data["items"], list):
+            raise ValueError(cls._items_error)
+        return cls(
+            tuple(cls._row_type.from_dict(row) for row in data["items"]),
+            data["dropped"],
+        )
+
+
 @dataclass(frozen=True, slots=True)
-class StatisticsState:
+class StatisticsState(_BoundedState):
     """Immutable bounded statistics snapshot."""
 
     items: tuple[DenialStat, ...] = ()
     dropped: int = 0
 
+    # Envelope-mapping hooks consumed by _BoundedState.
+    _row_type = DenialStat
+    _shape_error = "statistics state has an invalid shape"
+    _items_error = "statistics items must be a list"
+
     def __post_init__(self) -> None:
-        if not isinstance(self.items, tuple):
-            object.__setattr__(self, "items", tuple(self.items))
-        if len(self.items) > MAX_PATHS:
-            raise ValueError("statistics state has too many paths")
-        if (
-            isinstance(self.dropped, bool)
-            or not isinstance(self.dropped, int)
-            or not 0 <= self.dropped <= MAX_COUNT
-        ):
-            raise ValueError("statistics dropped count is invalid")
-        rows: list[DenialStat] = []
-        seen: set[str] = set()
-        for row in self.items:
-            if not isinstance(row, DenialStat):
-                raise TypeError("statistics state rows must be DenialStat")
-            if row.path in seen:
-                raise ValueError("statistics state has duplicate paths")
-            seen.add(row.path)
-            rows.append(row)
-        rows.sort(key=lambda row: row.path)
-        total = sum(_row_bytes(row) for row in rows)
-        # Breadcrumb: eviction uses the same deterministic key as record(),
-        # so an over-budget state sheds its oldest rows instead of failing
-        # to persist later.
-        while total > MAX_STATE_BYTES:
-            if len(rows) == 1:
-                raise ValueError("statistics row exceeds the state byte budget")
-            victim = min(
-                range(len(rows)),
-                key=lambda i: (_time_key(rows[i].last_utc), rows[i].path),
-            )
-            total -= _row_bytes(rows[victim])
-            rows.pop(victim)
-        object.__setattr__(self, "items", tuple(rows))
-
-    @classmethod
-    def empty(cls) -> "StatisticsState":
-        return cls()
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "StatisticsState":
-        if not isinstance(data, Mapping) or set(data) != {"items", "dropped"}:
-            raise ValueError("statistics state has an invalid shape")
-        if not isinstance(data["items"], list):
-            raise ValueError("statistics items must be a list")
-        return cls(tuple(DenialStat.from_dict(row) for row in data["items"]), data["dropped"])
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"items": [row.to_dict() for row in self.items], "dropped": self.dropped}
+        object.__setattr__(
+            self,
+            "items",
+            _bounded_state_items(
+                self.items,
+                self.dropped,
+                row_type=DenialStat,
+                type_error="statistics state rows must be DenialStat",
+                capacity_error="statistics state has too many paths",
+                duplicate_error="statistics state has duplicate paths",
+                row_key=lambda row: row.path,
+                victim_key=lambda row: (_time_key(row.last_utc), row.path),
+                row_bytes=_row_bytes,
+                budget_error="statistics row exceeds the state byte budget",
+            ),
+        )
 
     def list(self) -> dict[str, Any]:
         return self.to_dict()
@@ -222,7 +279,7 @@ class StatisticsState:
             rows = list(self.items)
             if len(rows) >= MAX_PATHS:
                 # Breadcrumb: path is the tie breaker, so equal timestamps evict deterministically.
-                victim = min(range(len(rows)), key=lambda i: (_time_key(rows[i].last_utc), rows[i].path))
+                victim = _victim_index(rows, lambda row: (_time_key(row.last_utc), row.path))
                 rows.pop(victim)
             rows.append(row)
         else:
@@ -340,6 +397,23 @@ class DenialBuffer:
 
 
 
+def validate_report_value(value: Any) -> str:
+    """Validate one extension-echoed target value.
+
+    Breadcrumb: the denial and usage report commands must accept exactly the
+    same value text the service itself authored, so both paths share this
+    bound (printable ASCII, 1..512 bytes).
+    """
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or any(not 0x20 < ord(char) < 0x7F for char in value)
+    ):
+        raise ValueError("reported target value is invalid")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class WebsiteDenialStat:
     """One aggregated website-denial row keyed by matched target value.
@@ -355,13 +429,10 @@ class WebsiteDenialStat:
     rule_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.value, str)
-            or not self.value
-            or len(self.value) > 512
-            or any(not 0x20 < ord(char) < 0x7F for char in self.value)
-        ):
-            raise ValueError("website denial value is invalid")
+        try:
+            object.__setattr__(self, "value", validate_report_value(self.value))
+        except ValueError as error:
+            raise ValueError("website denial value is invalid") from error
         if isinstance(self.count, bool) or not isinstance(self.count, int):
             raise TypeError("statistics count must be an integer")
         if self.count < 1 or self.count > MAX_COUNT:
@@ -405,65 +476,33 @@ class WebsiteDenialStat:
 
 
 @dataclass(frozen=True, slots=True)
-class WebsiteDenialState:
+class WebsiteDenialState(_BoundedState):
     """Bounded snapshot of website denials reported by the extension."""
 
     items: tuple[WebsiteDenialStat, ...] = ()
     dropped: int = 0
 
+    # Envelope-mapping hooks consumed by _BoundedState.
+    _row_type = WebsiteDenialStat
+    _shape_error = "website statistics state has an invalid shape"
+    _items_error = "website statistics items must be a list"
+
     def __post_init__(self) -> None:
-        if not isinstance(self.items, tuple):
-            object.__setattr__(self, "items", tuple(self.items))
-        if len(self.items) > MAX_PATHS:
-            raise ValueError("website statistics state has too many entries")
-        if (
-            isinstance(self.dropped, bool)
-            or not isinstance(self.dropped, int)
-            or not 0 <= self.dropped <= MAX_COUNT
-        ):
-            raise ValueError("statistics dropped count is invalid")
-        rows: list[WebsiteDenialStat] = []
-        seen: set[str] = set()
-        for row in self.items:
-            if not isinstance(row, WebsiteDenialStat):
-                raise TypeError("website rows must be WebsiteDenialStat values")
-            if row.value in seen:
-                raise ValueError("website statistics state has duplicate values")
-            seen.add(row.value)
-            rows.append(row)
-        rows.sort(key=lambda row: row.value)
-        total = sum(_row_bytes(row) for row in rows)
-        # Breadcrumb: eviction mirrors StatisticsState so both signed files
-        # share one bound discipline.
-        while total > MAX_STATE_BYTES:
-            if len(rows) == 1:
-                raise ValueError(
-                    "website statistics row exceeds the state byte budget"
-                )
-            victim = min(
-                range(len(rows)),
-                key=lambda i: (_time_key(rows[i].last_utc), rows[i].value),
-            )
-            total -= _row_bytes(rows[victim])
-            rows.pop(victim)
-        object.__setattr__(self, "items", tuple(rows))
-
-    @classmethod
-    def empty(cls) -> "WebsiteDenialState":
-        return cls()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"items": [row.to_dict() for row in self.items], "dropped": self.dropped}
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "WebsiteDenialState":
-        if not isinstance(data, Mapping) or set(data) != {"items", "dropped"}:
-            raise ValueError("website statistics state has an invalid shape")
-        if not isinstance(data["items"], list):
-            raise ValueError("website statistics items must be a list")
-        return cls(
-            tuple(WebsiteDenialStat.from_dict(row) for row in data["items"]),
-            data["dropped"],
+        object.__setattr__(
+            self,
+            "items",
+            _bounded_state_items(
+                self.items,
+                self.dropped,
+                row_type=WebsiteDenialStat,
+                type_error="website rows must be WebsiteDenialStat values",
+                capacity_error="website statistics state has too many entries",
+                duplicate_error="website statistics state has duplicate values",
+                row_key=lambda row: row.value,
+                victim_key=lambda row: (_time_key(row.last_utc), row.value),
+                row_bytes=_row_bytes,
+                budget_error="website statistics row exceeds the state byte budget",
+            ),
         )
 
     def record(
@@ -483,9 +522,8 @@ class WebsiteDenialState:
         )
         if index is None:
             if len(self.items) >= MAX_PATHS:
-                victim = min(
-                    range(len(self.items)),
-                    key=lambda i: (_time_key(self.items[i].last_utc), self.items[i].value),
+                victim = _victim_index(
+                    self.items, lambda row: (_time_key(row.last_utc), row.value)
                 )
                 remaining = self.items[:victim] + self.items[victim + 1 :]
                 return WebsiteDenialState(remaining, self.dropped).record(
@@ -506,6 +544,159 @@ class WebsiteDenialState:
         return WebsiteDenialState(tuple(rows), self.dropped)
 
 
+
+def _usage_day_text(value: Any) -> str:
+    """Validate one ``YYYY-MM-DD`` local-day stamp."""
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("usage day must be YYYY-MM-DD")
+    try:
+        date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("usage day is not a real date") from error
+    return value
+
+
+def _usage_row_bytes(row: "WebsiteUsageStat") -> int:
+    """Return the canonical JSON size of one usage row in the envelope."""
+    payload = json.dumps(row.to_dict(), sort_keys=True, separators=(",", ":"))
+    return len(payload) + 1
+
+
+@dataclass(frozen=True, slots=True)
+class WebsiteUsageStat:
+    """One per-rule daily count of permitted main-frame starts.
+
+    The day is the rule's LOCAL date (its schedule time zone), not UTC, so
+    a budget resets when the rule's own calendar day turns over.
+    """
+
+    rule_id: str
+    day: str
+    count: int
+
+    def __post_init__(self) -> None:
+        try:
+            object.__setattr__(self, "rule_id", canonical_uuid(self.rule_id))
+        except CanonicalError as error:
+            raise ValueError("usage rule id must be a canonical UUID") from error
+        try:
+            object.__setattr__(self, "day", _usage_day_text(self.day))
+        except ValueError as error:
+            raise ValueError(str(error)) from error
+        if isinstance(self.count, bool) or not isinstance(self.count, int):
+            raise TypeError("statistics count must be an integer")
+        if self.count < 1 or self.count > MAX_COUNT:
+            raise ValueError("statistics count is out of range")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"rule_id": self.rule_id, "day": self.day, "count": self.count}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "WebsiteUsageStat":
+        if not isinstance(data, Mapping) or set(data) != {"rule_id", "day", "count"}:
+            raise ValueError("website usage row has an invalid shape")
+        return cls(data["rule_id"], data["day"], data["count"])
+
+
+@dataclass(frozen=True, slots=True)
+class WebsiteUsageState(_BoundedState):
+    """Bounded snapshot of per-rule daily starts reported by the extension.
+
+    Breadcrumb: row normalization and envelope mapping are shared via
+    _BoundedState; the per-rule LOCAL-day semantics stay local to record()
+    and fresh().
+    """
+
+    items: tuple[WebsiteUsageStat, ...] = ()
+    dropped: int = 0
+
+    # Envelope-mapping hooks consumed by _BoundedState.
+    _row_type = WebsiteUsageStat
+    _shape_error = "website usage state has an invalid shape"
+    _items_error = "website usage items must be a list"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "items",
+            _bounded_state_items(
+                self.items,
+                self.dropped,
+                row_type=WebsiteUsageStat,
+                type_error="website rows must be WebsiteUsageStat values",
+                capacity_error="website usage state has too many entries",
+                duplicate_error="website usage state has duplicate rows",
+                row_key=lambda row: (row.rule_id, row.day),
+                victim_key=lambda row: (row.day, row.rule_id),
+                row_bytes=_usage_row_bytes,
+                budget_error="website usage row exceeds the state byte budget",
+            ),
+        )
+
+    def record(
+        self,
+        rule_id: str,
+        times: int,
+        day: str,
+    ) -> "WebsiteUsageState":
+        """Return a state with ``times`` starts merged for ``rule_id`` today."""
+        day = _usage_day_text(day)
+        if isinstance(times, bool) or not isinstance(times, int) or times < 1:
+            raise ValueError("usage count is invalid")
+        index = next(
+            (i for i, item in enumerate(self.items) if item.rule_id == rule_id),
+            None,
+        )
+        if index is None:
+            if len(self.items) >= MAX_PATHS:
+                victim = _victim_index(
+                    self.items, lambda row: (row.day, row.rule_id)
+                )
+                remaining = self.items[:victim] + self.items[victim + 1 :]
+                return WebsiteUsageState(remaining, self.dropped + 1).record(
+                    rule_id, times, day
+                )
+            fresh = WebsiteUsageStat(rule_id, day, min(MAX_COUNT, times))
+            return WebsiteUsageState((*self.items, fresh), self.dropped)
+        old = self.items[index]
+        if old.day == day:
+            updated = WebsiteUsageStat(
+                old.rule_id, old.day, min(MAX_COUNT, old.count + times)
+            )
+            rows = list(self.items)
+            rows[index] = updated
+            return WebsiteUsageState(tuple(rows), self.dropped)
+        # Breadcrumb: lazy daily reset. The stored row belongs to a previous
+        # local day, so the first report of the new day replaces it.
+        replacement = WebsiteUsageStat(old.rule_id, day, min(MAX_COUNT, times))
+        rows = list(self.items)
+        rows[index] = replacement
+        return WebsiteUsageState(tuple(rows), self.dropped)
+
+    def fresh(self, today_for) -> "WebsiteUsageState":
+        """Drop rows whose stored day is not the rule's current local day.
+
+        ``today_for`` maps a rule id to its current local ``YYYY-MM-DD``
+        string, or None for an unknown rule. Breadcrumb: no timers exist in
+        this design; staleness is resolved lazily at every report, load, and
+        projection.
+        """
+        kept = tuple(
+            row
+            for row in self.items
+            if today_for(row.rule_id) is not None
+            and _usage_day_text(today_for(row.rule_id)) == row.day
+        )
+        return WebsiteUsageState(kept, self.dropped)
+
+    def count_for(self, rule_id: str, day: str) -> int:
+        """Return today's counted starts, treating stale rows as zero."""
+        row = next((item for item in self.items if item.rule_id == rule_id), None)
+        if row is None or row.day != day:
+            return 0
+        return row.count
+
+
 __all__ = [
     "MAX_COUNT",
     "MAX_PATHS",
@@ -517,5 +708,7 @@ __all__ = [
     "StatisticsState",
     "WebsiteDenialState",
     "WebsiteDenialStat",
+    "WebsiteUsageState",
+    "WebsiteUsageStat",
     "canonical_path",
 ]

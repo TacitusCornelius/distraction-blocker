@@ -9,14 +9,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from distraction_blocker.control import ControlState
-from distraction_blocker.model import ManagedList, Policy, Rule
-from distraction_blocker.rpc import Client, RpcServer
+from distraction_blocker.model import POLICY_SCHEMA_VERSION, ManagedList, Policy, Rule
+from distraction_blocker.rpc import Client, RpcServer, response_fits
 from distraction_blocker.service import BlockerService
 from distraction_blocker.transfer import native_export_text
 from distraction_blocker.statistics import (
     DenialBuffer,
     StatisticsState,
     WebsiteDenialState,
+    WebsiteUsageState,
 )
 
 
@@ -44,6 +45,7 @@ class FakeStore:
         self.controls = controls or ControlState.empty()
         self.statistics = statistics or StatisticsState.empty()
         self.website_statistics = WebsiteDenialState.empty()
+        self.website_usage = WebsiteUsageState.empty()
         self.statistics_saves = []
         self.fail_statistics = False
         self.fail_policy = False
@@ -68,6 +70,15 @@ class FakeStore:
         if self.fail_statistics:
             raise OSError("statistics storage unavailable")
         self.website_statistics = state
+        return None
+
+    def load_website_usage(self):
+        return self.website_usage
+
+    def save_website_usage(self, state):
+        if self.fail_statistics:
+            raise OSError("statistics storage unavailable")
+        self.website_usage = state
         return None
 
     def initialize(self):
@@ -132,7 +143,7 @@ class FakeApplications:
 
 class ServiceTests(unittest.TestCase):
     def test_start_order_and_strict_fields(self):
-        raw = {"revision": 0, "rules": [], "managed_lists": []}
+        raw = {"schema_version": POLICY_SCHEMA_VERSION, "revision": 0, "rules": [], "managed_lists": []}
         service = BlockerService(FakeStore(Policy.from_dict(raw)), FakeClock(), FakeHosts(), FakeApplications())
         service.start()
         self.assertTrue(service.applications.started)
@@ -140,6 +151,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(service.dispatch(1000, {"command": "list_rules"})["ok"], True)
 
     def test_failed_policy_save_does_not_change_live_enforcement(self):
+
         rule = Rule.from_dict({
             "id": "12345678-1234-5678-1234-567812345678",
             "name": "Stored",
@@ -165,6 +177,39 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual(hosts.values, set())
         self.assertFalse(service.policy.rules[0].enabled)
+    def test_save_rejects_policy_when_projection_is_too_large(self):
+        rules = tuple(
+            Rule.from_dict(
+                {
+                    "id": f"00000000-0000-4000-8000-{index:012d}",
+                    "name": f"r{index}",
+                    "enabled": True,
+                    "targets": [
+                        {
+                            "kind": "url_path",
+                            "value": f"h{index}.example/x",
+                        }
+                    ],
+                    "schedule": {"kind": "indefinite"},
+                    "revision": 0,
+                }
+            )
+            for index in range(324)
+        )
+        store = FakeStore(Policy(0, ()))
+        service = BlockerService(
+            store, FakeClock(), FakeHosts(), FakeApplications()
+        )
+        service.start()
+        result = service.dispatch(
+            1000,
+            {
+                "command": "replace_rules",
+                "rules": [rule.to_dict() for rule in rules],
+            },
+        )
+        self.assertEqual(result["error"]["code"], "too_large")
+        self.assertEqual(store.policy.rules, ())
 
     def test_denial_stats_drain_associates_all_active_rules_and_clear(self):
         first = Rule.from_dict({
@@ -236,6 +281,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_statistics_storage_failure_keeps_enforcement_healthy(self):
         store = FakeStore(Policy.from_dict({
+            "schema_version": POLICY_SCHEMA_VERSION,
             "revision": 0, "rules": [], "managed_lists": [],
         }))
         buffer = DenialBuffer()
@@ -252,6 +298,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_clean_close_flushes_pending_statistics(self):
         store = FakeStore(Policy.from_dict({
+            "schema_version": POLICY_SCHEMA_VERSION,
             "revision": 0, "rules": [], "managed_lists": [],
         }))
         buffer = DenialBuffer()
@@ -845,7 +892,12 @@ class ServiceTests(unittest.TestCase):
         service.start()
         begun = service.dispatch(1000, {"command": "begin_native_import"})
         token = begun["result"]["import_id"]
-        text = json.dumps({"revision": 0, "rules": [replacement.to_dict()], "managed_lists": []})
+        text = json.dumps({
+            "schema_version": POLICY_SCHEMA_VERSION,
+            "revision": 0,
+            "rules": [replacement.to_dict()],
+            "managed_lists": [],
+        })
         service.dispatch(1000, {"command": "native_import_chunk", "import_id": token, "text": text})
         result = service.dispatch(1000, {"command": "commit_native_import", "import_id": token})
         self.assertTrue(result["ok"])
@@ -1057,6 +1109,347 @@ class ServiceTests(unittest.TestCase):
             server._serve_connection(left)
         finally:
             left.close()
+
+
+
+
+    def test_allowance_increase_is_rejected_for_active_rule(self):
+        old = Rule.from_dict(
+            {
+                "id": "99999999-9999-4999-8999-999999999999",
+                "name": "Active",
+                "enabled": True,
+                "targets": [
+                    {"kind": "url_path", "value": "example.com/feed"}
+                ],
+                "schedule": {"kind": "indefinite"},
+                "revision": 0,
+            }
+        )
+        updated = old.to_dict()
+        updated["allowance_starts"] = 2
+        service = BlockerService(
+            FakeStore(Policy(0, (old,))),
+            FakeClock(),
+            FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        result = service.dispatch(
+            1000, {"command": "put_rule", "rule": updated}
+        )
+        self.assertEqual(result["error"]["code"], "active_rule")
+
+    def test_allowance_increase_is_rejected_by_rule_lock(self):
+        old = closed_weekly_rule(allowance_starts=2)
+        updated = old.to_dict()
+        updated["allowance_starts"] = 3
+        service = BlockerService(
+            FakeStore(Policy(0, (old,))),
+            FakeClock(),
+            FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        locked = service.dispatch(
+            1000,
+            {
+                "command": "set_rule_lock",
+                "rule_id": old.id,
+                "lock": {"kind": "friction"},
+            },
+        )
+        self.assertTrue(locked["ok"])
+        result = service.dispatch(
+            1000, {"command": "put_rule", "rule": updated}
+        )
+        self.assertEqual(result["error"]["code"], "authorization_required")
+
+
+def closed_weekly_rule(rule_id="12345678-1234-5678-1234-567812345678", **extra):
+    """A weekly rule that is CLOSED at the FakeClock default instant."""
+    # Breadcrumb: 2026-01-01 is a Thursday, so a Monday-only period keeps
+    # the schedule inactive while the allowance tests run.
+    data = {
+        "id": rule_id,
+        "name": "Budgeted",
+        "enabled": True,
+        "targets": [
+            {
+                "kind": "url_path"
+                if "allowance_starts" in extra
+                else "website",
+                "value": "example.com/feed"
+                if "allowance_starts" in extra
+                else "example.com",
+            }
+        ],
+        "schedule": {
+            "kind": "weekly",
+            "timezone": "UTC",
+            "periods": [{"weekdays": [0], "start": "09:00:00", "end": "17:00:00"}],
+        },
+        "revision": 0,
+    }
+    data.update(extra)
+    return Rule.from_dict(data)
+
+
+class WebsiteUsageTests(unittest.TestCase):
+    def _service(self, *rules):
+        service = BlockerService(
+            FakeStore(Policy(0, rules)), FakeClock(), FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        return service
+
+    def _report(self, service, entries):
+        return service.dispatch(1000, {
+            "command": "report_website_usage",
+            "entries": entries,
+        })
+
+    def test_report_validation_mirrors_denials(self):
+        service = self._service(closed_weekly_rule())
+        missing = service.dispatch(1000, {"command": "report_website_usage"})
+        self.assertEqual(missing["error"]["code"], "bad_request")
+        self.assertEqual(
+            missing["error"]["message"], "entries is required"
+        )
+        empty = self._report(service, [])
+        self.assertEqual(empty["error"]["code"], "bad_request")
+        bad_fields = self._report(service, [{"rule_id": "x"}])
+        self.assertEqual(bad_fields["error"]["code"], "bad_value")
+        bool_count = self._report(service, [{
+            "rule_id": "12345678-1234-5678-1234-567812345678",
+            "value": "example.com",
+            "count": True,
+        }])
+        self.assertEqual(bool_count["error"]["code"], "bad_type")
+
+    def test_batch_is_atomic_before_commit(self):
+        service = self._service(closed_weekly_rule())
+        rejected = self._report(service, [
+            {
+                "rule_id": "12345678-1234-5678-1234-567812345678",
+                "value": "example.com",
+                "count": 1,
+            },
+            {
+                "rule_id": "12345678-1234-5678-1234-567812345678",
+                "value": "bad" + chr(127) + "value",
+                "count": 1,
+            },
+        ])
+        self.assertEqual(rejected["error"]["code"], "bad_value")
+        self.assertEqual(len(service._website_usage.items), 0)
+        self.assertEqual(len(service.store.website_usage.items), 0)
+
+    def test_unknown_and_non_allowance_usage_rows_are_rejected(self):
+        budgeted = closed_weekly_rule(allowance_starts=2)
+        unbudgeted = closed_weekly_rule(
+            rule_id="22222222-2222-4222-8222-222222222222",
+            name="No budget",
+        )
+        service = self._service(budgeted, unbudgeted)
+        self.assertTrue(
+            self._report(
+                service,
+                [{
+                    "rule_id": budgeted.id,
+                    "value": "example.com/feed",
+                    "count": 1,
+                }],
+            )["ok"]
+        )
+        before = service._website_usage
+        for rule_id in (
+            "33333333-3333-4333-8333-333333333333",
+            unbudgeted.id,
+        ):
+            with self.subTest(rule_id=rule_id):
+                rejected = self._report(
+                    service,
+                    [{
+                        "rule_id": rule_id,
+                        "value": "example.com/feed",
+                        "count": 1,
+                    }],
+                )
+                self.assertEqual(rejected["error"]["code"], "bad_value")
+                self.assertEqual(service._website_usage, before)
+                self.assertEqual(service.store.website_usage, before)
+
+    def test_list_website_stats_prunes_usage_once(self):
+        service = self._service(closed_weekly_rule(allowance_starts=2))
+        with patch.object(
+            service,
+            "_pruned_website_usage",
+            wraps=service._pruned_website_usage,
+        ) as prune:
+            result = service.dispatch(
+                1000, {"command": "list_website_stats"}
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(prune.call_count, 1)
+
+    def test_exhausted_rule_blocks_despite_closed_schedule(self):
+        rule = closed_weekly_rule(allowance_starts=2)
+        unbudgeted = closed_weekly_rule(
+            rule_id="22222222-2222-4222-8222-222222222222",
+            name="No budget",
+        )
+        service = self._service(rule, unbudgeted)
+        policy = service.dispatch(1000, {"command": "list_rules"})["result"]
+        self.assertEqual(
+            set(policy), {"schema_version", "revision", "rules"}
+        )
+        self.assertEqual(policy["schema_version"], POLICY_SCHEMA_VERSION)
+        listed = policy["rules"]
+        by_id = {item["id"]: item for item in listed}
+        self.assertFalse(by_id[rule.id]["budget_exhausted"])
+        self.assertFalse(by_id[unbudgeted.id]["budget_exhausted"])
+        self.assertEqual(service.hosts.values, set())
+
+        reported = self._report(service, [{
+            "rule_id": rule.id,
+            "value": "example.com/feed",
+            "count": 1,
+        }])
+        self.assertTrue(reported["ok"])
+        still_under = service.dispatch(
+            1000, {"command": "list_rules"}
+        )["result"]["rules"]
+        under = next(
+            item for item in still_under if item["id"] == rule.id
+        )
+        self.assertFalse(under["budget_exhausted"])
+
+        self._report(service, [{
+            "rule_id": rule.id,
+            "value": "example.com/feed",
+            "count": 1,
+        }])
+        after = service.dispatch(
+            1000, {"command": "list_rules"}
+        )["result"]["rules"]
+        exhausted_row = next(item for item in after if item["id"] == rule.id)
+        self.assertTrue(exhausted_row["budget_exhausted"])
+        unbudgeted_row = next(
+            item for item in after if item["id"] == unbudgeted.id
+        )
+        self.assertFalse(unbudgeted_row["budget_exhausted"])
+        # Enforcement: the exhausted rule's targets join the blocked set.
+        self.assertEqual(service.hosts.values, set())
+        # Persistence: the signed state file holds the counted starts.
+        saved = service.store.website_usage
+        self.assertEqual(saved.items[0].count, 2)
+
+    def test_daily_schedule_projects_full_day_when_exhausted(self):
+        rule = closed_weekly_rule(allowance_starts=1)
+        service = self._service(rule)
+        day = service.clock.now().date().isoformat()
+        before = service.dispatch(1000, {
+            "command": "daily_schedule",
+            "timezone": "UTC",
+            "date": day,
+        })["result"]
+        self.assertEqual(before["intervals"], [])
+        self._report(service, [{
+            "rule_id": rule.id,
+            "value": "example.com/feed",
+            "count": 1,
+        }])
+        after = service.dispatch(1000, {
+            "command": "daily_schedule",
+            "timezone": "UTC",
+            "date": day,
+        })["result"]
+        self.assertEqual(len(after["intervals"]), 1)
+        interval = after["intervals"][0]
+        self.assertEqual(interval["rule_id"], rule.id)
+        self.assertTrue(interval["start"].startswith(day + "T00:00"))
+        self.assertNotEqual(interval["end"][:10], day)
+
+    def test_stale_rows_are_pruned_and_count_as_zero(self):
+        rule = closed_weekly_rule(allowance_starts=1)
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,))), FakeClock(), FakeHosts(),
+            FakeApplications(),
+        )
+        # Breadcrumb: seed yesterday's row; the lazy reset must treat it as
+        # zero during start(), so the rule never projects as exhausted.
+        service.store.website_usage = WebsiteUsageState.empty().record(
+            rule.id, 5, "2025-12-31"
+        )
+        service.start()
+        result = service.dispatch(
+            1000, {"command": "list_rules"}
+        )["result"]["rules"]
+        self.assertFalse(result[0]["budget_exhausted"])
+        self.assertEqual(service.hosts.values, set())
+        # Breadcrumb: pruning is opportunistic and in memory; the signed
+        # file only updates on the next observational write.
+        self.assertEqual(service._website_usage.items, ())
+
+    def test_list_website_stats_adds_usage_projection(self):
+        rule = closed_weekly_rule(allowance_starts=3)
+        service = self._service(rule)
+        self._report(service, [{
+            "rule_id": rule.id,
+            "value": "example.com/feed",
+            "count": 1,
+        }])
+        result = service.dispatch(
+            1000, {"command": "list_website_stats"}
+        )["result"]
+        self.assertEqual(set(result), {"items", "dropped", "usage"})
+        usage = result["usage"]
+        self.assertEqual(len(usage), 1)
+        row = usage[0]
+        self.assertEqual(set(row), {
+            "rule_id", "day", "count", "allowance_starts",
+            "budget_exhausted",
+        })
+        self.assertEqual(row["rule_id"], rule.id)
+        self.assertEqual(row["day"], "2026-01-01")
+        self.assertEqual(row["count"], 1)
+        self.assertEqual(row["allowance_starts"], 3)
+        self.assertFalse(row["budget_exhausted"])
+
+    def test_combined_website_statistics_response_fits_rpc(self):
+        rules = tuple(
+            closed_weekly_rule(
+                rule_id=f"00000000-0000-4000-8000-{index:012d}",
+                allowance_starts=3,
+            )
+            for index in range(256)
+        )
+        service = self._service(*rules)
+        denials = WebsiteDenialState.empty()
+        usage = WebsiteUsageState.empty()
+        for index, rule in enumerate(rules):
+            denials = denials.record(
+                f"{index}.example/" + "x" * 480,
+                rule.id,
+                service.clock.now(),
+            )
+            usage = usage.record(rule.id, 1, "2026-01-01")
+        service._website_statistics = denials
+        service._website_usage = usage
+
+        response = service.dispatch(
+            1000, {"command": "list_website_stats"}
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertTrue(response_fits(response))
+        self.assertEqual(len(response["result"]["usage"]), 256)
+        self.assertLess(
+            len(response["result"]["items"]),
+            len(denials.items),
+        )
 
 
 class RpcTests(unittest.TestCase):

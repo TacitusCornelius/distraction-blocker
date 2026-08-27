@@ -13,7 +13,8 @@
     "nativeMessaging",
     "storage",
     "declarativeNetRequest",
-    "alarms"
+    "alarms",
+    "webRequest"
   ],
   "host_permissions": ["<all_urls>"],
   "action": {

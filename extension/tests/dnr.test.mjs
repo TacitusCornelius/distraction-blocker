@@ -14,7 +14,7 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
 
-const { compile_dnr, rule_to_regexp } = await import(
+const { compile_dnr, compile_inactive_tab_rule, rule_to_regexp } = await import(
   join(root, "core", "dnr.js")
 );
 const conformance = JSON.parse(
@@ -58,4 +58,23 @@ test("dnr rules are deterministic and uniquely numbered", () => {
     assert.equal(entry.rule.action.type, "block");
     assert.ok(entry.rule.condition.regexFilter.length > 0);
   }
+});
+
+test("inactive-tab rule targets only normalized tab ids", () => {
+  const rule = compile_inactive_tab_rule([9, -1, 3, 9, 2.5], 5001);
+  assert.equal(rule.id, 5001);
+  assert.equal(rule.action.type, "block");
+  assert.deepEqual(rule.condition.tabIds, [3, 9]);
+  assert.deepEqual(new Set(rule.condition.resourceTypes), new Set([
+    "main_frame", "sub_frame", "stylesheet", "script", "image", "font",
+    "object", "xmlhttprequest", "ping", "csp_report", "media", "websocket",
+    "webtransport", "webbundle", "other",
+  ]));
+  assert.equal(rule_to_regexp(rule).test("https://example.test/path"), true);
+  assert.equal(rule_to_regexp(rule).test("file:///tmp/example"), false);
+});
+
+test("inactive-tab rule is absent without target tabs", () => {
+  assert.equal(compile_inactive_tab_rule([], 5001), null);
+  assert.equal(compile_inactive_tab_rule(undefined, 5001), null);
 });

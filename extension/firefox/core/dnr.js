@@ -18,22 +18,35 @@
  */
 "use strict";
 
+// Breadcrumb: single source of truth lives in engine.js; both adapters
+// load this file as an ES module next to its vendored engine.js copy,
+// so the relative specifier resolves in every context that runs it.
+
 const YOUTUBE_HOST_PATTERN =
   "(?:www\\.|m\\.|music\\.)?(?:youtube\\.com|youtube-nocookie\\.com)";
 
+// Breadcrumb: DNR omits main_frame from its default resource types. Keep
+// this complete HTTP request set shared by policy and inactive-tab rules.
+const NETWORK_RESOURCE_TYPES = [
+  "main_frame",
+  "sub_frame",
+  "xmlhttprequest",
+  "script",
+  "stylesheet",
+  "image",
+  "media",
+  "font",
+  "object",
+  "ping",
+  "csp_report",
+  "websocket",
+  "webtransport",
+  "webbundle",
+  "other",
+];
+
 function escape_regex(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function split_target(value) {
-  const cut = value.indexOf("/");
-  if (cut < 0) {
-    return null;
-  }
-  return {
-    host: value.slice(0, cut).toLowerCase(),
-    path: value.slice(cut),
-  };
 }
 
 function case_insensitive_host(host) {
@@ -50,7 +63,7 @@ function case_insensitive_host(host) {
 }
 
 /** Build the anchored DNR regexFilter body for one target, or null. */
-export function target_pattern(target) {
+function target_pattern(target) {
   const anchor = "^https?://" ;
   if (target.kind === "url_path" || target.kind === "url_wildcard") {
     const parts = split_target(target.value);
@@ -81,7 +94,10 @@ export function target_pattern(target) {
       ? "@" + escape_regex(target.value.slice(1))
       : "channel/" + escape_regex(target.value);
     return (
-      anchor + "(?:www\\.)?youtube\\.com/" + reference + "(?:$|/)"
+      anchor +
+      // Breadcrumb: same host set as engine.js YOUTUBE_HOSTS.
+      "(?:www\\.|m\\.|music\\.)?youtube(?:-nocookie)?\\.com/" +
+      reference + "(?:$|/)"
     );
   }
   if (target.kind === "url_keyword") {
@@ -103,7 +119,7 @@ function case_sensitive(kind) {
  * Returns [{ rule, rule_id, kind, value }] sorted by rule_id then value,
  * ids assigned 1..N so dynamic-rule replacement is stable across restarts.
  */
-export function compile_dnr(rules) {
+function compile_dnr(rules) {
   const active = (rules ?? []).filter(
     (rule) => rule.enabled && Array.isArray(rule.targets),
   );
@@ -139,27 +155,38 @@ export function compile_dnr(rules) {
       condition: {
         regexFilter: entry.pattern,
         isUrlFilterCaseSensitive: case_sensitive(entry.kind),
-        // Breadcrumb: DNR omits main_frame from its default resource
-        // types, which would let top-level navigations through.
-        resourceTypes: [
-          "main_frame",
-          "sub_frame",
-          "xmlhttprequest",
-          "script",
-          "stylesheet",
-          "image",
-          "media",
-          "font",
-          "websocket",
-          "other",
-        ],
+        resourceTypes: NETWORK_RESOURCE_TYPES,
       },
     },
   }));
 }
 
+/**
+ * Build one session rule that blocks HTTP loads from the selected tabs.
+ * A null result removes the rule when no inactive tabs exist.
+ */
+function compile_inactive_tab_rule(tab_ids, rule_id) {
+  const ids = [...new Set((tab_ids ?? []).filter(
+    (tab_id) => Number.isInteger(tab_id) && tab_id >= 0,
+  ))].sort((left, right) => left - right);
+  if (ids.length === 0) {
+    return null;
+  }
+  return {
+    id: rule_id,
+    priority: 1,
+    action: { type: "block" },
+    condition: {
+      regexFilter: "^https?://",
+      isUrlFilterCaseSensitive: false,
+      resourceTypes: NETWORK_RESOURCE_TYPES,
+      tabIds: ids,
+    },
+  };
+}
+
 /** Build a live RegExp from one compiled rule (for tests and tooling). */
-export function rule_to_regexp(rule) {
+function rule_to_regexp(rule) {
   return new RegExp(
     rule.condition.regexFilter,
     rule.condition.isUrlFilterCaseSensitive ? "" : "i",

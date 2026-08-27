@@ -37,6 +37,7 @@ from distraction_blocker.gui import (
     duplicate_rule,
     filter_rules,
     form_to_request,
+    form_to_rule,
     _target_summary,
     friction_lock_request,
     import_preview_text,
@@ -58,7 +59,7 @@ from distraction_blocker.gui import (
     staged_native_upload_calls,
     utf8_text_chunks,
 )
-from distraction_blocker.model import ManagedList, Rule
+from distraction_blocker.model import POLICY_SCHEMA_VERSION, ManagedList, Rule
 from distraction_blocker.transfer import ImportIssue, ImportPreview
 
 
@@ -75,17 +76,38 @@ def make_rule(
     targets: list[dict[str, str]] | None = None,
     schedule: dict[str, object] | None = None,
     revision: int = 0,
+    allowance_starts: int | None = None,
 ) -> Rule:
-    return Rule.from_dict(
-        {
-            "id": rule_id,
-            "name": name,
-            "enabled": enabled,
-            "targets": targets or [{"kind": "website", "value": "example.com"}],
-            "schedule": schedule or {"kind": "indefinite"},
-            "revision": revision,
-        }
-    )
+    data = {
+        "id": rule_id,
+        "name": name,
+        "enabled": enabled,
+        "targets": targets
+        or (
+            [{"kind": "url_path", "value": "example.com/feed"}]
+            if allowance_starts is not None
+            else [{"kind": "website", "value": "example.com"}]
+        ),
+        "schedule": schedule or {"kind": "indefinite"},
+        "revision": revision,
+    }
+    if allowance_starts is not None:
+        data["allowance_starts"] = allowance_starts
+    return Rule.from_dict(data)
+
+def policy_result(
+    rules: tuple[dict[str, object], ...] = (),
+    *,
+    revision: int = 0,
+) -> dict[str, object]:
+    return {
+        "schema_version": POLICY_SCHEMA_VERSION,
+        "revision": revision,
+        "rules": [
+            {**rule, "budget_exhausted": rule.get("budget_exhausted", False)}
+            for rule in rules
+        ],
+    }
 
 
 class GtkLoadingTests(unittest.TestCase):
@@ -369,6 +391,10 @@ class StoredRuleEditorTests(unittest.TestCase):
             def set_visible_child_name(self, value):
                 self.value = value
 
+        class ValueField:
+            def set_value(self, value):
+                self.value = value
+
         editor = RuleEditor.__new__(RuleEditor)
         editor.name_entry = TextField()
         editor.website_view = TextView()
@@ -379,6 +405,7 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor.managed_list_checks = {}
         editor.schedule_dropdown = Dropdown()
         editor.schedule_stack = Stack()
+        editor.allowance_spin = ValueField()
         editor.one_start = Picker()
         editor.one_end = Picker()
         editor.weekly_rows = []
@@ -437,6 +464,7 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor.managed_list_checks = {}
         editor.schedule_dropdown = Dropdown()
         editor.schedule_stack = Stack()
+        editor.allowance_spin = ValueField()
         editor.pomodoro_start = TextField()
         editor.pomodoro_work = ValueField()
         editor.pomodoro_break = ValueField()
@@ -1020,7 +1048,7 @@ class ServiceResultTests(unittest.TestCase):
                 "clock_reason": "",
                 "active_counts": {"website": 0, "application": 0},
             },
-            (make_rule().to_dict(),),
+            policy_result((make_rule().to_dict(),)),
             (),
             (
                 {
@@ -1045,7 +1073,7 @@ class ServiceResultTests(unittest.TestCase):
                 "clock_reason": "",
                 "active_counts": {"website": 203, "application": 2},
             },
-            (rule.to_dict(),),
+            policy_result((rule.to_dict(),), revision=3),
             (),
             (),
         )
@@ -1060,10 +1088,22 @@ class ServiceResultTests(unittest.TestCase):
                     "clock_reason": "",
                     "active_counts": {"website": [], "application": 0},
                 },
-                (),
+                policy_result(),
                 (),
                 (),
             )
+
+    def test_snapshot_rejects_unknown_policy_schema(self) -> None:
+        status = {
+            "healthy": True,
+            "clock_trusted": True,
+            "clock_reason": "",
+            "active_counts": {"website": 0, "application": 0},
+        }
+        unsupported = policy_result()
+        unsupported["schema_version"] = POLICY_SCHEMA_VERSION + 1
+        with self.assertRaisesRegex(FormError, "policy values"):
+            snapshot_from_results(status, unsupported, (), ())
 
 
 class DenialStatisticsTests(unittest.TestCase):
@@ -1205,6 +1245,80 @@ class ExistingWorkflowTests(unittest.TestCase):
         text = import_preview_text(preview)
         self.assertIn("Accepted domains: 1", text)
         self.assertIn("Line 9", text)
+
+
+
+
+class WebsiteUsageViewTests(unittest.TestCase):
+    # Breadcrumb: v1 surfaces allowances as a small pane over the additive
+    # list_website_stats projection; the parser pins that wire shape.
+
+    def _result(self, **overrides):
+        row = {
+            "rule_id": RULE_ID,
+            "day": "2026-01-01",
+            "count": 2,
+            "allowance_starts": 5,
+            "budget_exhausted": False,
+        }
+        row.update(overrides)
+        return {"items": [], "dropped": 0, "usage": [row]}
+
+    def test_parses_usage_rows(self):
+        from distraction_blocker.gui import website_usage_from_result
+        parsed = website_usage_from_result(self._result())
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].rule_id, RULE_ID)
+        self.assertEqual(parsed[0].count, 2)
+        self.assertEqual(parsed[0].allowance_starts, 5)
+        self.assertFalse(parsed[0].budget_exhausted)
+
+    def test_rejects_unknown_fields_and_bad_values(self):
+        from distraction_blocker.gui import website_usage_from_result
+        with self.assertRaises(FormError):
+            website_usage_from_result({"items": [], "dropped": 0})
+        bad = self._result(count=True)
+        with self.assertRaises(FormError):
+            website_usage_from_result(bad)
+
+    def test_form_round_trips_allowance(self):
+        rule = make_rule(allowance_starts=4)
+        form = rule_to_form(rule, "UTC")
+        self.assertEqual(form.allowance_starts, 4)
+        rebuilt = form_to_rule(form, existing=rule)
+        self.assertEqual(rebuilt.to_dict()["allowance_starts"], 4)
+        no_budget = rule_to_form(make_rule(), "UTC")
+        self.assertIsNone(no_budget.allowance_starts)
+        self.assertNotIn(
+            "allowance_starts", form_to_rule(no_budget).to_dict()
+        )
+
+    def test_form_rejects_allowance_for_non_url_targets(self):
+        form = RuleForm(
+            name="Budgeted",
+            websites=("example.com",),
+            applications=(),
+            managed_list_ids=(),
+            schedule_kind="indefinite",
+            timezone="UTC",
+            allowance_starts=2,
+        )
+        with self.assertRaisesRegex(FormError, "URL-level"):
+            form_to_rule(form)
+
+    def test_snapshot_collects_exhausted_rule_ids(self):
+        status = {
+            "healthy": True,
+            "clock_trusted": True,
+            "clock_reason": "",
+            "active_counts": {"website": 0, "application": 0},
+        }
+        item = make_rule().to_dict()
+        item["budget_exhausted"] = True
+        snapshot = snapshot_from_results(
+            status, policy_result((item,)), [], []
+        )
+        self.assertEqual(snapshot.exhausted_rule_ids, {RULE_ID})
 
 
 if __name__ == "__main__":

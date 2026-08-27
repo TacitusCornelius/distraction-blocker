@@ -12,6 +12,50 @@ import subprocess
 import sys
 from typing import NoReturn
 
+HOST_MANIFEST_FILENAME = "org.distraction_blocker.extension.json"
+LEGACY_FIREFOX_MANIFEST_FILENAME = "org.distraction_blocker.firefox.json"
+LEGACY_CHROMIUM_MANIFEST_FILENAME = "org.distraction_blocker.chromium.json"
+FIREFOX_NATIVE_MANIFEST_DIRECTORIES = (
+    "/usr/lib/mozilla/native-messaging-hosts",
+    "/usr/lib/librewolf/native-messaging-hosts",
+)
+CHROMIUM_NATIVE_MANIFEST_DIRECTORIES = (
+    "/etc/chromium/native-messaging-hosts",
+    "/etc/opt/chrome/native-messaging-hosts",
+)
+NATIVE_MANIFESTS = tuple(
+    Path(directory) / HOST_MANIFEST_FILENAME
+    for directory in (
+        *FIREFOX_NATIVE_MANIFEST_DIRECTORIES,
+        *CHROMIUM_NATIVE_MANIFEST_DIRECTORIES,
+    )
+)
+LEGACY_NATIVE_MANIFESTS = (
+    *(
+        Path(directory) / LEGACY_FIREFOX_MANIFEST_FILENAME
+        for directory in FIREFOX_NATIVE_MANIFEST_DIRECTORIES
+    ),
+    *(
+        Path(directory) / LEGACY_CHROMIUM_MANIFEST_FILENAME
+        for directory in CHROMIUM_NATIVE_MANIFEST_DIRECTORIES
+    ),
+)
+OWNER_NATIVE_MANIFESTS = (
+    (".mozilla/native-messaging-hosts", HOST_MANIFEST_FILENAME),
+    (".mozilla/native-messaging-hosts", LEGACY_FIREFOX_MANIFEST_FILENAME),
+    (".librewolf/native-messaging-hosts", HOST_MANIFEST_FILENAME),
+    (".librewolf/native-messaging-hosts", LEGACY_FIREFOX_MANIFEST_FILENAME),
+    (".config/chromium/NativeMessagingHosts", HOST_MANIFEST_FILENAME),
+    (
+        ".config/chromium/NativeMessagingHosts",
+        LEGACY_CHROMIUM_MANIFEST_FILENAME,
+    ),
+    (".config/google-chrome/NativeMessagingHosts", HOST_MANIFEST_FILENAME),
+    (
+        ".config/google-chrome/NativeMessagingHosts",
+        LEGACY_CHROMIUM_MANIFEST_FILENAME,
+    ),
+)
 PREFIX = Path("/usr/lib/distraction-blocker")
 STATE = Path("/var/lib/distraction-blocker")
 RUN = Path("/run/distraction-blocker")
@@ -19,20 +63,17 @@ UNIT = Path("/etc/systemd/system/distraction-blocker.service")
 DESKTOP = Path("/usr/share/applications/org.distraction_blocker.App.desktop")
 LEGACY_DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
 CLI_PATH = Path("/usr/local/bin/distraction-blocker")
-NATIVE_MANIFESTS = tuple(
-    Path(directory) / manifest_name
-    for directory in (
-        "/usr/lib/mozilla/native-messaging-hosts",
-        "/usr/lib/librewolf/native-messaging-hosts",
-        "/etc/chromium/native-messaging-hosts",
-        "/etc/opt/chrome/native-messaging-hosts",
-    )
-    for manifest_name in (
-        "org.distraction_blocker.firefox.json",
-        "org.distraction_blocker.chromium.json",
-    )
+# Breadcrumb: every signed observational file belongs here. A leftover file
+# would keep the state directory alive after uninstall because rmdir only
+# removes an empty directory.
+POLICY_FILES = (
+    "hmac.key",
+    "policy.json",
+    "policy.json.bak",
+    "statistics.json",
+    "website-statistics.json",
+    "website-usage.json",
 )
-POLICY_FILES = ("hmac.key", "policy.json", "policy.json.bak", "statistics.json")
 MARKER_NAME = "INSTALLATION"
 MARKER_TEXT = "distraction-blocker\n"
 CLI_MARKER = "# distraction-blocker-owned-wrapper-v1"
@@ -84,14 +125,14 @@ def remove_cli() -> None:
 
 
 def remove_native_manifests() -> None:
-    for path in NATIVE_MANIFESTS:
+    for path in (*NATIVE_MANIFESTS, *LEGACY_NATIVE_MANIFESTS):
         if path.is_symlink():
             fail(f"refusing to remove a symlink at {path}")
         if path.is_file():
             path.unlink()
     # Breadcrumb: the installer also placed per-owner copies under the
-    # desktop user's home; remove those for the recorded owner UID.
-    owner_file = Path("/var/lib/distraction-blocker/owner.uid")
+    # desktop user's home; remove current and legacy names.
+    owner_file = STATE / "owner.uid"
     homes = []
     if owner_file.is_file():
         try:
@@ -100,8 +141,8 @@ def remove_native_manifests() -> None:
         except (OSError, ValueError, KeyError):
             pass
     for home in homes:
-        for subdir in (".mozilla", ".librewolf", ".config/chromium/NativeMessagingHosts", ".config/google-chrome/NativeMessagingHosts"):
-            path = home / subdir / "native-messaging-hosts" / "org.distraction_blocker.firefox.json"
+        for subdir, manifest_name in OWNER_NATIVE_MANIFESTS:
+            path = home / subdir / manifest_name
             if path.is_symlink():
                 fail(f"refusing to remove a symlink at {path}")
             if path.is_file():
@@ -142,7 +183,6 @@ def main() -> int:
             if path.is_file():
                 path.unlink()
         run_systemctl(["daemon-reload"])
-        remove_cli()
         remove_native_manifests()
         if PREFIX.is_symlink():
             fail("refusing to remove a symlink at the install path")

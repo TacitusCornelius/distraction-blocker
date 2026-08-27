@@ -34,8 +34,8 @@ POMODORO_RULE = "44444444-4444-4444-8444-444444444444"
 CLI_PATH = Path("/usr/local/bin/distraction-blocker")
 HOST_PATH = Path("/usr/lib/distraction-blocker/host_entry.py")
 NATIVE_MANIFESTS = (
-    Path("/usr/lib/mozilla/native-messaging-hosts/org.distraction_blocker.firefox.json"),
-    Path("/usr/lib/librewolf/native-messaging-hosts/org.distraction_blocker.firefox.json"),
+    Path("/usr/lib/mozilla/native-messaging-hosts/org.distraction_blocker.extension.json"),
+    Path("/usr/lib/librewolf/native-messaging-hosts/org.distraction_blocker.extension.json"),
 )
 MARKER_PURPOSE = "distraction-blocker-acceptance"
 
@@ -256,8 +256,16 @@ def add_v13_state(owner_uid: int) -> None:
     # a root client is refused authorization by design. Exercise the
     # begin/complete flow as the desktop user, exactly like the GUI does.
     account = pwd.getpwuid(owner_uid)
+    # Breadcrumb: the deliberate wrong-password attempt below bumps the
+    # persisted failure counter and sets a short retry_after (control.py
+    # with_password_failure), so an unclean rerun would hit rate_limited. The
+    # same probe therefore finishes with one successful authorization, which
+    # the service turns into with_password_success() and resets both fields.
+    # The success needs a 3-second pause first because one failure already
+    # starts a 2-second retry delay that the service enforces before verify.
     probe = "\n".join((
         "import sys",
+        "import time",
         "sys.path.insert(0, '/usr/lib/distraction-blocker')",
         "from distraction_blocker.rpc import Client, RpcError",
         f"client = Client('{SOCKET}')",
@@ -275,6 +283,14 @@ def add_v13_state(owner_uid: int) -> None:
         "        raise SystemExit(error.code)",
         "else:",
         "    raise SystemExit('the wrong password was accepted')",
+        "time.sleep(3)",
+        "challenge = client.request('begin_rule_authorization', rule_id=rule_id)",
+        "client.request(",
+        "    'complete_rule_authorization',",
+        "    rule_id=rule_id,",
+        "    challenge_id=challenge['challenge_id'],",
+        "    response='acceptance secret',",
+        ")",
     ))
     command([
         "/usr/sbin/runuser",
@@ -348,6 +364,16 @@ def check_extension_policy_link(owner_uid: int) -> None:
             raise AcceptanceError("a native manifest has unexpected content")
 
     client = installed_client()
+    existing_stats = client.request("list_website_stats")
+    existing_row = next(
+        (
+            row
+            for row in existing_stats.get("items", [])
+            if row.get("value") == "ext.invalid/feed"
+        ),
+        None,
+    )
+    expected_count = (existing_row or {}).get("count", 0) + 2
     client.request(
         "put_rule",
         rule={
@@ -378,6 +404,7 @@ def check_extension_policy_link(owner_uid: int) -> None:
         # Breadcrumb: feed every frame first, then read; the host answers
         # strictly in order.
         process.stdin.write(_framed({"command": "status"}))
+        process.stdin.write(_framed({"command": "list_rules"}))
         process.stdin.write(
             _framed({
                 "command": "delete_rule",
@@ -400,6 +427,19 @@ def check_extension_policy_link(owner_uid: int) -> None:
         status = _read_framed(process.stdout)
         if not status.get("ok") or not status["result"].get("healthy"):
             raise AcceptanceError("the extension host cannot see a healthy service")
+        policy = _read_framed(process.stdout)
+        try:
+            from distraction_blocker.model import PolicyProjection, ValidationError
+
+            projection = PolicyProjection.from_dict(policy["result"])
+        except (KeyError, TypeError, ValidationError) as error:
+            raise AcceptanceError(
+                "the extension host returned an invalid policy"
+            ) from error
+        if not policy.get("ok") or not any(
+            rule["id"] == EXT_RULE for rule in projection.to_dict()["rules"]
+        ):
+            raise AcceptanceError("the extension host returned an invalid policy")
         forbidden = _read_framed(process.stdout)
         if forbidden.get("ok") is not False or forbidden["error"]["code"] != "forbidden":
             raise AcceptanceError("the native host allowed a policy change")
@@ -409,20 +449,47 @@ def check_extension_policy_link(owner_uid: int) -> None:
         listed = _read_framed(process.stdout)
         rows = {row["value"]: row for row in listed["result"]["items"]}
         row = rows.get("ext.invalid/feed")
-        if row is None or row["count"] != 2:
+        if row is None or row["count"] != expected_count:
             raise AcceptanceError("website denial statistics were not recorded")
     finally:
         process.kill()
         process.wait()
-    stored = json.loads(
-        Path("/var/lib/distraction-blocker/website-statistics.json").read_text(
-            encoding="utf-8"
+    # Breadcrumb: storage.py wraps website statistics in a signed
+    # {"version": 1, "payload": {"items": [...], "dropped": N}} envelope;
+    # assert the denial reported above actually reached the signed file.
+    try:
+        envelope = json.loads(
+            Path("/var/lib/distraction-blocker/website-statistics.json").read_text(
+                encoding="utf-8"
+            )
         )
+    except (OSError, ValueError) as error:
+        raise AcceptanceError(
+            "website-statistics.json is missing or not valid JSON."
+        ) from error
+    payload = envelope.get("payload") if isinstance(envelope, dict) else None
+    items = payload.get("items") if isinstance(payload, dict) else None
+    rows = (
+        {row["value"]: row for row in items if isinstance(row, dict)}
+        if isinstance(items, list)
+        else {}
     )
+    row = rows.get("ext.invalid/feed")
+    if (
+        envelope.get("version") != 1
+        or row is None
+        or row.get("count") != expected_count
+        or row.get("rule_ids") != [EXT_RULE]
+    ):
+        raise AcceptanceError(
+            "website-statistics.json did not persist the denial report."
+        )
 
 
 def check_v13_state(owner_uid: int) -> None:
     client = installed_client()
+    from distraction_blocker.model import PolicyProjection, ValidationError
+
     locks = client.request("list_locks")
     kinds = {item["rule_id"]: item["kind"] for item in locks}
     expected = {
@@ -432,7 +499,11 @@ def check_v13_state(owner_uid: int) -> None:
     }
     if any(kinds.get(rule_id) != kind for rule_id, kind in expected.items()):
         raise AcceptanceError("Version 1.3 locks did not persist.")
-    rules = {item["id"]: item for item in client.request("list_rules")}
+    try:
+        projection = PolicyProjection.from_dict(client.request("list_rules"))
+    except (TypeError, ValidationError) as error:
+        raise AcceptanceError("The service returned invalid policy data.") from error
+    rules = {item["id"]: item for item in projection.to_dict()["rules"]}
     schedule = rules.get(POMODORO_RULE, {}).get("schedule")
     if not isinstance(schedule, dict) or schedule.get("kind") != "pomodoro":
         raise AcceptanceError("The Pomodoro schedule did not persist.")

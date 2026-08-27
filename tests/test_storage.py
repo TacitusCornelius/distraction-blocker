@@ -7,8 +7,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from distraction_blocker.control import ControlState, RuleLock
-from distraction_blocker.model import Policy
-from distraction_blocker.statistics import StatisticsState, WebsiteDenialState
+from distraction_blocker.model import POLICY_SCHEMA_VERSION, Policy
+from distraction_blocker.statistics import (
+    StatisticsState,
+    WebsiteDenialState,
+    WebsiteUsageState,
+)
 from distraction_blocker.storage import ProtectedStore, StorageError
 
 
@@ -24,7 +28,11 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(loaded.controls, controls)
             self.assertEqual(Path(directory, "policy.json").stat().st_mode & 0o777, 0o600)
             envelope = json.loads(Path(directory, "policy.json").read_text())
-            self.assertEqual(envelope["version"], 3)
+            self.assertEqual(envelope["version"], 4)
+            self.assertEqual(
+                envelope["payload"]["policy"]["schema_version"],
+                POLICY_SCHEMA_VERSION,
+            )
             self.assertNotIn("controls", envelope["payload"]["policy"])
 
     def test_bad_primary_recovers_backup(self):
@@ -62,9 +70,9 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(result.controls, ControlState.empty())
             self.assertEqual(result.policy.to_dict()["managed_lists"], [])
             self.assertEqual(result.policy.rules[0].to_dict()["schedule"]["periods"], [{"weekdays": [0, 2], "start": "09:00:00", "end": "17:00:00"}])
-            self.assertEqual(json.loads(Path(directory, "policy.json").read_text())["version"], 3)
+            self.assertEqual(json.loads(Path(directory, "policy.json").read_text())["version"], 4)
 
-    def test_signed_v2_adds_empty_controls_and_migrates_to_v3(self):
+    def test_signed_v2_adds_empty_controls_and_migrates_to_v4(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ProtectedStore(directory, key_source=b"k" * 32)
             store.initialize()
@@ -75,7 +83,39 @@ class StorageTests(unittest.TestCase):
             result = store.load()
             self.assertEqual(result.controls, ControlState.empty())
             self.assertTrue(result.clock_untrusted)
-            self.assertEqual(json.loads(Path(directory, "policy.json").read_text())["version"], 3)
+            self.assertEqual(json.loads(Path(directory, "policy.json").read_text())["version"], 4)
+
+    def test_signed_v3_adds_policy_schema_and_migrates_to_v4(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            store.initialize()
+            old_policy = Policy(4, ()).to_dict()
+            old_policy.pop("schema_version")
+            payload = {
+                "clock_untrusted": False,
+                "high_water_utc": None,
+                "policy": old_policy,
+                "controls": ControlState.empty().to_dict(),
+            }
+            unsigned = {"version": 3, "payload": payload}
+            envelope = {
+                **unsigned,
+                "hmac": hmac.new(
+                    b"k" * 32,
+                    store._canonical(unsigned),
+                    hashlib.sha256,
+                ).hexdigest(),
+            }
+            Path(directory, "policy.json").write_bytes(store._canonical(envelope))
+            result = store.load()
+            self.assertEqual(result.policy.schema_version, POLICY_SCHEMA_VERSION)
+            rewritten = json.loads(Path(directory, "policy.json").read_text())
+            self.assertEqual(rewritten["version"], 4)
+            self.assertEqual(
+                rewritten["payload"]["policy"]["schema_version"],
+                POLICY_SCHEMA_VERSION,
+            )
+
 
     def test_invalid_v2_hmac_never_migrates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -155,6 +195,60 @@ class StorageTests(unittest.TestCase):
             path.write_bytes(store._canonical(envelope))
             with self.assertRaises(StorageError):
                 store.load_statistics()
+
+    def test_pre_unification_envelope_still_loads(self):
+        # Breadcrumb: this blob was produced by the pre-unification code,
+        # before the three signed states shared _BoundedState. It pins the
+        # exact wire bytes so the refactor stays byte-compatible on disk.
+        blob = (
+            '{"hmac":"47fd72adf23fc82496a404a8ff354501ad06d376bd57292521d38d784ed5a413",'
+            '"payload":{"dropped":7,"items":['
+            '{"count":1,"first_utc":"2026-02-03T00:00:00.000000Z","last_utc":"2026-02-03T00:00:00.000000Z","path":"/opt/Other App","rule_ids":[]},'
+            '{"count":3,"first_utc":"2026-01-01T10:00:00.000000Z","last_utc":"2026-01-02T11:30:00.000000Z","path":"/usr/bin/game.exe","rule_ids":["12345678-1234-5678-9234-567812345678","12345678-1234-5678-9234-56781234567a"]}]}'
+            ',"version":1}'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            Path(directory, "statistics.json").write_text(blob)
+            state = store.load_statistics()
+            self.assertEqual(state.dropped, 7)
+            self.assertEqual(
+                [row.path for row in state.items],
+                ["/opt/Other App", "/usr/bin/game.exe"],
+            )
+            store.save_statistics(state)
+            self.assertEqual(
+                Path(directory, "statistics.json").read_text(), blob
+            )
+
+
+
+class WebsiteUsageStorageTests(unittest.TestCase):
+    # Breadcrumb: website-usage.json is the third signed bounded state file
+    # and must behave exactly like its siblings.
+
+    def test_website_usage_round_trip_and_bad_signature_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            state = WebsiteUsageState.empty().record(
+                "11111111-1111-4111-8111-111111111111", 4, "2026-01-01"
+            )
+            store.save_website_usage(state)
+            self.assertEqual(store.load_website_usage(), state)
+            path = Path(directory, "website-usage.json")
+            envelope = json.loads(path.read_text())
+            self.assertEqual(envelope["version"], 1)
+            envelope["hmac"] = "0" * 64
+            path.write_bytes(store._canonical(envelope))
+            with self.assertRaises(StorageError):
+                store.load_website_usage()
+
+    def test_missing_website_usage_is_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            self.assertEqual(
+                store.load_website_usage(), WebsiteUsageState.empty()
+            )
 
 
 if __name__ == "__main__":

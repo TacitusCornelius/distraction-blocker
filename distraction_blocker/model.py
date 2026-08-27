@@ -6,7 +6,6 @@ from datetime import datetime, time, timedelta, timezone
 import ipaddress
 import os
 import re
-import uuid
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -21,6 +20,17 @@ class ValidationError(ValueError):
         self.code = code
         self.message = message
         super().__init__(f"{code}: {message}")
+
+
+# Breadcrumb: the schedule bounds live here because model, schedule_view,
+# and the GUI form all validate against them. schedule_view already imports
+# this module, so this direction stays free of circular imports.
+MAX_WEEKLY_PERIODS = 16
+MAX_POMODORO_CYCLES = 20
+# Breadcrumb: browser counters use exact JavaScript integers. A larger
+# allowance can never be reached by the extension.
+MAX_ALLOWANCE_STARTS = 2**53 - 1
+POLICY_SCHEMA_VERSION = 1
 
 
 def _error(code: str, message: str) -> None:
@@ -96,14 +106,18 @@ def _hostname(value: Any, label: str = "website value") -> str:
 
 
 def _uuid(value: Any, label: str) -> str:
+    # Breadcrumb for reviewers: rule and list IDs are service-generated
+    # (uuid4 in service.py and gui.py); no CLI or GUI flow feeds user-typed ID
+    # text into this model, so unlike cli._rule_id there is nothing to
+    # normalize and we demand the same strict canonical form as control.py
+    # and statistics.py via canonical.canonical_uuid.
     text = _string(value, label)
     try:
-        parsed = uuid.UUID(text)
-    except ValueError:
-        _error("bad_value", f"{label} must be a UUID")
-    if str(parsed) != text.lower():
+        return canonical.canonical_uuid(text)
+    except CanonicalError as error:
+        if error.reason == canonical.REASON_UUID:
+            _error("bad_value", f"{label} must be a UUID")
         _error("bad_value", f"{label} must be a canonical UUID")
-    return text.lower()
 
 
 def _url_target_value(value: Any, label: str, *, wildcard: bool) -> str:
@@ -167,6 +181,17 @@ def _youtube_channel(value: Any, label: str) -> str:
 class Target:
     kind: str
     value: str
+
+    # Breadcrumb: single source of truth for "URL-like" target kinds. The
+    # GUI groups these kinds together; membership here must stay in sync
+    # with the from_dict cascade below.
+    URL_LIKE_KINDS = frozenset({
+        "url_path",
+        "url_wildcard",
+        "url_keyword",
+        "youtube_video",
+        "youtube_channel",
+    })
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Target":
@@ -294,9 +319,8 @@ class Schedule:
             if not isinstance(raw_periods, list) or not raw_periods:
                 _error("bad_type" if not isinstance(raw_periods, list) else "bad_value", "periods must be a non-empty list")
             periods = tuple(WeeklyPeriod.from_dict(item) for item in raw_periods)
-            if len(periods) > 16 or len(set(periods)) != len(periods):
+            if len(periods) > MAX_WEEKLY_PERIODS or len(set(periods)) != len(periods):
                 _error("bad_value", "weekly schedule periods are not valid")
-            periods = tuple(sorted(periods, key=lambda period: (period.weekdays, period.start_local, period.end_local)))
             return cls(kind, timezone_name=zone, periods=periods)
         if kind == "indefinite":
             if set(obj) != {"kind"}:
@@ -385,10 +409,13 @@ class Rule:
     targets: tuple[Target, ...]
     schedule: Schedule
     revision: int
+    # Breadcrumb: the optional daily budget remains part of policy schema 1.
+    # Future incompatible shapes must increment POLICY_SCHEMA_VERSION.
+    allowance_starts: int | None = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Rule":
-        obj = _object(data, {"id", "name", "enabled", "targets", "schedule", "revision"}, "rule")
+        obj = _object(data, {"id", "name", "enabled", "targets", "schedule", "revision", "allowance_starts"}, "rule")
         ident = _uuid(obj.get("id"), "rule id")
         name = _string(obj.get("name"), "rule name", maximum=256)
         if not isinstance(obj.get("enabled"), bool):
@@ -401,10 +428,34 @@ class Rule:
             _error("bad_value", "targets must be unique")
         schedule = Schedule.from_dict(obj.get("schedule"))
         revision = _integer(obj.get("revision"), "revision", minimum=0)
-        return cls(ident, name, obj["enabled"], targets, schedule, revision)
+        # Breadcrumb: _integer rejects bools, so true/false can never pose
+        # as an allowance; absence keeps the field optional.
+        # Breadcrumb: only URL-level targets have main-frame start events that
+        # the extension can count. Rules without a budget keep all target kinds.
+        allowance = (
+            _integer(
+                obj["allowance_starts"],
+                "allowance_starts",
+                minimum=1,
+                maximum=MAX_ALLOWANCE_STARTS,
+            )
+            if "allowance_starts" in obj
+            else None
+        )
+        if allowance is not None and any(
+            target.kind not in Target.URL_LIKE_KINDS for target in targets
+        ):
+            _error(
+                "bad_value",
+                "allowance_starts requires URL-level targets",
+            )
+        return cls(ident, name, obj["enabled"], targets, schedule, revision, allowance)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"id": self.id, "name": self.name, "enabled": self.enabled, "targets": [target.to_dict() for target in self.targets], "schedule": self.schedule.to_dict(), "revision": self.revision}
+        data = {"id": self.id, "name": self.name, "enabled": self.enabled, "targets": [target.to_dict() for target in self.targets], "schedule": self.schedule.to_dict(), "revision": self.revision}
+        if self.allowance_starts is not None:
+            data["allowance_starts"] = self.allowance_starts
+        return data
 
     def is_active(self, now_utc: datetime, clock_trusted: bool = True) -> bool:
         if not self.enabled:
@@ -450,12 +501,28 @@ class Policy:
     revision: int
     rules: tuple[Rule, ...]
     managed_lists: tuple[ManagedList, ...] = ()
+    schema_version: int = POLICY_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        # Breadcrumb: direct dataclass construction is common inside the
+        # service. It must not create a policy that cannot load again.
+        schema_version = _integer(
+            self.schema_version, "policy schema version", minimum=1
+        )
+        if schema_version != POLICY_SCHEMA_VERSION:
+            _error("bad_value", "policy schema version is not supported")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Policy":
-        obj = _object(data, {"revision", "rules", "managed_lists"}, "policy")
-        if set(obj) != {"revision", "rules", "managed_lists"}:
+        fields = {"schema_version", "revision", "rules", "managed_lists"}
+        obj = _object(data, fields, "policy")
+        if set(obj) != fields:
             _error("bad_value", "policy fields are incomplete")
+        schema_version = _integer(
+            obj.get("schema_version"), "policy schema version", minimum=1
+        )
+        if schema_version != POLICY_SCHEMA_VERSION:
+            _error("bad_value", "policy schema version is not supported")
         revision = _integer(obj.get("revision"), "policy revision", minimum=0)
         raw_rules = obj.get("rules")
         if not isinstance(raw_rules, list):
@@ -479,7 +546,102 @@ class Policy:
             for target in rule.targets:
                 if target.kind == "managed_list" and target.value not in list_ids:
                     _error("bad_value", "rule refers to an unknown managed list")
-        return cls(revision, rules, managed_lists)
+        return cls(revision, rules, managed_lists, schema_version)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"revision": self.revision, "rules": [rule.to_dict() for rule in self.rules], "managed_lists": [item.to_dict() for item in self.managed_lists]}
+        return {
+            "schema_version": self.schema_version,
+            "revision": self.revision,
+            "rules": [rule.to_dict() for rule in self.rules],
+            "managed_lists": [item.to_dict() for item in self.managed_lists],
+        }
+
+
+@dataclass(frozen=True)
+class PolicyProjection:
+    """Strict list-rules projection shared by service, CLI, and GUI."""
+
+    schema_version: int
+    revision: int
+    rules: tuple[dict[str, Any], ...]
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PolicyProjection":
+        # Breadcrumb: this is the only parser for the public list-rules shape.
+        # Every caller must validate before it reads or displays rule fields.
+        if not isinstance(data, Mapping):
+            _error("bad_type", "policy projection must be an object")
+        fields = {"schema_version", "revision", "rules"}
+        if set(data) != fields:
+            _error("bad_value", "policy projection fields are invalid")
+        schema_version = _integer(
+            data["schema_version"], "policy projection schema version", minimum=1
+        )
+        if schema_version != POLICY_SCHEMA_VERSION:
+            _error("bad_value", "policy projection schema version is not supported")
+        revision = _integer(
+            data["revision"], "policy projection revision", minimum=0
+        )
+        raw_rules = data["rules"]
+        if not isinstance(raw_rules, list):
+            _error("bad_type", "policy projection rules must be a list")
+        required = {
+            "id",
+            "name",
+            "enabled",
+            "targets",
+            "schedule",
+            "revision",
+            "budget_exhausted",
+        }
+        allowed = required | {"allowance_starts"}
+        normalized: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for raw_rule in raw_rules:
+            if not isinstance(raw_rule, Mapping):
+                _error("bad_type", "policy projection rule must be an object")
+            if not required <= set(raw_rule) or set(raw_rule) - allowed:
+                _error("bad_value", "policy projection rule fields are invalid")
+            if not isinstance(raw_rule["budget_exhausted"], bool):
+                _error("bad_type", "budget_exhausted must be a boolean")
+            rule_data = {
+                key: value
+                for key, value in raw_rule.items()
+                if key != "budget_exhausted"
+            }
+            rule = Rule.from_dict(rule_data)
+            if rule.id in seen_ids:
+                _error("bad_value", "policy projection rule ids must be unique")
+            seen_ids.add(rule.id)
+            normalized.append({
+                **rule.to_dict(),
+                "budget_exhausted": raw_rule["budget_exhausted"],
+            })
+        return cls(schema_version, revision, tuple(normalized))
+
+    @classmethod
+    def from_policy(
+        cls,
+        policy: "Policy",
+        exhausted_rule_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> "PolicyProjection":
+        if not isinstance(policy, Policy):
+            _error("bad_type", "policy projection source is invalid")
+        return cls.from_dict({
+            "schema_version": policy.schema_version,
+            "revision": policy.revision,
+            "rules": [
+                {
+                    **rule.to_dict(),
+                    "budget_exhausted": rule.id in exhausted_rule_ids,
+                }
+                for rule in policy.rules
+            ],
+        })
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "revision": self.revision,
+            "rules": [dict(rule) for rule in self.rules],
+        }

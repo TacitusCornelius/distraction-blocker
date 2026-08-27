@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 from pathlib import Path
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -19,7 +20,17 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .categories import starter_categories
-from .model import ManagedList, Policy, Rule, Schedule, Target, ValidationError
+from .model import (
+    MAX_POMODORO_CYCLES,
+    MAX_WEEKLY_PERIODS,
+    ManagedList,
+    Policy,
+    PolicyProjection,
+    Rule,
+    Schedule,
+    Target,
+    ValidationError,
+)
 from .canonical import CanonicalError, canonical_uuid, parse_utc
 from .schedule_view import (
     MAX_DAILY_TRANSITIONS,
@@ -73,8 +84,6 @@ THEME_LABELS = ("System", "Light", "Dark")
 RULE_FILTER_LABELS = ("All", "Active", "Inactive", "Enabled", "Disabled")
 RULE_FILTERS = ("all", "active", "inactive", "enabled", "disabled")
 FOCUS_DURATIONS = (15, 30, 60, 120)
-MAX_WEEKLY_PERIODS = 16
-MAX_POMODORO_CYCLES = 20
 RPC_LIST_CHUNK_SIZE = 200
 # Breadcrumb for reviewers: JSON ASCII escaping can triple the UTF-8 size.
 # This bound keeps the full request below the fixed 65,536-byte RPC frame.
@@ -164,6 +173,17 @@ class DenialStatDisplay:
 
 
 @dataclass(frozen=True)
+class WebsiteUsageView:
+    """One bounded per-rule daily start-allowance row."""
+
+    rule_id: str
+    day: str
+    count: int
+    allowance_starts: int | None
+    budget_exhausted: bool
+
+
+@dataclass(frozen=True)
 class AuthorizationChallenge:
     """One short-lived rule authorization challenge."""
 
@@ -218,6 +238,9 @@ class RuleForm:
     # Breadcrumb: the editor has no URL fields yet, so these carried values
     # keep an edit from silently dropping extension-enforced targets.
     url_targets: tuple[dict[str, str], ...] = ()
+    # Breadcrumb: optional daily start budget; None means "no limit" and
+    # round-trips through put_rule exactly like the other rule fields.
+    allowance_starts: int | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +253,9 @@ class ServiceSnapshot:
     rules: tuple[Rule, ...]
     managed_lists: tuple[ManagedListSummary, ...]
     locks: tuple[LockSummary, ...]
+    # Breadcrumb (allowance seam): ids of enabled rules whose daily start
+    # budget is used up, mirrored from the list_rules projection.
+    exhausted_rule_ids: frozenset[str] = frozenset()
 
 def load_gtk(
     importer: Callable[[str], ModuleType] = importlib.import_module,
@@ -446,16 +472,29 @@ def form_to_rule(
         rule_id = current["id"]
         enabled = current["enabled"]
         revision = current["revision"]
-    return Rule.from_dict(
-        {
-            "id": rule_id,
-            "name": name,
-            "enabled": enabled,
-            "targets": [target.to_dict() for target in targets],
-            "schedule": schedule.to_dict(),
-            "revision": revision,
-        }
-    )
+    rule_data = {
+        "id": rule_id,
+        "name": name,
+        "enabled": enabled,
+        "targets": [target.to_dict() for target in targets],
+        "schedule": schedule.to_dict(),
+        "revision": revision,
+    }
+    if form.allowance_starts is not None:
+        if (
+            isinstance(form.allowance_starts, bool)
+            or not isinstance(form.allowance_starts, int)
+            or form.allowance_starts < 1
+        ):
+            raise FormError(
+                "The daily start allowance must be a whole number from 1 up."
+            )
+        if any(target.kind not in Target.URL_LIKE_KINDS for target in targets):
+            raise FormError(
+                "Daily start allowances require URL-level targets only."
+            )
+        rule_data["allowance_starts"] = form.allowance_starts
+    return Rule.from_dict(rule_data)
 
 
 def form_to_request(
@@ -473,9 +512,13 @@ def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
     url_targets = tuple(
         {"kind": item["kind"], "value": item["value"]}
         for item in rule.to_dict()["targets"]
-        if item["kind"].startswith(("url", "youtube"))
+        if item["kind"] in Target.URL_LIKE_KINDS
     )
-    return replace(form, url_targets=url_targets)
+    return replace(
+        form,
+        url_targets=url_targets,
+        allowance_starts=rule.allowance_starts,
+    )
 
 
 def _rule_to_form_fields(rule: Rule, timezone_name: str) -> RuleForm:
@@ -743,6 +786,68 @@ def denial_stat_display(stat: DenialStatView) -> DenialStatDisplay:
         ", ".join(stat.rule_ids) if stat.rule_ids else "None recorded",
     )
 
+
+
+def website_usage_from_result(result: Mapping[str, object]) -> tuple[WebsiteUsageView, ...]:
+    """Parse the additive usage projection of ``list_website_stats``.
+
+    Breadcrumb for reviewers: the denial rows in the same response are not
+    needed here, so only the bounded usage entries are validated; the shape
+    stays pinned so protected state can never enter the GUI.
+    """
+    if not isinstance(result, Mapping) or set(result) != {"items", "dropped", "usage"}:
+        raise FormError("The service returned invalid website statistics.")
+    raw_usage = result["usage"]
+    if not isinstance(raw_usage, list) or len(raw_usage) > 256:
+        raise FormError("The service returned invalid website usage.")
+    expected = {
+        "rule_id",
+        "day",
+        "count",
+        "allowance_starts",
+        "budget_exhausted",
+    }
+    parsed: list[WebsiteUsageView] = []
+    seen: set[str] = set()
+    for item in raw_usage:
+        if not isinstance(item, Mapping) or set(item) != expected:
+            raise FormError("The service returned an invalid website usage row.")
+        rule_id = _canonical_uuid(
+            item["rule_id"], "The service returned an invalid usage rule ID."
+        )
+        if rule_id in seen:
+            raise FormError("The service returned an invalid usage rule ID.")
+        seen.add(rule_id)
+        day = item["day"]
+        if not isinstance(day, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            raise FormError("The service returned an invalid usage day.")
+        count = item["count"]
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+            or count > 2**63 - 1
+        ):
+            raise FormError("The service returned an invalid usage count.")
+        allowance = item["allowance_starts"]
+        if allowance is not None and (
+            isinstance(allowance, bool)
+            or not isinstance(allowance, int)
+            or allowance < 1
+        ):
+            raise FormError("The service returned an invalid start allowance.")
+        if not isinstance(item["budget_exhausted"], bool):
+            raise FormError("The service returned an invalid budget state.")
+        parsed.append(
+            WebsiteUsageView(
+                rule_id,
+                day,
+                count,
+                allowance,
+                item["budget_exhausted"],
+            )
+        )
+    return tuple(parsed)
 
 def timed_lock_request(
     rule_id: str,
@@ -1036,7 +1141,7 @@ def managed_list_from_domains(
 
 def snapshot_from_results(
     status: Mapping[str, object],
-    rule_items: Sequence[Mapping[str, object]],
+    policy_result: Mapping[str, object],
     list_items: Sequence[Mapping[str, object]],
     lock_items: Sequence[Mapping[str, object]],
 ) -> ServiceSnapshot:
@@ -1060,15 +1165,33 @@ def snapshot_from_results(
         raise FormError("The service returned an invalid status.")
     if not isinstance(status["clock_reason"], str):
         raise FormError("The service returned an invalid clock reason.")
+    try:
+        projection = PolicyProjection.from_dict(policy_result)
+    except ValidationError as error:
+        raise FormError("The service returned invalid policy values.") from error
+    normalized = projection.to_dict()
+    rule_items = normalized["rules"]
+    exhausted_rule_ids = frozenset(
+        item["id"] for item in rule_items if item["budget_exhausted"]
+    )
+    clean_rule_items = [
+        {
+            key: value
+            for key, value in item.items()
+            if key != "budget_exhausted"
+        }
+        for item in rule_items
+    ]
     return ServiceSnapshot(
         status["healthy"],
         status["clock_trusted"],
         status["clock_reason"],
         websites,
         applications,
-        tuple(Rule.from_dict(item) for item in rule_items),
+        tuple(Rule.from_dict(item) for item in clean_rule_items),
         managed_list_summaries_from_results(list_items),
         lock_summaries_from_results(lock_items),
+        exhausted_rule_ids=exhausted_rule_ids,
     )
 
 def duplicate_rule(
@@ -1316,7 +1439,7 @@ def _target_summary(rule: Rule) -> str:
     applications = sum(item["kind"] == "application" for item in targets)
     managed_lists = sum(item["kind"] == "managed_list" for item in targets)
     url_targets = sum(
-        item["kind"].startswith(("url", "youtube")) for item in targets
+        item["kind"] in Target.URL_LIKE_KINDS for item in targets
     )
     parts: list[str] = []
     if websites:
@@ -1549,7 +1672,7 @@ class GuiController:
                 locks = self.client.request("list_locks")
                 if (
                     not isinstance(status, Mapping)
-                    or not isinstance(rules, list)
+                    or not isinstance(rules, Mapping)
                     or not isinstance(lists, list)
                     or not isinstance(locks, list)
                 ):
@@ -1701,7 +1824,15 @@ class GuiController:
     ) -> object:
         Gtk = self.Gtk
         data = rule.to_dict()
-        active = rule.is_active(now_utc, clock_trusted=snapshot.clock_trusted)
+        # Breadcrumb (allowance seam): an exhausted rule is ACTIVE-BLOCKING
+        # regardless of its schedule, so the visible state says so and the
+        # scheduled next-change line would be misleading until the reset.
+        exhausted = (
+            data["enabled"] and rule.id in snapshot.exhausted_rule_ids
+        )
+        active = exhausted or rule.is_active(
+            now_utc, clock_trusted=snapshot.clock_trusted
+        )
         kind = data["schedule"]["kind"]
         row = Gtk.ListBoxRow()
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.SMALL))
@@ -1715,10 +1846,20 @@ class GuiController:
         name.set_xalign(0)
         name.set_hexpand(True)
         heading_row.append(name)
-        state = Gtk.Label(
-            label=_rule_state_text(rule, now_utc, snapshot.clock_trusted)
-        )
-        state.add_css_class("accent" if active else "dim-label")
+        if exhausted:
+            allowance = data.get("allowance_starts")
+            state = Gtk.Label(
+                label=(
+                    f"Blocking — daily start allowance used "
+                    f"({allowance} of {allowance} starts)."
+                )
+            )
+            state.add_css_class("warning")
+        else:
+            state = Gtk.Label(
+                label=_rule_state_text(rule, now_utc, snapshot.clock_trusted)
+            )
+            state.add_css_class("accent" if active else "dim-label")
         heading_row.append(state)
         outer.append(heading_row)
         details = Gtk.Label(label=f"{_target_summary(rule)} · {_schedule_summary(rule)}")
@@ -1739,7 +1880,7 @@ class GuiController:
             "warning" if lock is not None and lock.locked else "dim-label"
         )
         outer.append(lock_text)
-        if data["enabled"] and snapshot.clock_trusted:
+        if not exhausted and data["enabled"] and snapshot.clock_trusted:
             change = next_state_change(rule, now_utc)
             if change is not None:
                 action = _state_change_action(rule, change)
@@ -2093,6 +2234,7 @@ class GuiController:
                 else:
                     policy = Policy.from_dict(
                         {
+                            "schema_version": POLICY_SCHEMA_VERSION,
                             "revision": 0,
                             "rules": [rule.to_dict() for rule in rules],
                             "managed_lists": [
@@ -2423,6 +2565,7 @@ class GuiController:
             self.window,
             self._load_denial_statistics,
             self._clear_denial_statistics,
+            self._load_website_usage,
         ).present()
 
     def _load_denial_statistics(
@@ -2454,6 +2597,24 @@ class GuiController:
             {},
             lambda _result: completed(None),
             lambda error: completed(self._rpc_error(error)),
+        )
+
+    def _load_website_usage(
+        self,
+        completed: Callable[
+            [tuple[WebsiteUsageView, ...] | None, str | None], None
+        ],
+    ) -> None:
+        def load() -> tuple[WebsiteUsageView, ...]:
+            # Breadcrumb: the usage projection rides on the same public RPC
+            # result as website denial statistics; nothing protected loads.
+            result = self.client.request("list_website_stats")
+            return website_usage_from_result(result)
+
+        self._run_worker(
+            load,
+            lambda usage: completed(usage, None),
+            lambda error: completed(None, self._rpc_error(error)),
         )
 
     def _save_form(
@@ -3536,6 +3697,20 @@ class RuleEditor:
             empty_lists.add_css_class("dim-label")
             outer.append(empty_lists)
 
+        # Breadcrumb (allowance seam): 0 in the editor means "no daily
+        # limit"; any value from 1 up is stored as allowance_starts and
+        # blocks the rule once that many permitted starts are used today.
+        self.allowance_spin = Gtk.SpinButton.new_with_range(0, 10000, 1)
+        self.allowance_spin.set_numeric(True)
+        self.allowance_spin.set_value(0)
+        self.allowance_spin.set_tooltip_text(
+            "Allowed main-frame starts per day; 0 means no limit"
+        )
+        outer.append(
+            self._label_for("_Daily start allowance", self.allowance_spin)
+        )
+        outer.append(self.allowance_spin)
+
         schedule_heading = Gtk.Label(label="Schedule")
         schedule_heading.add_css_class("heading")
         schedule_heading.set_xalign(0)
@@ -3931,6 +4106,10 @@ class RuleEditor:
             pomodoro_break_minutes=self.pomodoro_break.get_value_as_int(),
             pomodoro_cycles=self.pomodoro_cycles.get_value_as_int(),
             url_targets=tuple(self.url_targets),
+            allowance_starts=(
+                None if self.allowance_spin.get_value_as_int() == 0
+                else self.allowance_spin.get_value_as_int()
+            ),
         )
 
     def _submit(self) -> None:
@@ -3977,6 +4156,8 @@ class RuleEditor:
             self.pomodoro_work.set_value(form.pomodoro_work_minutes)
             self.pomodoro_break.set_value(form.pomodoro_break_minutes)
             self.pomodoro_cycles.set_value(form.pomodoro_cycles)
+        # Breadcrumb: 0 means "no daily limit" in the editor.
+        self.allowance_spin.set_value(form.allowance_starts or 0)
         for row in tuple(self.weekly_rows):
             self._remove_weekly_period(row)
         if form.schedule_kind == "weekly":
@@ -4441,10 +4622,17 @@ class DenialStatisticsWindow:
             None,
         ],
         clear: Callable[[Callable[[str | None], None]], None],
+        load_usage: Callable[
+            [Callable[[tuple[WebsiteUsageView, ...] | None, str | None], None]],
+            None,
+        ] | None = None,
     ):
         self.Gtk = Gtk
         self.load_statistics = load
         self.clear_statistics = clear
+        # Breadcrumb: optional website-usage loader; a small pane is enough
+        # for v1 and an absent loader simply hides the pane.
+        self.load_usage = load_usage
         self.closed = False
         self.statistics: DenialStatistics | None = None
         self.window = self._build(parent)
@@ -4526,6 +4714,15 @@ class DenialStatisticsWindow:
         close = Gtk.Button.new_with_mnemonic("_Close")
         close.set_halign(Gtk.Align.END)
         close.connect("clicked", lambda _button: self._close())
+
+        usage_heading = Gtk.Label(label="Website start allowances (today)")
+        usage_heading.add_css_class("heading")
+        usage_heading.set_xalign(0)
+        outer.append(usage_heading)
+        self.usage_list_box = Gtk.ListBox()
+        self.usage_list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.usage_list_box.add_css_class("boxed-list")
+        outer.append(self.usage_list_box)
         outer.append(close)
         return window
 
@@ -4553,6 +4750,82 @@ class DenialStatisticsWindow:
     def _load(self) -> None:
         self._set_loading("Loading denial statistics.")
         self.load_statistics(self._loaded)
+        if self.load_usage is not None:
+            self.load_usage(self._usage_loaded)
+
+    def _usage_loaded(
+        self,
+        usage: tuple[WebsiteUsageView, ...] | None,
+        error: str | None,
+    ) -> None:
+        """Render the small per-rule allowance pane."""
+        Gtk = self.Gtk
+        child = self.usage_list_box.get_first_child()
+        while child is not None:
+            next_child = child.get_next_sibling()
+            self.usage_list_box.remove(child)
+            child = next_child
+        if usage is None:
+            row = Gtk.ListBoxRow()
+            message = Gtk.Label(
+                label=(
+                    "Website start allowances could not be loaded."
+                    + (f" {error}" if error else "")
+                )
+            )
+            message.set_xalign(0)
+            message.set_wrap(True)
+            message.add_css_class("dim-label")
+            row.set_child(message)
+            self.usage_list_box.append(row)
+            return
+        if not usage:
+            row = Gtk.ListBoxRow()
+            message = Gtk.Label(
+                label="No rule sets a daily start allowance yet."
+            )
+            message.set_xalign(0)
+            message.set_wrap(True)
+            message.add_css_class("dim-label")
+            row.set_child(message)
+            self.usage_list_box.append(row)
+            return
+        for item in usage:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL,
+                spacing=int(Space.COMPACT),
+            )
+            for method in (
+                box.set_margin_top,
+                box.set_margin_bottom,
+                box.set_margin_start,
+                box.set_margin_end,
+            ):
+                method(int(Space.SMALL))
+            if item.allowance_starts is None:
+                text = f"Used {item.count} allowed start(s) today (no limit)."
+            else:
+                text = (
+                    f"Used {item.count} of {item.allowance_starts} "
+                    "allowed start(s) today."
+                )
+            if item.budget_exhausted:
+                text += " Blocking until the day resets."
+            label = Gtk.Label(label=text)
+            label.set_xalign(0)
+            label.set_wrap(True)
+            if item.budget_exhausted:
+                label.add_css_class("warning")
+            box.append(label)
+            rules = Gtk.Label(label=f"Rule ID: {item.rule_id}")
+            rules.set_xalign(0)
+            rules.set_wrap(True)
+            rules.set_selectable(True)
+            rules.add_css_class("dim-label")
+            box.append(rules)
+            row.set_child(box)
+            self.usage_list_box.append(row)
 
     def _loaded(
         self,

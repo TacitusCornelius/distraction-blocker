@@ -12,12 +12,10 @@ import os
 from collections.abc import Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .model import Rule
+from .model import MAX_POMODORO_CYCLES, MAX_WEEKLY_PERIODS, Rule
 
 UTC = timezone.utc
 
-MAX_WEEKLY_PERIODS = 16
-MAX_POMODORO_CYCLES = 20
 MAX_DAILY_TRANSITIONS = max(MAX_WEEKLY_PERIODS * 2 + 2, MAX_POMODORO_CYCLES * 2)
 
 
@@ -186,8 +184,17 @@ def project_daily_schedule(
     rules: Sequence[Rule],
     local_day: date,
     timezone_name: str,
+    exhausted_rule_ids: frozenset[str] | None = None,
 ) -> tuple[DailyInterval, ...]:
-    """Project enabled rule intervals into one day in the system time zone."""
+    """Project enabled rule intervals into one local day.
+
+    Breadcrumb (allowance seam): a rule whose daily start budget is used up
+    blocks regardless of its schedule windows or exceptions until the
+    budget resets. The service passes those rule ids here; this pure
+    function then pins each of them to one full-day interval so every
+    viewer (GUI overview, CLI) sees the same ACTIVE-BLOCKING projection.
+    """
+    exhausted = exhausted_rule_ids or frozenset()
     try:
         zone = ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError as error:
@@ -199,6 +206,13 @@ def project_daily_schedule(
     intervals: list[DailyInterval] = []
     for rule in rules:
         if not rule.enabled:
+            continue
+        # Breadcrumb: exhaustion overrides schedule evaluation entirely,
+        # including untrusted-clock handling, until the day resets.
+        if rule.id in exhausted:
+            intervals.append(
+                DailyInterval(rule.id, rule.name, day_start, day_end)
+            )
             continue
         active = rule.is_active(start_utc, clock_trusted=True)
         interval_start = start_utc if active else None

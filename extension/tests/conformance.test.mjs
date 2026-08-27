@@ -66,15 +66,12 @@ test("conformance fixtures are complete and well-formed", () => {
   }
 });
 
-test("adapter cores are byte-identical to the shared source", () => {
+// Breadcrumb: Firefox compiles the shared core to classic scripts (MV2
+// persistent background), so its copies intentionally differ from the
+// module sources; build.py --check is the authority for that contract.
+// Chromium keeps verbatim module copies.
+test("chromium core is byte-identical to the shared source", () => {
   const source = readFileSync(join(root, "core", "engine.js"));
-  for (const target of ["firefox", "chromium"]) {
-    const copy = join(root, target, "core", "engine.js");
-    try {
-      assert.equal(readFileSync(copy).equals(source), true, `${target} core stale`);
-    } catch (error) {
-      if (error.code === "ENOENT") continue; // adapter not started yet
-      throw error;
-    }
-  }
+  const copy = join(root, "chromium", "core", "engine.js");
+  assert.equal(readFileSync(copy).equals(source), true, "chromium core stale");
 });

@@ -14,8 +14,8 @@ from typing import Any
 
 from .canonical import CanonicalError, format_utc, parse_utc
 from .control import ControlState
-from .model import Policy, ValidationError
-from .statistics import StatisticsState, WebsiteDenialState
+from .model import POLICY_SCHEMA_VERSION, Policy, ValidationError
+from .statistics import StatisticsState, WebsiteDenialState, WebsiteUsageState
 
 
 class StorageError(RuntimeError):
@@ -32,12 +32,13 @@ class LoadResult:
 
 
 class ProtectedStore:
-    VERSION = 3
+    VERSION = 4
     KEY_NAME = "hmac.key"
     PRIMARY_NAME = "policy.json"
     BACKUP_NAME = "policy.json.bak"
     STATISTICS_NAME = "statistics.json"
     WEBSITE_STATISTICS_NAME = "website-statistics.json"
+    WEBSITE_USAGE_NAME = "website-usage.json"
     MAX_POLICY_BYTES = 16 * 1024 * 1024
     MAX_STATISTICS_BYTES = 1024 * 1024
 
@@ -61,6 +62,10 @@ class ProtectedStore:
     @property
     def website_statistics_path(self) -> Path:
         return self.directory / self.WEBSITE_STATISTICS_NAME
+
+    @property
+    def website_usage_path(self) -> Path:
+        return self.directory / self.WEBSITE_USAGE_NAME
 
     def initialize(self) -> None:
         if self.directory.exists() and self.directory.is_symlink():
@@ -160,68 +165,79 @@ class ProtectedStore:
         self._atomic_write(self.primary_path, content)
 
     def _statistics_envelope(self, state) -> bytes:
-        if not isinstance(state, (StatisticsState, WebsiteDenialState)):
+        if not isinstance(state, (StatisticsState, WebsiteDenialState, WebsiteUsageState)):
             raise StorageError("statistics state has an invalid type")
         unsigned = {"version": 1, "payload": state.to_dict()}
         signature = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
         return self._canonical({**unsigned, "hmac": signature})
 
-    def save_statistics(self, state: StatisticsState) -> None:
-        """Atomically save observational statistics without touching policy files."""
+    def _save_signed_state(self, path: Path, state: StatisticsState | WebsiteDenialState | WebsiteUsageState, name: str) -> None:
+        """Atomically save one signed statistics state; ``name`` labels errors."""
         self.initialize()
         content = self._statistics_envelope(state)
         if len(content) > self.MAX_STATISTICS_BYTES:
-            raise StorageError("statistics file is too large")
-        # Breadcrumb: statistics have no backup. Observational data must never rewrite policy backups.
-        self._atomic_write(self.statistics_path, content)
+            raise StorageError(f"{name} file is too large")
+        # Breadcrumb: statistics files have no backup. Observational data
+        # must never rewrite policy backups.
+        self._atomic_write(path, content)
+
+    def _load_signed_state(self, path: Path, empty, from_payload, name: str):
+        """Load one signed statistics state, or an empty state when absent."""
+        self.initialize()
+        if not path.exists():
+            return empty()
+        if path.is_symlink() or not path.is_file():
+            raise StorageError(f"{name} path is not a regular file")
+        if path.stat().st_size > self.MAX_STATISTICS_BYTES:
+            raise StorageError(f"{name} file is too large")
+        try:
+            envelope = json.loads(path.read_bytes().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StorageError(f"{name} file is invalid") from exc
+        _, payload = self._verify_envelope(envelope, {1}, name)
+        try:
+            return from_payload(payload)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise StorageError(f"{name} payload is invalid") from exc
+
+    def save_statistics(self, state: StatisticsState) -> None:
+        """Atomically save observational statistics without touching policy files."""
+        self._save_signed_state(self.statistics_path, state, "statistics")
 
     def load_statistics(self) -> StatisticsState:
         """Load signed statistics, or return an empty state when absent."""
-        self.initialize()
-        path = self.statistics_path
-        if not path.exists():
-            return StatisticsState.empty()
-        if path.is_symlink() or not path.is_file():
-            raise StorageError("statistics path is not a regular file")
-        if path.stat().st_size > self.MAX_STATISTICS_BYTES:
-            raise StorageError("statistics file is too large")
-        try:
-            envelope = json.loads(path.read_bytes().decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise StorageError("statistics file is invalid") from exc
-        _, payload = self._verify_envelope(envelope, {1}, "statistics")
-        try:
-            return StatisticsState.from_dict(payload)
-        except (TypeError, ValueError, KeyError) as exc:
-            raise StorageError("statistics payload is invalid") from exc
+        return self._load_signed_state(
+            self.statistics_path,
+            StatisticsState.empty,
+            StatisticsState.from_dict,
+            "statistics",
+        )
 
     def save_website_statistics(self, state: WebsiteDenialState) -> None:
         """Atomically save website denials into their own signed file."""
-        self.initialize()
-        content = self._statistics_envelope(state)
-        if len(content) > self.MAX_STATISTICS_BYTES:
-            raise StorageError("website statistics file is too large")
-        self._atomic_write(self.website_statistics_path, content)
+        self._save_signed_state(self.website_statistics_path, state, "website statistics")
 
     def load_website_statistics(self) -> WebsiteDenialState:
         """Load signed website statistics, or an empty state when absent."""
-        self.initialize()
-        path = self.website_statistics_path
-        if not path.exists():
-            return WebsiteDenialState.empty()
-        if path.is_symlink() or not path.is_file():
-            raise StorageError("website statistics path is not a regular file")
-        if path.stat().st_size > self.MAX_STATISTICS_BYTES:
-            raise StorageError("website statistics file is too large")
-        try:
-            envelope = json.loads(path.read_bytes().decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise StorageError("website statistics file is invalid") from exc
-        _, payload = self._verify_envelope(envelope, {1}, "website statistics")
-        try:
-            return WebsiteDenialState.from_dict(payload)
-        except (TypeError, ValueError, KeyError) as exc:
-            raise StorageError("website statistics payload is invalid") from exc
+        return self._load_signed_state(
+            self.website_statistics_path,
+            WebsiteDenialState.empty,
+            WebsiteDenialState.from_dict,
+            "website statistics",
+        )
+
+    def save_website_usage(self, state: WebsiteUsageState) -> None:
+        """Atomically save per-rule daily starts into their own signed file."""
+        self._save_signed_state(self.website_usage_path, state, "website usage")
+
+    def load_website_usage(self) -> WebsiteUsageState:
+        """Load signed website usage, or an empty state when absent."""
+        return self._load_signed_state(
+            self.website_usage_path,
+            WebsiteUsageState.empty,
+            WebsiteUsageState.from_dict,
+            "website usage",
+        )
 
 
     def _atomic_write(self, path: Path, content: bytes) -> None:
@@ -292,6 +308,9 @@ class ProtectedStore:
         if not isinstance(data, dict):
             raise StorageError("policy is invalid")
         migrated = dict(data)
+        # Breadcrumb: envelopes 1 through 3 predate the explicit policy
+        # schema field. A verified old envelope enters schema 1.
+        migrated.setdefault("schema_version", POLICY_SCHEMA_VERSION)
         migrated.setdefault("managed_lists", [])
         rules = migrated.get("rules")
         if not isinstance(rules, list):
@@ -320,19 +339,31 @@ class ProtectedStore:
         raw = path.read_bytes()
         envelope = json.loads(raw.decode("utf-8"))
         version, payload = self._verify_envelope(
-            envelope, {1, 2, self.VERSION}, "policy"
+            envelope, {1, 2, 3, self.VERSION}, "policy"
         )
         old_fields = {"clock_untrusted", "high_water_utc", "policy"}
         current_fields = old_fields | {"controls"}
-        if not isinstance(payload, dict) or set(payload) != (current_fields if version == self.VERSION else old_fields):
+        has_controls = version >= 3
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != (current_fields if has_controls else old_fields)
+        ):
             raise StorageError("policy payload is invalid")
         if not isinstance(payload["clock_untrusted"], bool):
             raise StorageError("clock state is invalid")
-        policy_data = self._migrate_policy(payload["policy"]) if version == 1 else payload["policy"]
+        policy_data = (
+            payload["policy"]
+            if version == self.VERSION
+            else self._migrate_policy(payload["policy"])
+        )
         policy = Policy.from_dict(policy_data)
-        controls = ControlState.from_dict(payload["controls"]) if version == self.VERSION else ControlState.empty()
+        controls = (
+            ControlState.from_dict(payload["controls"])
+            if has_controls
+            else ControlState.empty()
+        )
         result = LoadResult(policy, controls, self._parse_utc(payload["high_water_utc"]), degraded, payload["clock_untrusted"])
         if version != self.VERSION:
-            # Breadcrumb: verify the old signature first, then write only the converted v3 form.
+            # Breadcrumb: verify the old signature first, then write only the converted v4 form.
             self.save(policy, controls, result.high_water_utc, result.clock_untrusted)
         return result

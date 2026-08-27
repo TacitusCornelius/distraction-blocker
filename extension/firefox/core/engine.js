@@ -17,7 +17,7 @@
 "use strict";
 
 /** Split a stored `host/path` value into its lowercase host and path. */
-export function split_target(value) {
+function split_target(value) {
   const cut = value.indexOf("/");
   if (cut < 0) {
     return null;
@@ -40,7 +40,7 @@ const YOUTUBE_HOSTS = new Set([
  * Extract a video ID or channel reference from a YouTube URL.
  * Handles watch?v=, /shorts/, /embed/, /live/, /@handle and /channel/UC….
  */
-export function youtube_fields(parsed) {
+function youtube_fields(parsed) {
   const host = parsed.hostname.toLowerCase();
   if (!YOUTUBE_HOSTS.has(host)) {
     return null;
@@ -74,7 +74,7 @@ export function youtube_fields(parsed) {
 }
 
 /** Normalize a request URL into the fields matchers compare against. */
-export function describe_url(raw) {
+function describe_url(raw) {
   let parsed;
   try {
     parsed = new URL(raw);
@@ -108,7 +108,7 @@ function matches(target, url) {
  * Compile service rules into a matcher.
  * `rules` is a list of { id, enabled, targets: [{kind, value}] }.
  */
-export function compile(rules) {
+function compile(rules) {
   const active = (rules ?? []).filter(
     (rule) => rule.enabled && Array.isArray(rule.targets),
   );

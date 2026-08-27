@@ -14,6 +14,31 @@ import sys
 import tempfile
 from typing import Iterable, NoReturn
 
+HOST_MANIFEST_FILENAME = "org.distraction_blocker.extension.json"
+LEGACY_FIREFOX_MANIFEST_FILENAME = "org.distraction_blocker.firefox.json"
+LEGACY_CHROMIUM_MANIFEST_FILENAME = "org.distraction_blocker.chromium.json"
+LEGACY_SYSTEM_NATIVE_MANIFESTS = (
+    Path("/usr/lib/mozilla/native-messaging-hosts")
+    / LEGACY_FIREFOX_MANIFEST_FILENAME,
+    Path("/usr/lib/librewolf/native-messaging-hosts")
+    / LEGACY_FIREFOX_MANIFEST_FILENAME,
+    Path("/etc/chromium/native-messaging-hosts")
+    / LEGACY_CHROMIUM_MANIFEST_FILENAME,
+    Path("/etc/opt/chrome/native-messaging-hosts")
+    / LEGACY_CHROMIUM_MANIFEST_FILENAME,
+)
+LEGACY_OWNER_NATIVE_MANIFESTS = (
+    (".mozilla/native-messaging-hosts", LEGACY_FIREFOX_MANIFEST_FILENAME),
+    (".librewolf/native-messaging-hosts", LEGACY_FIREFOX_MANIFEST_FILENAME),
+    (
+        ".config/chromium/NativeMessagingHosts",
+        LEGACY_CHROMIUM_MANIFEST_FILENAME,
+    ),
+    (
+        ".config/google-chrome/NativeMessagingHosts",
+        LEGACY_CHROMIUM_MANIFEST_FILENAME,
+    ),
+)
 PREFIX = Path("/usr/lib/distraction-blocker")
 STATE = Path("/var/lib/distraction-blocker")
 RUN = Path("/run/distraction-blocker")
@@ -196,6 +221,20 @@ def check_cli_collision() -> None:
         fail(f"refusing to replace an existing path: {CLI_PATH}")
 
 
+def _remove_owned_manifest(path: Path) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        fail(f"the legacy native manifest path is unsafe: {path}")
+    if path.is_file():
+        path.unlink()
+
+
+def remove_legacy_native_manifests(owner_home: Path) -> None:
+    """Remove browser-specific manifest names from an older installation."""
+    for path in LEGACY_SYSTEM_NATIVE_MANIFESTS:
+        _remove_owned_manifest(path)
+    for subdir, manifest_name in LEGACY_OWNER_NATIVE_MANIFESTS:
+        _remove_owned_manifest(owner_home / subdir / manifest_name)
+
 
 def install_files(source_root: Path, owner_uid: int) -> None:
     upgrading = installation_exists()
@@ -263,13 +302,20 @@ def install_files(source_root: Path, owner_uid: int) -> None:
             ):
                 copy_asset(
                     packaging_fd,
+                    # Breadcrumb: source keeps its packaging name; the
+                    # deployed name must equal the host "name" field plus
+                    # .json because Firefox constructs the lookup path.
                     "org.distraction_blocker.firefox.json",
-                    browser_dir / "org.distraction_blocker.firefox.json",
+                    browser_dir / HOST_MANIFEST_FILENAME,
                 )
             try:
-                owner_home = Path(pwd.getpwuid(owner_uid).pw_dir)
+                account = pwd.getpwuid(owner_uid)
             except KeyError:
                 fail("the owner UID has no user account")
+            owner_home = Path(account.pw_dir)
+            # Breadcrumb: chown with the account's real primary group, not
+            # uid:uid, or the browser running as the user may lose read access.
+            owner_spec = f"{owner_uid}:{account.pw_gid}"
             for home_dir in (
                 owner_home / ".mozilla" / "native-messaging-hosts",
                 owner_home / ".librewolf" / "native-messaging-hosts",
@@ -277,14 +323,14 @@ def install_files(source_root: Path, owner_uid: int) -> None:
                 copy_asset(
                     packaging_fd,
                     "org.distraction_blocker.firefox.json",
-                    home_dir / "org.distraction_blocker.firefox.json",
+                    home_dir / HOST_MANIFEST_FILENAME,
                     0o644,
                 )
             subprocess.run(
                 [
                     "/usr/bin/chown",
                     "-R",
-                    f"{owner_uid}:{owner_uid}",
+                    owner_spec,
                     str(owner_home / ".mozilla" / "native-messaging-hosts"),
                     str(owner_home / ".librewolf" / "native-messaging-hosts"),
                 ],
@@ -297,8 +343,10 @@ def install_files(source_root: Path, owner_uid: int) -> None:
                 copy_asset(
                     packaging_fd,
                     "org.distraction_blocker.chromium.json",
-                    browser_dir / "org.distraction_blocker.chromium.json",
+                    browser_dir / HOST_MANIFEST_FILENAME,
                 )
+            # Breadcrumb: these per-owner copies must mirror the removal
+            # pairs in scripts/uninstall.py remove_native_manifests().
             for user_dir in (
                 owner_home / ".config" / "chromium" / "NativeMessagingHosts",
                 owner_home / ".config" / "google-chrome" / "NativeMessagingHosts",
@@ -306,18 +354,25 @@ def install_files(source_root: Path, owner_uid: int) -> None:
                 copy_asset(
                     packaging_fd,
                     "org.distraction_blocker.chromium.json",
-                    user_dir / "org.distraction_blocker.chromium.json",
+                    user_dir / HOST_MANIFEST_FILENAME,
                     0o644,
                 )
+            # Breadcrumb: scope the recursive chown to NativeMessagingHosts;
+            # the whole ~/.config tree belongs to the user, not to us.
             subprocess.run(
                 [
                     "/usr/bin/chown",
                     "-R",
-                    f"{owner_uid}:{owner_uid}",
-                    str(owner_home / ".config" / "chromium"),
-                    str(owner_home / ".config" / "google-chrome"),
+                    owner_spec,
+                    str(owner_home / ".config" / "chromium" / "NativeMessagingHosts"),
+                    str(
+                        owner_home
+                        / ".config"
+                        / "google-chrome"
+                        / "NativeMessagingHosts"
+                    ),
                 ],
-                check=False,
+                check=True,
             )
         finally:
             os.close(packaging_fd)
@@ -328,6 +383,10 @@ def install_files(source_root: Path, owner_uid: int) -> None:
         # Breadcrumb for reviewers: version 1.2 aligns the desktop filename
         # with the GTK application ID so Gio notifications have an identity.
         LEGACY_DESKTOP.unlink()
+    if upgrading:
+        # Breadcrumb: new manifests use the host name. Remove only the
+        # browser-specific names that an older marked installation owned.
+        remove_legacy_native_manifests(owner_home)
     marker = PREFIX / MARKER_NAME
     marker.write_text(MARKER_TEXT, encoding="ascii")
     set_mode(marker, 0o644)

@@ -2,7 +2,17 @@ import unittest
 from datetime import datetime, timezone
 import uuid
 
-from distraction_blocker.model import ManagedList, Policy, Rule, Schedule, Target, ValidationError
+from distraction_blocker.model import (
+    MAX_ALLOWANCE_STARTS,
+    POLICY_SCHEMA_VERSION,
+    ManagedList,
+    Policy,
+    PolicyProjection,
+    Rule,
+    Schedule,
+    Target,
+    ValidationError,
+)
 
 
 LIST_ID = "11111111-1111-4111-8111-111111111111"
@@ -28,13 +38,30 @@ class ModelTests(unittest.TestCase):
 
     def test_managed_list_target_and_reference_validation(self):
         item = managed_list()
-        target = Target.from_dict({"kind": "managed_list", "value": LIST_ID.upper()})
+        target = Target.from_dict({"kind": "managed_list", "value": LIST_ID})
         self.assertEqual(target.value, LIST_ID)
         rule = Rule.from_dict({"id": str(uuid.uuid4()), "name": "x", "enabled": True, "targets": [target.to_dict()], "schedule": {"kind": "indefinite"}, "revision": 0})
-        policy = Policy.from_dict({"revision": 1, "rules": [rule.to_dict()], "managed_lists": [item.to_dict()]})
+        policy = Policy.from_dict({"schema_version": POLICY_SCHEMA_VERSION, "revision": 1, "rules": [rule.to_dict()], "managed_lists": [item.to_dict()]})
         self.assertEqual(policy.managed_lists[0].domains, ("example.com",))
         with self.assertRaises(ValidationError):
-            Policy.from_dict({"revision": 1, "rules": [rule.to_dict()], "managed_lists": []})
+            Policy.from_dict({"schema_version": POLICY_SCHEMA_VERSION, "revision": 1, "rules": [rule.to_dict()], "managed_lists": []})
+
+    def test_ids_accept_only_canonical_uuids(self):
+        # Breadcrumb: the model demands the same strict canonical form as
+        # control.py and statistics.py; IDs are service-generated uuid4 text,
+        # so there is no interactive path that needs lenient normalization.
+        canonical = str(uuid.uuid4())
+        target_dict = {"kind": "website", "value": "example.test"}
+        self.assertEqual(Rule.from_dict({"id": canonical, "name": "x", "enabled": True, "targets": [target_dict], "schedule": {"kind": "indefinite"}, "revision": 0}).id, canonical)
+        for bad in (canonical.upper(), "{" + canonical + "}", canonical.replace("-", ""), "not-a-uuid", 123):
+            with self.assertRaises(ValidationError):
+                Rule.from_dict({"id": bad, "name": "x", "enabled": True, "targets": [target_dict], "schedule": {"kind": "indefinite"}, "revision": 0})
+            data = managed_list().to_dict()
+            data["id"] = bad
+            with self.assertRaises(ValidationError):
+                ManagedList.from_dict(data)
+            with self.assertRaises(ValidationError):
+                Target.from_dict({"kind": "managed_list", "value": bad})
 
     def test_rejects_bool_integer_and_unknown_field(self):
         with self.assertRaises(ValidationError):
@@ -129,8 +156,20 @@ class ModelTests(unittest.TestCase):
                 self.assertEqual(Schedule.from_dict(schedule.to_dict()), schedule)
 
     def test_policy_round_trip(self):
-        policy = Policy.from_dict({"revision": 1, "rules": [], "managed_lists": [managed_list().to_dict()]})
+        policy = Policy.from_dict({"schema_version": POLICY_SCHEMA_VERSION, "revision": 1, "rules": [], "managed_lists": [managed_list().to_dict()]})
         self.assertEqual(Policy.from_dict(policy.to_dict()), policy)
+        self.assertEqual(policy.to_dict()["schema_version"], POLICY_SCHEMA_VERSION)
+
+    def test_policy_refuses_missing_or_unknown_schema_version(self):
+        # Breadcrumb: storage migrates verified old envelopes. Public model
+        # input remains strict, so callers cannot guess a future schema.
+        base = {"revision": 1, "rules": [], "managed_lists": []}
+        with self.assertRaises(ValidationError):
+            Policy.from_dict(base)
+        with self.assertRaises(ValidationError):
+            Policy.from_dict({"schema_version": 2, **base})
+        with self.assertRaises(ValidationError):
+            Policy(1, (), (), 2)
 
 
 
@@ -174,6 +213,7 @@ class UrlTargetTests(unittest.TestCase):
 
     def test_policy_round_trips_url_targets(self):
         policy = Policy.from_dict({
+            "schema_version": POLICY_SCHEMA_VERSION,
             "revision": 1,
             "rules": [{
                 "id": "12345678-1234-5678-1234-567812345678",
@@ -218,8 +258,113 @@ class YoutubeTargetTests(unittest.TestCase):
                     Target.from_dict({"kind": kind, "value": value})
 
 
-if __name__ == "__main__":
-    unittest.main()
+
+
+RULE_ID = "12345678-1234-5678-9234-567812345678"
+
+def allowance_rule_dict(**extra):
+    data = {
+        "id": RULE_ID,
+        "name": "Budgeted",
+        "enabled": True,
+        "targets": [
+            {
+                "kind": "url_path"
+                if extra.get("allowance_starts") is not None
+                else "website",
+                "value": "example.com/feed"
+                if extra.get("allowance_starts") is not None
+                else "example.com",
+            }
+        ],
+        "schedule": {"kind": "indefinite"},
+        "revision": 0,
+    }
+    data.update(extra)
+    return data
+
+
+class AllowanceStartsTests(unittest.TestCase):
+    # Breadcrumb: allowance_starts is the first OPTIONAL rule field, so its
+    # absence and presence must both round-trip through the signed policy.
+
+    def test_absent_field_round_trips_as_none(self):
+        rule = Rule.from_dict(allowance_rule_dict())
+        self.assertIsNone(rule.allowance_starts)
+        self.assertNotIn("allowance_starts", rule.to_dict())
+
+    def test_positive_integer_round_trips(self):
+        rule = Rule.from_dict(allowance_rule_dict(allowance_starts=5))
+        self.assertEqual(rule.allowance_starts, 5)
+        self.assertEqual(rule.to_dict()["allowance_starts"], 5)
+        reparsed = Rule.from_dict(rule.to_dict())
+        self.assertEqual(reparsed, rule)
+
+    def test_rejects_bool_zero_negative_and_non_int(self):
+        for bad in (
+            True,
+            False,
+            0,
+            -1,
+            "5",
+            5.0,
+            None,
+            MAX_ALLOWANCE_STARTS + 1,
+        ):
+            with self.assertRaises(ValidationError):
+                Rule.from_dict(allowance_rule_dict(allowance_starts=bad))
+
+    def test_unknown_field_is_refused(self):
+        with self.assertRaises(ValidationError):
+            Rule.from_dict(allowance_rule_dict(allowance_startss=5))
+
+
+    def test_rejects_allowance_for_non_url_targets(self):
+        with self.assertRaisesRegex(
+            ValidationError, "URL-level targets"
+        ):
+            Rule.from_dict(
+                allowance_rule_dict(
+                    targets=[{"kind": "website", "value": "example.com"}],
+                    allowance_starts=5,
+                )
+            )
+
+
+class PolicyProjectionTests(unittest.TestCase):
+    def _rule(self):
+        return allowance_rule_dict(allowance_starts=5)
+
+    def test_round_trips_strict_projection(self):
+        projection = {
+            "schema_version": POLICY_SCHEMA_VERSION,
+            "revision": 9,
+            "rules": [
+                {**self._rule(), "budget_exhausted": False},
+            ],
+        }
+        self.assertEqual(
+            PolicyProjection.from_dict(projection).to_dict(),
+            projection,
+        )
+
+    def test_rejects_bool_versions_and_invalid_rule_mappings(self):
+        base = {
+            "schema_version": POLICY_SCHEMA_VERSION,
+            "revision": 0,
+            "rules": [],
+        }
+        for field in ("schema_version", "revision"):
+            with self.subTest(field=field):
+                with self.assertRaises(ValidationError):
+                    PolicyProjection.from_dict({**base, field: True})
+        invalid_rule = self._rule()
+        invalid_rule["budget_exhausted"] = False
+        invalid_rule["extra"] = True
+        with self.assertRaises(ValidationError):
+            PolicyProjection.from_dict(
+                {**base, "rules": [invalid_rule]}
+            )
 
 
 if __name__ == "__main__":

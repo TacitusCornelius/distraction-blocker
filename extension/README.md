@@ -13,16 +13,21 @@ URL-level rules that `/etc/hosts` cannot express:
 - Search-keyword rules.
 - Website exceptions under a broad rule.
 - YouTube channel or video rules.
-- Embedded-content blocking.
+- Embedded-content blocking: rules match loads in any frame, so
+  iframe/embedded content is blocked like a top-level navigation.
 - Inactive-tab blocking.
 - Browser-extension protection.
-- Website usage statistics.
-- Website allowance accounting.
-
-The desktop application never trusts the extension. Policy flows one way,
-from the signed service to the extension. Statistics flow back as plain
-observational data.
+- Each URL-level rule can have a daily website allowance. The extension
+  permits starts until the allowance ends. The service then enforces the
+  rule all day. The allowance resets at local midnight for the rule.
 
 ## Status
 
-Design phase. No code yet.
+Implemented: the shared policy engine, Firefox and Chromium adapters,
+denial attribution, the native host, installer wiring, and unit checks.
+The two adapters block inactive-tab loads. Policy projections include an
+explicit schema version.
+
+The desktop application does not trust the extension. Policy flows from
+the root service to the extension. The extension sends observational
+statistics to the service.

@@ -29,6 +29,8 @@
     { "policy": "mixed", "url": "https://example.com/vid/98765432",
       "expect": { "rule_id": "wild-rule" } },
     { "policy": "mixed", "url": "https://example.org/vid/x", "expect": null },
+    { "policy": "mixed", "url": "https://example.com/video", "expect": null },
+    { "policy": "mixed", "url": "https://example.com/vidx/1", "expect": null },
     { "policy": "mixed",
       "url": "https://search.example.net/q?click=casino+bonus",
       "expect": { "rule_id": "word-rule" } },
@@ -49,6 +51,12 @@
     { "policy": "mixed", "url": "https://youtube.com/@otherhandle",
       "expect": null },
     { "policy": "mixed", "url": "https://evil.example.net/watch?v=dQw4w9WgXcQ",
+      "expect": null },
+    { "policy": "mixed", "url": "https://m.youtube.com/@examplehandle/videos",
+      "expect": { "rule_id": "yt-channel" } },
+    { "policy": "mixed", "url": "https://www.youtube-nocookie.com/@ExampleHandle",
+      "expect": { "rule_id": "yt-channel" } },
+    { "policy": "mixed", "url": "https://m.youtube.com/@otherhandle",
       "expect": null }
   ]
 }

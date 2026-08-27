@@ -192,6 +192,19 @@ A browser extension is necessary for these features:
 - Website usage statistics.
 - Website allowance accounting.
 
+Deferred by owner decision: browser-extension protection.
+
+Website allowance accounting is built. Each URL-level rule can have an
+optional daily start budget. The service enforces the rule after the
+budget ends. The budget resets at local midnight for the rule.
+
+The next feature cycle is built:
+
+- Chromium inactive-tab blocking uses a session DNR rule with inactive tab
+  IDs. Tab events replace the rule.
+- Policy projections include `schema_version: 1` and `revision`. Firefox,
+  Chromium, the GUI, and the CLI reject an unsupported projection.
+
 The root service must remain the final policy authority.
 
 ## Privileged network version

@@ -1,5 +1,5 @@
 {
-  "manifest_version": 3,
+  "manifest_version": 2,
   "name": "Distraction Blocker",
   "version": "1.3.0",
   "description": "Enforces URL-level rules authored by the Distraction Blocker root service.",
@@ -10,17 +10,17 @@
     }
   },
   "background": {
-    "scripts": ["core/engine.js", "background.js"],
-    "type": "module"
+    "scripts": ["core/engine.js", "core/usage.js", "core/policy.js", "background.js"]
   },
   "permissions": [
     "nativeMessaging",
     "webRequest",
     "webRequestBlocking",
     "storage",
-    "tabs"
+    "tabs",
+    "alarms",
+    "<all_urls>"
   ],
-  "host_permissions": ["<all_urls>"],
   "action": {
     "default_title": "Distraction Blocker",
     "default_popup": "status.html"

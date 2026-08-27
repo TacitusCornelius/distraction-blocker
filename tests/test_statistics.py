@@ -98,5 +98,96 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(buffer.drain_into().dropped, 0)
 
 
+
+
+import uuid
+
+from distraction_blocker.statistics import (
+    MAX_PATHS,
+    WebsiteUsageStat,
+    WebsiteUsageState,
+)
+
+
+def usage_rule(n: int) -> str:
+    # Deterministic canonical UUIDs; the 4/8 nibbles keep the v4 shape.
+    return f"{n:08d}-1111-4111-8111-111111111111"
+
+
+class WebsiteUsageTests(unittest.TestCase):
+    # Breadcrumb: usage rows bucket per rule per LOCAL day. Staleness is
+    # resolved lazily via fresh()/count_for(); no timers exist.
+
+    def test_record_merges_same_day_and_resets_on_new_day(self):
+        rule = usage_rule(1)
+        state = WebsiteUsageState.empty()
+        state = state.record(rule, 2, "2026-01-01")
+        state = state.record(rule, 3, "2026-01-01")
+        self.assertEqual(state.count_for(rule, "2026-01-01"), 5)
+        next_day = state.record(rule, 1, "2026-01-02")
+        self.assertEqual(next_day.count_for(rule, "2026-01-02"), 1)
+        # The old day's row is replaced, not merged.
+        self.assertEqual(len(next_day.items), 1)
+
+    def test_row_and_state_shapes_are_exact(self):
+        row = WebsiteUsageStat(usage_rule(2), "2026-01-01", 4)
+        self.assertEqual(
+            row.to_dict(),
+            {"rule_id": usage_rule(2), "day": "2026-01-01", "count": 4},
+        )
+        state = WebsiteUsageState((row,), 0)
+        self.assertEqual(
+            state.to_dict(),
+            {"items": [row.to_dict()], "dropped": 0},
+        )
+        self.assertEqual(WebsiteUsageState.from_dict(state.to_dict()), state)
+
+    def test_fresh_prunes_stale_and_unknown_rows(self):
+        kept = WebsiteUsageStat(usage_rule(1), "2026-01-01", 2)
+        stale = WebsiteUsageStat(usage_rule(2), "2025-12-31", 9)
+        state = WebsiteUsageState((stale, kept), 0)
+        days = {usage_rule(1): "2026-01-01", usage_rule(2): "2026-01-01"}
+        fresh = state.fresh(days.get)
+        self.assertEqual(fresh.items, (kept,))
+        # Unknown rules resolve to None and are pruned too.
+        self.assertEqual(state.fresh(lambda _rid: None).items, ())
+
+    def test_count_for_treats_stale_rows_as_zero(self):
+        rule = usage_rule(3)
+        state = WebsiteUsageState.empty().record(rule, 7, "2025-12-31")
+        self.assertEqual(state.count_for(rule, "2026-01-01"), 0)
+
+    def test_record_rejects_bad_counts_and_days(self):
+        with self.assertRaises(ValueError):
+            WebsiteUsageState.empty().record(usage_rule(1), 0, "2026-01-01")
+        with self.assertRaises(ValueError):
+            WebsiteUsageState.empty().record(usage_rule(1), True, "2026-01-01")
+        with self.assertRaises(ValueError):
+            WebsiteUsageState.empty().record(usage_rule(1), 1, "2026-1-1")
+
+    def test_row_capacity_evicts_oldest_day_then_rule(self):
+        state = WebsiteUsageState.empty()
+        for index in range(MAX_PATHS):
+            state = state.record(usage_rule(index + 1), 1, "2026-01-01")
+        overflow = state.record(usage_rule(MAX_PATHS + 1), 1, "2025-12-31")
+        self.assertEqual(len(overflow.items), MAX_PATHS)
+        self.assertEqual(overflow.dropped, 1)
+        # The oldest day is evicted first.
+        self.assertNotIn(
+            usage_rule(1), {row.rule_id for row in overflow.items}
+        )
+        self.assertIn(
+            usage_rule(MAX_PATHS + 1),
+            {row.rule_id for row in overflow.items},
+        )
+
+    def test_duplicate_rows_and_bad_ids_are_refused(self):
+        row = WebsiteUsageStat(usage_rule(1), "2026-01-01", 1)
+        with self.assertRaises(ValueError):
+            WebsiteUsageState((row, row))
+        with self.assertRaises(ValueError):
+            WebsiteUsageStat("not-a-uuid", "2026-01-01", 1)
+
+
 if __name__ == "__main__":
     unittest.main()

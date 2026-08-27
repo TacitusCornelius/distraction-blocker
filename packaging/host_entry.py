@@ -32,6 +32,7 @@ READONLY_COMMANDS = frozenset({
 # Commands that carry payload fields; the field set is still pinned here.
 FIELD_COMMANDS = {
     "report_website_denials": frozenset({"command", "entries"}),
+    "report_website_usage": frozenset({"command", "entries"}),
 }
 
 

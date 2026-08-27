@@ -12,12 +12,22 @@ import sys
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Iterable
 
+from .canonical import format_utc
 from .control import ControlError, ControlState, RuleLock
-from .model import ManagedList, Policy, Rule, ValidationError
-from .schedule_view import ScheduleViewError, project_daily_schedule
-from .statistics import DenialBuffer, StatisticsState, WebsiteDenialState
+from .model import (
+    POLICY_SCHEMA_VERSION,
+    ManagedList,
+    Policy,
+    PolicyProjection,
+    Rule,
+    Target,
+    ValidationError,
+)
+from .schedule_view import ScheduleViewError, project_daily_schedule, system_timezone_name
+from .statistics import DenialBuffer, StatisticsState, WebsiteDenialState, WebsiteUsageState, validate_report_value
 
 
 def _authorization_now() -> float:
@@ -58,6 +68,8 @@ class BlockerService:
         self.controls = ControlState.empty()
         self._statistics = StatisticsState.empty()
         self._website_statistics = WebsiteDenialState.empty()
+        self._website_usage = WebsiteUsageState.empty()
+        self._cached_system_zone_name: str | None = None
         self._statistics_dirty = False
         self._last_statistics_persist = time.monotonic()
         self._last_statistics_error: str | None = None
@@ -96,8 +108,14 @@ class BlockerService:
         lists = {item.id: item for item in getattr(selected, "managed_lists", ())}
         now = self._now()
         trusted = bool(getattr(self.clock, "trusted", True))
+        # Breadcrumb (allowance seam): a budget-exhausted rule stays
+        # ACTIVE-BLOCKING regardless of schedule or exceptions until its
+        # local day resets, so its targets join the blocked set here.
+        exhausted = self._exhausted_rule_ids(selected)
         for rule in selected.rules:
-            if not rule.is_active(now, clock_trusted=trusted):
+            if not rule.enabled:
+                continue
+            if rule.id not in exhausted and not rule.is_active(now, clock_trusted=trusted):
                 continue
             active.append(rule)
             for target in rule.targets:
@@ -159,6 +177,114 @@ class BlockerService:
         except Exception:
             # Observational data can never degrade policy health.
             self._website_statistics = WebsiteDenialState.empty()
+
+    def _load_website_usage(self) -> None:
+        try:
+            loaded = self.store.load_website_usage()
+            if isinstance(loaded, WebsiteUsageState):
+                # Breadcrumb: lazy day reset — stale rows count as zero and
+                # are pruned here so no timer is ever needed.
+                self._website_usage = loaded.fresh(self._usage_day_for_rule_id)
+        except Exception:
+            # Observational data can never degrade policy health.
+            self._website_usage = WebsiteUsageState.empty()
+
+    def _system_zone_name(self) -> str:
+        """Return the cached IANA name of the host time zone."""
+        if self._cached_system_zone_name is None:
+            try:
+                self._cached_system_zone_name = system_timezone_name()
+            except ScheduleViewError:
+                # Breadcrumb: an unresolvable host zone must never break
+                # reporting; UTC keeps day bucketing deterministic.
+                self._cached_system_zone_name = "UTC"
+        return self._cached_system_zone_name
+
+    def _rule_zone_name(self, rule: Rule | None) -> str:
+        """Resolve one rule's day-bucket zone from its own schedule."""
+        if (
+            rule is not None
+            and rule.schedule.kind == "weekly"
+            and rule.schedule.timezone_name
+        ):
+            return rule.schedule.timezone_name
+        return self._system_zone_name()
+
+    def _local_day_text(self, zone_name: str) -> str:
+        try:
+            zone = ZoneInfo(zone_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            zone = timezone.utc
+        return self._now().astimezone(zone).date().isoformat()
+
+    def _usage_day_for_rule_id(
+        self, rule_id: str, policy: Policy | None = None
+    ) -> str | None:
+        selected = policy if policy is not None else self.policy
+        rule = next(
+            (
+                item
+                for item in selected.rules
+                if item.id == rule_id
+                and item.allowance_starts is not None
+                and all(
+                    target.kind in Target.URL_LIKE_KINDS
+                    for target in item.targets
+                )
+            ),
+            None,
+        ) if selected is not None else None
+        if rule is None:
+            return None
+        return self._local_day_text(self._rule_zone_name(rule))
+
+    def _pruned_website_usage(
+        self, policy: Policy | None = None
+    ) -> WebsiteUsageState:
+        return self._website_usage.fresh(
+            lambda rule_id: self._usage_day_for_rule_id(rule_id, policy)
+        )
+
+    def _exhausted_rule_ids(
+        self,
+        policy: Policy | None = None,
+        *,
+        usage: WebsiteUsageState | None = None,
+    ) -> frozenset[str]:
+        """Return enabled rules whose counted starts used up their budget.
+
+        Breadcrumb (allowance seam): these ids drive three views that must
+        agree — list_rules projection, daily-schedule projection, and
+        website-target blocking in _active_targets.
+        """
+        selected = policy if policy is not None else self.policy
+        if selected is None:
+            return frozenset()
+        current_usage = (
+            usage
+            if usage is not None
+            else self._pruned_website_usage(selected)
+        )
+        exhausted: set[str] = set()
+        for rule in selected.rules:
+            if not rule.enabled or rule.allowance_starts is None:
+                continue
+            day = self._local_day_text(self._rule_zone_name(rule))
+            if current_usage.count_for(rule.id, day) >= rule.allowance_starts:
+                exhausted.add(rule.id)
+        return frozenset(exhausted)
+
+    def _policy_projection(
+        self, policy: Policy | None = None
+    ) -> dict[str, Any]:
+        """Build the one strict projection shared by RPC and size checks."""
+        selected = policy if policy is not None else self.policy
+        if selected is None:
+            raise RuntimeError("service is not started")
+        return PolicyProjection.from_policy(
+            selected, self._exhausted_rule_ids(selected)
+        ).to_dict()
+
 
     @staticmethod
     def _event_path(event) -> str:
@@ -260,6 +386,9 @@ class BlockerService:
             self.policy = Policy.from_dict(self.policy)
         if not isinstance(self.controls, ControlState):
             self.controls = ControlState.from_dict(self.controls)
+        # Breadcrumb: usage staleness resolves per-rule time zones, so the
+        # load must wait until the policy (and its rules) is in memory.
+        self._load_website_usage()
         known_rules = {rule.id for rule in self.policy.rules}
         if any(lock.rule_id not in known_rules for lock in self.controls.locks):
             raise RuntimeError("protected lock refers to an unknown rule")
@@ -331,11 +460,15 @@ class BlockerService:
         policy = Policy.from_dict(policy_data)
         selected_controls = controls if controls is not None else self.controls
         self._validate_control_refs(policy, selected_controls)
+        projection = self._policy_projection(policy)
+        summaries = self._ok(
+            [self._list_summary(item) for item in policy.managed_lists]
+        )
         from .rpc import response_fits
-        listed = self._ok([rule.to_dict() for rule in policy.rules])
-        summaries = self._ok([self._list_summary(item) for item in policy.managed_lists])
-        if not response_fits(listed) or not response_fits(summaries):
-            raise ValidationError("too_large", "policy is too large for the service protocol")
+        if not response_fits(self._ok(projection)) or not response_fits(summaries):
+            raise ValidationError(
+                "too_large", "policy is too large for the service protocol"
+            )
         # Breadcrumb for reviewers: persist before exposing a weaker live
         # policy. A failed signed write must leave enforcement unchanged.
         self.store.save(
@@ -365,6 +498,19 @@ class BlockerService:
         return rule.is_active(now, clock_trusted=trusted)
 
     @staticmethod
+    def _weakened_allowance(old: Rule, new: Rule) -> bool:
+        # Breadcrumb: an allowance increase, including None to a finite
+        # allowance, is a weakening under the policy change contract.
+        return (
+            old.allowance_starts is None
+            and new.allowance_starts is not None
+        ) or (
+            old.allowance_starts is not None
+            and new.allowance_starts is not None
+            and new.allowance_starts > old.allowance_starts
+        )
+
+    @staticmethod
     def _weakened_change(old: Rule, new: Rule) -> bool:
         old_targets = {(target.kind, target.value) for target in old.targets}
         new_targets = {(target.kind, target.value) for target in new.targets}
@@ -372,6 +518,7 @@ class BlockerService:
             old.enabled and not new.enabled
             or not old_targets <= new_targets
             or old.schedule.to_dict() != new.schedule.to_dict()
+            or BlockerService._weakened_allowance(old, new)
         )
 
     def _has_grant(self, uid: int, rule_id: str) -> bool:
@@ -437,6 +584,8 @@ class BlockerService:
             return None
         if not new.enabled:
             return "active rule cannot be disabled"
+        if self._weakened_allowance(old, new):
+            return "active rule allowance cannot be weakened"
         old_targets = {(target.kind, target.value) for target in old.targets}
         new_targets = {(target.kind, target.value) for target in new.targets}
         if not old_targets <= new_targets:
@@ -444,7 +593,10 @@ class BlockerService:
         if old.schedule.kind != new.schedule.kind:
             return "active rule cannot shorten schedule"
         if old.schedule.kind == "one_time":
-            if new.schedule.start_utc > old.schedule.start_utc or new.schedule.end_utc < old.schedule.end_utc:
+            if (
+                new.schedule.start_utc > old.schedule.start_utc
+                or new.schedule.end_utc < old.schedule.end_utc
+            ):
                 return "active rule cannot shorten schedule"
         elif old.schedule.to_dict() != new.schedule.to_dict():
             return "active recurring schedule cannot be changed"
@@ -573,6 +725,7 @@ class BlockerService:
         if self.policy is None:
             raise RuntimeError("service is not started")
         imported = Policy.from_dict({
+            "schema_version": POLICY_SCHEMA_VERSION,
             "revision": self.policy.revision,
             "rules": raw_rules,
             "managed_lists": [
@@ -858,14 +1011,8 @@ class BlockerService:
             ],
             "schedule": {
                 "kind": "one_time",
-                "start_utc": now.isoformat(
-                    timespec="microseconds"
-                ).replace("+00:00", "Z"),
-                "end_utc": (
-                    now + timedelta(minutes=minutes)
-                ).isoformat(timespec="microseconds").replace(
-                    "+00:00", "Z"
-                ),
+                "start_utc": format_utc(now),
+                "end_utc": format_utc(now + timedelta(minutes=minutes)),
             },
             "revision": 0,
         })
@@ -896,7 +1043,10 @@ class BlockerService:
             )
         try:
             intervals = project_daily_schedule(
-                self.policy.rules, local_day, timezone_name
+                self.policy.rules,
+                local_day,
+                timezone_name,
+                exhausted_rule_ids=self._exhausted_rule_ids(),
             )
         except (ScheduleViewError, ValidationError, ValueError) as error:
             return self._error("bad_value", str(error))
@@ -926,8 +1076,6 @@ class BlockerService:
 
     def _parse_native(self, value: Any) -> Policy:
         if isinstance(value, dict):
-            if "policy" in value:
-                value = value["policy"]
             # Version 1 files use an envelope and omit managed_lists.
             if (
                 isinstance(value, dict)
@@ -1156,7 +1304,13 @@ class BlockerService:
         # listing stay available even when enforcement is unhealthy.
         "list_website_stats": ((frozenset({"command"}),), "unknown command field", "_cmd_list_website_stats"),
         "report_website_denials": ((frozenset({"command", "entries"}),), "entries is required", "_cmd_report_website_denials"),
+        "report_website_usage": ((frozenset({"command", "entries"}),), "entries is required", "_cmd_report_website_usage"),
+
     }
+    def _cmd_list_rules(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        # Breadcrumb: the same projection is returned and size-checked by
+        # _save, so an accepted policy always fits the RPC response frame.
+        return self._ok(self._policy_projection())
 
     # Refused while enforcement is unhealthy. The gate runs before field
     # validation, exactly as the previous if-chain ordered it.
@@ -1197,8 +1351,6 @@ class BlockerService:
             request["timezone"], request["date"]
         )
 
-    def _cmd_list_rules(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
-        return self._ok([rule.to_dict() for rule in self.policy.rules])
 
     def _cmd_list_locks(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         return self._ok(list(self.controls.summaries(
@@ -1228,7 +1380,87 @@ class BlockerService:
         )
 
     def _cmd_list_website_stats(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
-        return self._ok(self._website_statistics.to_dict())
+        result = self._website_statistics.to_dict()
+        # Additive projection: today's per-rule usage versus its allowance.
+        usage = self._pruned_website_usage()
+        exhausted = self._exhausted_rule_ids(usage=usage)
+        usage_rows = []
+        for rule in self.policy.rules:
+            day = self._local_day_text(self._rule_zone_name(rule))
+            count = usage.count_for(rule.id, day)
+            if rule.allowance_starts is None and count == 0:
+                continue
+            usage_rows.append({
+                "rule_id": rule.id,
+                "day": day,
+                "count": count,
+                "allowance_starts": rule.allowance_starts,
+                "budget_exhausted": rule.id in exhausted,
+            })
+        result["usage"] = usage_rows
+        from .rpc import response_fits
+        while result["items"] and not response_fits(self._ok(result)):
+            result["items"].pop()
+        if not response_fits(self._ok(result)):
+            return self._error(
+                "too_large", "website statistics response is too large"
+            )
+        return self._ok(result)
+
+    def _cmd_report_website_usage(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        entries = request["entries"]
+        if not isinstance(entries, list) or not entries or len(entries) > 128:
+            return self._error(
+                "bad_request", "entries must be a list of 1 to 128 items"
+            )
+        state = self._pruned_website_usage()
+        try:
+            for entry in entries:
+                if not isinstance(entry, dict) or set(entry) != {
+                    "rule_id",
+                    "value",
+                    "count",
+                }:
+                    raise ValidationError("bad_value", "entry fields are invalid")
+                rule_id = entry["rule_id"]
+                value = entry["value"]
+                count = entry["count"]
+                if (
+                    isinstance(rule_id, bool)
+                    or not isinstance(rule_id, str)
+                    or isinstance(value, bool)
+                    or not isinstance(value, str)
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                ):
+                    raise ValidationError("bad_type", "entry types are invalid")
+                day = self._usage_day_for_rule_id(rule_id)
+                if day is None:
+                    raise ValidationError(
+                        "bad_value",
+                        "rule ID is not eligible for website usage",
+                    )
+                # Breadcrumb: validate the whole batch before assigning state,
+                # so an unknown row cannot evict a real allowance counter.
+                try:
+                    validate_report_value(value)
+                    state = state.record(rule_id, count, day)
+                except (TypeError, ValueError) as error:
+                    raise ValidationError("bad_value", str(error)) from error
+        except ValidationError as error:
+            return self._error(error.code, error.message)
+        accepted = len(state.items)
+        dropped = state.dropped
+        self._website_usage = state
+        try:
+            self.store.save_website_usage(state)
+        except Exception:
+            # Observational writes never block or fail the report.
+            pass
+        # Breadcrumb: the report may push a rule past its allowance, so
+        # enforcement re-projects immediately instead of waiting for tick().
+        self._reconcile()
+        return self._ok({"accepted": accepted, "dropped": dropped})
 
     def _cmd_report_website_denials(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         entries = request["entries"]
@@ -1334,7 +1566,7 @@ class BlockerService:
                 raise ValidationError("bad_request", "list metadata fields are invalid")
             metadata = {
                 **metadata,
-                "imported_utc": self._now().isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "imported_utc": format_utc(self._now()),
             }
             ManagedList.from_dict({**metadata, "domains": []})
         except ValidationError as error:
@@ -1509,8 +1741,14 @@ class BlockerService:
     def _cmd_clear_clock_latch(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         if uid != 0:
             return self._error("forbidden", "root access is required")
+        # Breadcrumb: the clock is injectable, so a substitute without
+        # clear_latch must read as "unavailable" instead of raising
+        # AttributeError past _serve_connection and stopping the service.
+        clear_latch = getattr(self.clock, "clear_latch", None)
+        if not callable(clear_latch):
+            return self._error("unavailable", "clock recovery is not available")
         try:
-            recovered = self.clock.clear_latch()
+            recovered = clear_latch()
         except RuntimeError as error:
             return self._error("clock_untrusted", str(error))
         return self._ok({"clock_trusted": True, "time_utc": recovered.isoformat()})
@@ -1584,12 +1822,21 @@ def main(argv=None) -> int:
     parser.add_argument("--owner-uid", type=int)
     args = parser.parse_args(argv)
     try:
-        owner_uid = args.owner_uid if args.owner_uid is not None else _read_owner_uid(args.data_dir)
+        if args.owner_uid is not None:
+            # Breadcrumb for reviewers: --owner-uid is an operator override
+            # that skips every protection _read_owner_uid enforces on the
+            # owner.uid file (root-owned regular file, mode 0600, <=32 bytes).
+            # main() already requires root, so we only mirror the value checks
+            # _read_owner_uid applies to the parsed number: positive and
+            # within 1..2**31-1. The file path stays the default.
+            owner_uid = args.owner_uid
+            if owner_uid <= 0 or owner_uid > 2**31 - 1:
+                print("The service needs the configured user UID.")
+                return 1
+        else:
+            owner_uid = _read_owner_uid(args.data_dir)
     except (OSError, ValueError):
         print("The service needs a protected owner UID file.")
-        return 1
-    if owner_uid <= 0:
-        print("The service needs the configured user UID.")
         return 1
     store = ProtectedStore(args.data_dir)
     store.initialize()

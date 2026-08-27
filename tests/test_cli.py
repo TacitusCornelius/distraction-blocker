@@ -87,6 +87,64 @@ class CommandImportTests(unittest.TestCase):
         self.assertIn("Active websites: 2", output)
         self.assertFalse(any(line.startswith("{") for line in output))
 
+    def test_rules_human_output_reads_policy_projection(self) -> None:
+        from distraction_blocker import cli
+
+        class FakeClient:
+            def request(self, command, **_fields):
+                self.call = command
+                return {
+                    "schema_version": 1,
+                    "revision": 4,
+                    "rules": [{
+                        "id": "11111111-1111-4111-8111-111111111111",
+                        "name": "Focus",
+                        "enabled": True,
+                        "targets": [
+                            {"kind": "website", "value": "example.com"}
+                        ],
+                        "schedule": {"kind": "indefinite"},
+                        "revision": 0,
+                        "budget_exhausted": False,
+                    }],
+                }
+
+        output = []
+        result = cli.main(["rules"], client=FakeClient(), output=output.append)
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            output,
+            [
+                "11111111-1111-4111-8111-111111111111  "
+                "Focus  enabled  indefinite"
+            ],
+        )
+
+    def test_rules_reject_invalid_projection_before_any_output(self) -> None:
+        from distraction_blocker import cli
+
+        class FakeClient:
+            def request(self, command, **_fields):
+                return {
+                    "schema_version": True,
+                    "revision": 0,
+                    "rules": [],
+                }
+
+        for argv in (["rules"], ["--json", "rules"]):
+            with self.subTest(argv=argv):
+                output: list[str] = []
+                errors: list[str] = []
+                result = cli.main(
+                    argv,
+                    client=FakeClient(),
+                    output=output.append,
+                    error=errors.append,
+                )
+                self.assertEqual(result, 1)
+                self.assertEqual(output, [])
+                self.assertTrue(errors)
+
     def test_password_lock_uses_hidden_input(self) -> None:
         from distraction_blocker import cli
 
@@ -143,6 +201,12 @@ class CommandImportTests(unittest.TestCase):
                 class FakeClient:
                     def request(self, command, **fields):
                         self.call = (command, fields)
+                        if command == "list_rules":
+                            return {
+                                "schema_version": 1,
+                                "revision": 0,
+                                "rules": [],
+                            }
                         return {}
 
                 fake = FakeClient()

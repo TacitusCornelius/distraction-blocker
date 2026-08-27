@@ -46,6 +46,38 @@ class ExtensionCoreSyncTests(unittest.TestCase):
                 versions.add(json.loads(manifest.read_text())["version"])
         self.assertEqual(len(versions), 1, f"manifest versions diverge: {versions}")
 
+    def test_chromium_manifest_key_matches_packaged_extension_id(self):
+        # Breadcrumb: Chromium derives the extension id from the manifest
+        # "key" (SHA-256 over the DER SPKI, first 16 bytes), while the native
+        # messaging policy in packaging/ hardcodes that id in allowed_origins.
+        # Nothing else couples them, so this test fails loudly when either
+        # side changes alone.
+        import base64
+        import hashlib
+        import json
+
+        manifest = json.loads(
+            (self.root / "extension" / "chromium" / "manifest.json").read_text()
+        )
+        spki = base64.b64decode(manifest["key"])
+        digest = hashlib.sha256(spki).hexdigest()[:32]
+        # Breadcrumb: Chromium spells each hex digit in the a-p alphabet
+        # (0-f map to a-p rather than literal hex text), and native
+        # messaging origins embed the compact undashed form.
+        extension_id = "".join(chr(ord("a") + int(digit, 16)) for digit in digest)
+        policy = json.loads(
+            (
+                self.root / "packaging" / "org.distraction_blocker.chromium.json"
+            ).read_text()
+        )
+        origins = policy["allowed_origins"]
+        self.assertEqual(len(origins), 1, f"unexpected origin count: {origins}")
+        self.assertEqual(origins[0], f"chrome-extension://{extension_id}/*")
+        # Breadcrumb: Chromium-flavored builds (Chrome for Testing) match on
+        # allowed_extensions instead; both must pin the same id.
+        extensions = policy.get("allowed_extensions")
+        self.assertEqual(extensions, [f"{extension_id}/*"])
+
 
 if __name__ == "__main__":
     unittest.main()
