@@ -15,7 +15,7 @@ function event() {
 test("Chromium attributes DNR matches seen during worker startup", async () => {
   globalThis.setTimeout = () => ({ unref() {} });
   const policy = {
-    schema_version: 4,
+    schema_version: 5,
     revision: 1,
     rules: [{
       id: "old",

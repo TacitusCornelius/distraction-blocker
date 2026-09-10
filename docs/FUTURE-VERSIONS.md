@@ -127,13 +127,13 @@ A local DNS service remains a possible long-term design. Large `/etc/hosts` sect
 
 ### Other version 1.2 features
 
-- Five small offline starter categories.
+- Seven small offline starter categories, including Video and YouTube.
 - Up to 16 weekly periods for one rule.
 - Quick focus timers that copy existing rule targets.
-- Start and end notifications while the GUI runs.
-- A daily schedule overview in the system time zone.
+- Per-rule notification controls for rule-state and upcoming-change alerts.
 
-Notifications only report observed state. They never control enforcement.
+Notifications report only the categories selected on each rule. They never
+control enforcement.
 
 ## Version 1.3
 
@@ -141,8 +141,9 @@ Version 1.3 is built. It adds stricter sessions and observational activity data.
 
 ### Rule locks
 
-The root service enforces timed, friction, and password locks.
+The root service enforces weekly schedule, timed, friction, and password locks.
 
+- A schedule lock is effective automatically during active periods of a weekly rule.
 - A timed lock can last up to 366 days.
 - An untrusted clock keeps a timed lock effective.
 - A friction challenge uses 12 service-generated characters.
@@ -201,7 +202,7 @@ The next feature cycle is built:
 
 - Chromium inactive-tab blocking uses a session DNR rule with inactive tab
   IDs. Tab events replace the rule.
-- Policy projections include `schema_version: 4` and `revision`. Firefox,
+- Policy projections include `schema_version: 5` and `revision`. Firefox,
   Chromium, the GUI, and the CLI reject an unsupported projection.
 
 The root service must remain the final policy authority.
@@ -275,6 +276,113 @@ The tray launcher requires Ubuntu's
 `gir1.2-ayatanaappindicator3-0.1` package because GTK 4 does not provide a
 cross-desktop system tray API. Scheduled shutdown remains separate from normal
 blocking rules because it can cause data loss.
+
+## Version 1.4
+
+Version 1.4 adds timed allowances and Delay locks as separate controls.
+Timed allowances govern automatic permitted browsing time inside an active rule
+period. Delay is an explicit, temporary pause requested by the user. Delay does
+not change the saved policy.
+
+
+
+### Timed allowances
+
+The first implementation supports elapsed-time allowances only for
+browser-enforced URL targets:
+
+- `url_path`
+- `url_wildcard`
+- `url_keyword`
+- YouTube video and channel targets
+
+Application, `/etc/hosts` website, network, and mixed-target rules do not
+receive timed allowances until the corresponding enforcement layer can provide
+a trustworthy foreground-time signal. Existing daily start allowances remain
+unchanged and are not reinterpreted as elapsed time.
+
+For a weekly schedule, each concrete period occurrence receives its own
+allowance. A period that lists several weekdays therefore has an independent
+budget on each weekday. A period with no allowance is strict: it blocks for
+the entire active period. Unused time never carries forward.
+
+The initial allowance modes are:
+
+- strict;
+- one total duration per period occurrence;
+- a fixed refill window, such as 10 minutes in each 60-minute bucket,
+  anchored at the occurrence's local start.
+
+Rolling windows and week/month refill scopes are deferred until the fixed
+window behavior is proven. A rule-level daily cap is supported as a hard
+ceiling across all allowance-enabled periods. It resets at local midnight in
+the rule's schedule time zone, and the effective remaining time is the
+smaller of the applicable period budget and the remaining daily cap.
+
+Timed allowances reject overlapping weekly periods because the existing
+continuous-block behavior cannot identify which independent budget should
+consume overlapping time. Allowance usage is measured in elapsed UTC seconds,
+while period occurrences and daily reset boundaries are derived from the
+schedule's IANA time zone. DST transitions and cross-midnight periods must
+remain deterministic.
+The Phase 2 pure engine resolves allowance boundaries on the UTC timeline.
+Ambiguous local boundary times use their earlier UTC occurrence. A nonexistent
+local boundary moves forward through the DST gap to the first representable
+local time. Usage reports are half-open intervals; overlapping or retried
+reports count once, and time reported after the evaluation instant is ignored.
+Budget consumption is rounded up to whole seconds so sub-second reports cannot
+grant extra time.
+
+
+The root service owns the budget. Browser adapters count only the focused
+window's active tab while the user is non-idle and the URL matches the
+allowance rule. They use short-lived service-issued leases and retry-safe
+reports so multiple browser clients cannot independently spend the same
+remaining budget. Browser-extension tampering remains outside the existing
+extension protection boundary.
+The Phase 3 service ledger stores accepted usage intervals in a separate
+signed state file. Browser adapters request leases of up to 30 seconds and
+must report an interval inside the issued lease. The service reserves live
+leases across all clients, accepts each report ID at most once, persists a
+report before re-projecting enforcement, and rejects reports that would
+exceed either the active period budget or the daily cap. Expired leases do
+not consume budget.
+
+
+### Delay
+
+A Delay lock has two configured durations:
+
+- a wait duration for the countdown;
+- a fixed break duration from 1 minute through 1440 minutes.
+
+The user can request a break only while the locked rule is active. The root
+service records the request, keeps the rule enforced during the countdown,
+and starts the fixed-duration break automatically when the countdown ends.
+Repeated requests return the existing countdown; they cannot reset or shorten
+it. Canceling a pending request is allowed because it strengthens
+enforcement.
+
+Pending and active break state is root-owned and persisted, so closing the GUI
+or restarting the service cannot bypass the Delay. Countdown and expiry use
+the trusted-clock behavior already required by finite schedules and timed
+locks; an untrusted clock fails closed.
+
+A break applies to the requested rule only. Other rules that match the same
+target continue to enforce. A break is a separate manual pause: it does not
+refill or modify automatic allowance budgets and is reported separately.
+Global breaks and rolling allowance windows are not part of this contract.
+
+Both features are additive policy changes. The existing `allowance_starts`
+field and behavior remain compatible. New policy and protected-runtime-state
+schema versions must be introduced only with strict migration and capability
+checks for browser adapters that understand timed allowances and break
+overrides.
+
+These contracts define the Version 1.4 behavior. Any change to target scope,
+overlap handling, break scope, clock behavior, or allowance accounting requires
+updating this contract before source changes.
+
 
 ## Sources
 

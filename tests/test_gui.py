@@ -36,10 +36,15 @@ from distraction_blocker.gui import (
     detect_rule_transitions,
     duplicate_rule,
     filter_rules,
+    sort_rules,
     form_to_request,
     form_to_rule,
     _target_summary,
+    delay_lock_request,
+    request_delay_break_request,
+    cancel_delay_break_request,
     friction_lock_request,
+    schedule_lock_request,
     import_preview_text,
     load_gtk,
     lock_summaries_from_results,
@@ -426,6 +431,7 @@ class FormConversionTests(unittest.TestCase):
         )
 
     def test_form_rejects_unknown_network_control(self) -> None:
+
         form = RuleForm(
             name="Bad",
             websites=(),
@@ -438,6 +444,24 @@ class FormConversionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(FormError, "network control"):
             form_to_request(form, id_factory=lambda: UUID(RULE_ID))
+    def test_rule_notification_settings_round_trip_through_form(self) -> None:
+        form = RuleForm(
+            name="Quiet",
+            websites=("example.com",),
+            applications=(),
+            managed_list_ids=(),
+            schedule_kind="indefinite",
+            timezone="UTC",
+            notifications_enabled=False,
+            notification_categories=("state_changes",),
+        )
+        rule = form_to_rule(form, id_factory=lambda: UUID(RULE_ID))
+        self.assertFalse(rule.notifications_enabled)
+        self.assertEqual(rule.notification_categories, ("state_changes",))
+        self.assertEqual(
+            rule_to_form(rule, "UTC").notification_categories,
+            ("state_changes",),
+        )
 
     def test_allowance_is_rejected_for_network_targets(self) -> None:
         form = RuleForm(
@@ -491,7 +515,11 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor.application_paths = []
         editor._render_applications = lambda: None
         editor.url_targets = []
-        editor._render_url_targets = lambda: None
+        editor.url_exceptions = []
+        rendered_urls = []
+        editor._render_url_targets = lambda: rendered_urls.append(
+            (tuple(editor.url_targets), tuple(editor.url_exceptions))
+        )
         editor.managed_list_checks = {}
         editor.network_checks = {}
         editor.schedule_dropdown = Dropdown()
@@ -503,6 +531,13 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor._remove_weekly_period = editor.weekly_rows.remove
         editor._add_weekly_period = editor.weekly_rows.append
         weekly = make_rule(
+            targets=[
+                {"kind": "website", "value": "example.com"},
+                {"kind": "url_path", "value": "example.com/feed"},
+            ],
+            exceptions=[
+                {"kind": "url_path", "value": "example.com/allowed"},
+            ],
             schedule={
                 "kind": "weekly",
                 "timezone": "UTC",
@@ -516,6 +551,13 @@ class StoredRuleEditorTests(unittest.TestCase):
         indefinite = make_rule(schedule={"kind": "indefinite"})
 
         editor._populate(rule_to_form(weekly, "UTC"))
+        self.assertEqual(
+            rendered_urls[0],
+            (
+                ({"kind": "url_path", "value": "example.com/feed"},),
+                ({"kind": "url_path", "value": "example.com/allowed"},),
+            ),
+        )
         editor._populate(rule_to_form(indefinite, "UTC"))
 
         self.assertEqual(editor.weekly_rows, [])
@@ -715,11 +757,41 @@ class ScheduleProjectionTests(unittest.TestCase):
             ),
             "Break",
         )
-        self.assertIn(
-            "cannot be weakened before",
+        self.assertEqual(
             active_lock_explanation(
                 rule, datetime(2026, 8, 14, 9, 10, tzinfo=UTC), True
             ),
+            "",
+        )
+
+    def test_active_lock_explanation_requires_effective_lock(self) -> None:
+        now = datetime(2026, 8, 14, 9, 10, tzinfo=UTC)
+        weekly = make_rule(
+            schedule={
+                "kind": "weekly",
+                "timezone": "UTC",
+                "periods": [
+                    {"weekdays": [4], "start": "09:00", "end": "10:00"}
+                ],
+            }
+        )
+        self.assertEqual(active_lock_explanation(weekly, now, True), "")
+        schedule_lock = LockSummary(RULE_ID, "schedule", True, None, None)
+        self.assertIn(
+            "This locked rule cannot be weakened before",
+            active_lock_explanation(weekly, now, True, schedule_lock),
+        )
+        friction_lock = LockSummary(RULE_ID, "friction", True, None, None)
+        self.assertEqual(
+            active_lock_explanation(weekly, now, True, friction_lock),
+            "This rule cannot be weakened before friction authorization is completed.",
+        )
+        untrusted = active_lock_explanation(
+            weekly, now, False, schedule_lock
+        )
+        self.assertEqual(
+            untrusted,
+            "This locked rule remains effective until the trusted clock is restored.",
         )
 
     def test_daily_projection_contains_only_pomodoro_work_intervals(self) -> None:
@@ -959,6 +1031,59 @@ class ServiceResultTests(unittest.TestCase):
             lock_summaries_from_results(
                 ({**friction, "until_utc": timed["until_utc"]},)
             )
+
+    def test_schedule_lock_summary_and_request(self) -> None:
+        item = {
+            "rule_id": RULE_ID,
+            "kind": "schedule",
+            "locked": True,
+            "until_utc": None,
+            "retry_after_utc": None,
+        }
+        summary = lock_summaries_from_results((item,))[0]
+        self.assertEqual(
+            lock_summary_text(summary, "UTC"),
+            "Schedule lock: active during the rule's weekly periods.",
+        )
+        self.assertEqual(
+            schedule_lock_request(RULE_ID),
+            {"rule_id": RULE_ID, "lock": {"kind": "schedule"}},
+        )
+    def test_delay_lock_summary_and_requests(self) -> None:
+        item = {
+            "rule_id": RULE_ID,
+            "kind": "delay",
+            "locked": True,
+            "until_utc": None,
+            "retry_after_utc": None,
+            "wait_seconds": 60,
+            "break_seconds": 1800,
+            "pending_until_utc": "2026-08-14T16:01:00Z",
+            "break_until_utc": None,
+        }
+        summary = lock_summaries_from_results((item,))[0]
+        self.assertEqual(summary.wait_seconds, 60)
+        self.assertIn("Countdown ends", lock_summary_text(summary, "UTC"))
+        self.assertEqual(
+            delay_lock_request(RULE_ID, 60, 1800),
+            {
+                "rule_id": RULE_ID,
+                "lock": {
+                    "kind": "delay",
+                    "wait_seconds": 60,
+                    "break_seconds": 1800,
+                },
+            },
+        )
+        self.assertEqual(request_delay_break_request(RULE_ID), {"rule_id": RULE_ID})
+        self.assertEqual(cancel_delay_break_request(RULE_ID), {"rule_id": RULE_ID})
+        with self.assertRaisesRegex(FormError, "Delay"):
+            delay_lock_request(RULE_ID, 0, 1800)
+        with self.assertRaisesRegex(FormError, "state"):
+            lock_summaries_from_results(
+                ({**item, "break_until_utc": item["pending_until_utc"]},)
+            )
+
 
     def test_rule_lock_requests_cover_all_kinds_and_removal(self) -> None:
         password = "correct horse"
@@ -1354,6 +1479,17 @@ class ExistingWorkflowTests(unittest.TestCase):
         text = import_preview_text(preview)
         self.assertIn("Accepted domains: 1", text)
         self.assertIn("Line 9", text)
+    def test_rule_sort_options_are_deterministic(self) -> None:
+        first = make_rule(name="Zulu")
+        second = make_rule(rule_id=SECOND_RULE_ID, name="alpha", enabled=False)
+
+        self.assertEqual(sort_rules((first, second), "recent"), (second, first))
+        self.assertEqual(
+            sort_rules((first, second), "name_asc"), (second, first)
+        )
+        self.assertEqual(
+            sort_rules((first, second), "name_desc"), (first, second)
+        )
 
 
 
@@ -1429,6 +1565,73 @@ class WebsiteUsageViewTests(unittest.TestCase):
         )
         self.assertEqual(snapshot.exhausted_rule_ids, {RULE_ID})
 
+
+
+class NotificationDispatchTests(unittest.TestCase):
+    def test_upcoming_notifications_follow_per_rule_categories(self) -> None:
+        from distraction_blocker.gui import GuiController
+
+        class Notification:
+            def __init__(self, title):
+                self.title = title
+
+            @classmethod
+            def new(cls, title):
+                return cls(title)
+
+            def set_body(self, body):
+                self.body = body
+
+        Gio = type("Gio", (), {"Notification": Notification})
+
+        class Application:
+            def __init__(self):
+                self.sent = []
+
+            def send_notification(self, notification_id, notification):
+                self.sent.append((notification_id, notification))
+
+        controller = GuiController.__new__(GuiController)
+        controller.Gio = Gio
+        controller.application = Application()
+        controller._warning_keys = set()
+        now = datetime(2026, 8, 14, 9, 0, tzinfo=UTC)
+        base = make_rule(
+            schedule={
+                "kind": "one_time",
+                "start_utc": "2026-08-14T09:00:00Z",
+                "end_utc": "2026-08-14T09:05:00Z",
+            }
+        )
+        disabled = Rule.from_dict({
+            **base.to_dict(),
+            "notifications": {
+                "enabled": False,
+                "categories": ["upcoming_changes"],
+            },
+        })
+        controller._send_advance_notifications((disabled,), now, True)
+        self.assertEqual(controller.application.sent, [])
+
+        state_only = Rule.from_dict({
+            **base.to_dict(),
+            "notifications": {
+                "enabled": True,
+                "categories": ["state_changes"],
+            },
+        })
+        controller._send_advance_notifications((state_only,), now, True)
+        self.assertEqual(controller.application.sent, [])
+
+        upcoming = Rule.from_dict({
+            **base.to_dict(),
+            "notifications": {
+                "enabled": True,
+                "categories": ["upcoming_changes"],
+            },
+        })
+        controller._send_advance_notifications((upcoming,), now, True)
+        self.assertEqual(len(controller.application.sent), 1)
 
 if __name__ == "__main__":
     unittest.main()

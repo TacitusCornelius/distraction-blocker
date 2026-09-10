@@ -3,10 +3,11 @@ import hmac
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from distraction_blocker.control import ControlState, RuleLock
+from distraction_blocker.allowance import AllowanceUsageReport, AllowanceUsageState
+from distraction_blocker.control import ControlState, DelayBreak, DelayBreakState, RuleLock
 from distraction_blocker.model import POLICY_SCHEMA_VERSION, Policy
 from distraction_blocker.statistics import (
     StatisticsState,
@@ -34,6 +35,23 @@ class StorageTests(unittest.TestCase):
                 POLICY_SCHEMA_VERSION,
             )
             self.assertNotIn("controls", envelope["payload"]["policy"])
+    def test_signed_allowance_usage_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            report = AllowanceUsageReport(
+                "22345678-1234-5678-9234-567812345678",
+                "12345678-1234-5678-9234-567812345678",
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+                datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc),
+            )
+            state = AllowanceUsageState.empty().record(report)
+            store.save_allowance_usage(state)
+            self.assertEqual(store.load_allowance_usage(), state)
+            self.assertEqual(
+                Path(directory, "allowance-usage.json").stat().st_mode & 0o777,
+                0o600,
+            )
+
 
     def test_bad_primary_recovers_backup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -148,6 +166,36 @@ class StorageTests(unittest.TestCase):
             rewritten = json.loads(Path(directory, "policy.json").read_text())
             self.assertEqual(rewritten["version"], 7)
 
+    def test_current_envelope_migrates_previous_policy_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            store.initialize()
+            old_policy = Policy(4, ()).to_dict()
+            old_policy["schema_version"] = 4
+            payload = {
+                "clock_untrusted": False,
+                "high_water_utc": None,
+                "policy": old_policy,
+                "controls": ControlState.empty().to_dict(),
+            }
+            unsigned = {"version": ProtectedStore.VERSION, "payload": payload}
+            envelope = {
+                **unsigned,
+                "hmac": hmac.new(
+                    b"k" * 32,
+                    store._canonical(unsigned),
+                    hashlib.sha256,
+                ).hexdigest(),
+            }
+            Path(directory, "policy.json").write_bytes(store._canonical(envelope))
+            result = store.load()
+            self.assertEqual(result.policy.schema_version, POLICY_SCHEMA_VERSION)
+            rewritten = json.loads(Path(directory, "policy.json").read_text())
+            self.assertEqual(
+                rewritten["payload"]["policy"]["schema_version"],
+                POLICY_SCHEMA_VERSION,
+            )
+
     def test_network_policy_round_trips_through_signed_storage(self):
         # Breadcrumb: network targets are root policy data; the signed
         # envelope must carry them intact across save and load.
@@ -241,6 +289,28 @@ class StorageTests(unittest.TestCase):
             path.write_bytes(store._canonical(envelope))
             with self.assertRaises(StorageError):
                 store.load_website_statistics()
+
+    def test_delay_break_state_round_trip_and_bad_signature_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            state = DelayBreakState(items=(
+                DelayBreak(
+                    "12345678-1234-5678-9234-567812345678",
+                    now,
+                    now + timedelta(minutes=1),
+                    600,
+                ),
+            ))
+            store.save_delay_breaks(state)
+            self.assertEqual(store.load_delay_breaks(), state)
+            path = Path(directory, "delay-breaks.json")
+            envelope = json.loads(path.read_text())
+            self.assertEqual(envelope["version"], 1)
+            envelope["hmac"] = "0" * 64
+            path.write_bytes(store._canonical(envelope))
+            with self.assertRaises(StorageError):
+                store.load_delay_breaks()
 
     def test_missing_statistics_is_empty_and_bad_signature_refuses(self):
         with tempfile.TemporaryDirectory() as directory:

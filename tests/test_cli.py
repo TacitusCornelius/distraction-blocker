@@ -96,7 +96,7 @@ class CommandImportTests(unittest.TestCase):
             def request(self, command, **_fields):
                 self.call = command
                 return {
-                    "schema_version": 4,
+                    "schema_version": 5,
                     "revision": 4,
                     "rules": [{
                         "id": "11111111-1111-4111-8111-111111111111",
@@ -192,9 +192,22 @@ class CommandImportTests(unittest.TestCase):
                 "set_rule_lock",
                 {"rule_id": rule_id, "lock": {"kind": "friction"}},
             )),
-            (["clear-lock", rule_id], (
+            (["lock-delay", rule_id, "5", "15"], (
                 "set_rule_lock",
-                {"rule_id": rule_id, "lock": {"kind": "none"}},
+                {
+                    "rule_id": rule_id,
+                    "lock": {
+                        "kind": "delay",
+                        "wait_seconds": 300,
+                        "break_seconds": 900,
+                    },
+                },
+            )),
+            (["delay-break", rule_id], (
+                "request_delay_break", {"rule_id": rule_id}
+            )),
+            (["cancel-delay-break", rule_id], (
+                "cancel_delay_break", {"rule_id": rule_id}
             )),
         )
 
@@ -205,7 +218,7 @@ class CommandImportTests(unittest.TestCase):
                         self.call = (command, fields)
                         if command == "list_rules":
                             return {
-                                "schema_version": 4,
+                                "schema_version": 5,
                                 "revision": 0,
                                 "rules": [],
                             }
@@ -300,6 +313,180 @@ class CommandImportTests(unittest.TestCase):
             output,
             ['{"date":"2026-08-20","intervals":[],"timezone":"UTC"}'],
         )
+
+class ManagedListCommandTests(unittest.TestCase):
+    def test_create_uploads_custom_roster_atomically(self) -> None:
+        from datetime import datetime, timezone
+
+        from distraction_blocker import cli
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, command, **fields):
+                self.calls.append((command, fields))
+                if command == "begin_list_import":
+                    return {"import_id": "custom-stage"}
+                if command == "commit_list_import":
+                    return {
+                        "id": fields.get("list_id", ""),
+                        "name": "Video",
+                        "domain_count": 2,
+                    }
+                return {"received": len(fields.get("domains", []))}
+
+        fake = FakeClient()
+        result = cli.main(
+            [
+                "--json",
+                "managed-lists",
+                "create",
+                "--name",
+                "Video",
+                "--domains",
+                "youtube.com, vimeo.com",
+            ],
+            client=fake,
+            now=lambda: datetime(2026, 8, 20, tzinfo=timezone.utc),
+            output=lambda _text: None,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [command for command, _fields in fake.calls],
+            ["begin_list_import", "import_list_chunk", "commit_list_import"],
+        )
+        metadata = fake.calls[0][1]["metadata"]
+        self.assertEqual(
+            {key for key in metadata},
+            {"id", "name", "source", "version", "license"},
+        )
+        self.assertEqual(metadata["name"], "Video")
+        self.assertEqual(
+            fake.calls[1][1]["domains"],
+            ["youtube.com", "vimeo.com"],
+        )
+
+    def test_edit_replaces_roster_and_preserves_metadata_by_default(self) -> None:
+        from datetime import datetime, timezone
+
+        from distraction_blocker import cli
+
+        list_id = "11111111-1111-4111-8111-111111111111"
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, command, **fields):
+                self.calls.append((command, fields))
+                if command == "list_managed_lists":
+                    return [{
+                        "id": list_id,
+                        "name": "Custom",
+                        "source": "custom",
+                        "version": "1",
+                        "license": "User-provided domains.",
+                        "imported_utc": "2026-08-20T00:00:00Z",
+                        "domain_count": 2,
+                    }]
+                if command == "read_managed_list":
+                    return {
+                        "id": list_id,
+                        "offset": 0,
+                        "domains": ["old.example", "keep.example"],
+                        "next_offset": None,
+                    }
+                if command == "begin_list_import":
+                    return {"import_id": "edit-stage"}
+                return {}
+
+        fake = FakeClient()
+        result = cli.main(
+            [
+                "managed-lists",
+                "edit",
+                list_id,
+                "--add",
+                "new.example",
+                "--remove",
+                "old.example",
+            ],
+            client=fake,
+            now=lambda: datetime(2026, 8, 20, tzinfo=timezone.utc),
+            output=lambda _text: None,
+        )
+
+        self.assertEqual(result, 0)
+        metadata = next(
+            fields["metadata"]
+            for command, fields in fake.calls
+            if command == "begin_list_import"
+        )
+        self.assertEqual(metadata["name"], "Custom")
+        self.assertEqual(metadata["source"], "custom")
+        domains = next(
+            fields["domains"]
+            for command, fields in fake.calls
+            if command == "import_list_chunk"
+        )
+        self.assertEqual(domains, ["keep.example", "new.example"])
+    def test_edit_domains_replaces_roster_without_reading_existing_values(self) -> None:
+        from datetime import datetime, timezone
+
+        from distraction_blocker import cli
+
+        list_id = "11111111-1111-4111-8111-111111111111"
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, command, **fields):
+                self.calls.append((command, fields))
+                if command == "list_managed_lists":
+                    return [{
+                        "id": list_id,
+                        "name": "Custom",
+                        "source": "custom",
+                        "version": "1",
+                        "license": "User-provided domains.",
+                        "imported_utc": "2026-08-20T00:00:00Z",
+                        "domain_count": 2,
+                    }]
+                if command == "begin_list_import":
+                    return {"import_id": "replace-stage"}
+                return {}
+
+        fake = FakeClient()
+        result = cli.main(
+            [
+                "managed-lists",
+                "edit",
+                list_id,
+                "--domains",
+                "new.example",
+            ],
+            client=fake,
+            now=lambda: datetime(2026, 8, 20, tzinfo=timezone.utc),
+            output=lambda _text: None,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            next(
+                fields["domains"]
+                for command, fields in fake.calls
+                if command == "import_list_chunk"
+            ),
+            ["new.example"],
+        )
+        self.assertNotIn(
+            "read_managed_list",
+            [command for command, _fields in fake.calls],
+        )
+
 
 
 if __name__ == "__main__":

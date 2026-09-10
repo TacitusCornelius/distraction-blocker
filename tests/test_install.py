@@ -101,6 +101,39 @@ class InstallerSecurityTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as raised:
                     install.install_files(root, missing_uid, True, False)
             self.assertEqual(raised.exception.code, 2)
+    def test_service_unit_allows_owner_notification_state_and_session_bus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home" / "owner"
+            home.mkdir(parents=True)
+            unit = root / "unit"
+            unit.write_text(
+                "[Service]\n"
+                "ReadWritePaths=/var/lib/distraction-blocker /run/distraction-blocker /etc\n",
+                encoding="utf-8",
+            )
+            with patch.object(install, "UNIT", unit), patch.object(
+                install, "set_mode"
+            ):
+                install.configure_service_unit(home, 1000)
+            rendered = unit.read_text(encoding="utf-8")
+            self.assertIn(
+                f"ReadWritePaths=/var/lib/distraction-blocker /run/distraction-blocker /etc "
+                f"{home}/.config/distraction-blocker",
+                rendered,
+            )
+            self.assertIn(
+                "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+                rendered,
+            )
+            with patch.object(install.os, "fchown"), patch.object(
+                install.os, "fchmod"
+            ):
+                install.prepare_notification_directory(home, (1000, 1000))
+            self.assertTrue(
+                (home / ".config" / "distraction-blocker").is_dir()
+            )
+
 
 
 class NativeHostTests(unittest.TestCase):
@@ -215,6 +248,53 @@ class NativeHostTests(unittest.TestCase):
             "extra": True,
         })
         self.assertEqual(widened["error"]["code"], "forbidden")
+
+    def test_allowance_commands_are_forwarded_with_pinned_fields(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "host_entry",
+            Path(__file__).resolve().parent.parent
+            / "packaging"
+            / "host_entry.py",
+        )
+        host_entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(host_entry)
+        seen = []
+
+        def fake_request(self, **request):
+            seen.append(request)
+            return {"accepted": True}
+
+        with patch.object(
+            host_entry,
+            "Client",
+            lambda socket_path: type("C", (), {"request": fake_request})(),
+        ):
+            lease = host_entry.handle({
+                "command": "request_allowance_lease",
+                "rule_id": "12345678-1234-5678-1234-567812345678",
+                "seconds": 30,
+            })
+            report = host_entry.handle({
+                "command": "report_allowance_usage",
+                "lease_id": "12345678-1234-5678-1234-567812345678",
+                "report_id": "22345678-1234-5678-1234-567812345678",
+                "start_utc": "2025-01-01T00:00:00Z",
+                "end_utc": "2025-01-01T00:00:01Z",
+            })
+        self.assertTrue(lease["ok"])
+        self.assertTrue(report["ok"])
+        self.assertEqual([request["command"] for request in seen], [
+            "request_allowance_lease",
+            "report_allowance_usage",
+        ])
+        self.assertFalse(host_entry.handle({
+            "command": "request_allowance_lease",
+            "rule_id": "12345678-1234-5678-1234-567812345678",
+            "seconds": 30,
+            "extra": True,
+        })["ok"])
 
     def test_message_framing_round_trip(self) -> None:
         import io
@@ -428,7 +508,11 @@ class UninstallManifestTests(unittest.TestCase):
             source = home / ".config/distraction-blocker/notifications.json"
             source.parent.mkdir(parents=True)
             source.write_text(
-                json.dumps({"show_banners": True, "show_in_lock_screen": False}),
+                json.dumps({
+                    "version": 1,
+                    "show_banners": True,
+                    "show_in_lock_screen": False,
+                }),
                 encoding="utf-8",
             )
             account = type(

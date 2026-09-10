@@ -6,15 +6,26 @@
  */
 "use strict";
 
-/** True when a rule can still permit counted starts. */
+/** True when a rule has a service-enforced timed allowance. */
+export function is_time_allowance_rule(rule) {
+  return (
+    rule?.allowance_time !== undefined &&
+    rule?.allowance_time !== null &&
+    rule?.budget_exhausted !== true
+  );
+}
+
+/** True when a rule can still permit counted starts or timed usage. */
 export function is_allowance_rule(rule) {
   const starts = rule?.allowance_starts;
   return (
-    typeof starts === "number" &&
-    Number.isInteger(starts) &&
-    starts >= 1 &&
-    rule?.budget_exhausted !== true
-  );
+    (
+      typeof starts === "number" &&
+      Number.isInteger(starts) &&
+      starts >= 1
+    ) ||
+    is_time_allowance_rule(rule)
+  ) && rule?.budget_exhausted !== true;
 }
 
 /**

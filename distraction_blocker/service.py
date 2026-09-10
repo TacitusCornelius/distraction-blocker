@@ -22,8 +22,14 @@ from .actions import (
     ScheduledAction,
     ScheduledActionsState,
 )
-from .canonical import format_utc
-from .control import ControlError, ControlState, RuleLock
+from .allowance import (
+    AllowanceError,
+    AllowanceUsageReport,
+    AllowanceUsageState,
+    allowance_decision,
+)
+from .canonical import CanonicalError, canonical_uuid, format_utc, parse_utc
+from .control import ControlError, ControlState, DelayBreak, DelayBreakState, RuleLock
 from .model import (
     POLICY_SCHEMA_VERSION,
     ManagedList,
@@ -55,14 +61,23 @@ def execute_notification_action(
 ) -> None:
     """Run the desktop notification CLI as the configured desktop user."""
     try:
-        username = pwd.getpwuid(owner_uid).pw_name
+        account = pwd.getpwuid(owner_uid)
     except KeyError as error:
         raise OSError("scheduled notification owner does not exist") from error
+    environment = os.environ.copy()
+    environment.update({
+        "HOME": account.pw_dir,
+        "USER": account.pw_name,
+        "LOGNAME": account.pw_name,
+        "XDG_RUNTIME_DIR": f"/run/user/{owner_uid}",
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{owner_uid}/bus",
+    })
     subprocess.run(
         [
             "/usr/sbin/runuser",
+            "--preserve-environment",
             "-u",
-            username,
+            account.pw_name,
             "--",
             "/usr/local/bin/distraction-blocker",
             "notifications",
@@ -70,10 +85,8 @@ def execute_notification_action(
         ],
         check=True,
         timeout=30,
+        env=environment,
     )
-
-
-
 class BlockerService:
     """Policy authority and the only place that expands managed-list targets."""
 
@@ -84,6 +97,9 @@ class BlockerService:
     _AUTH_SECONDS = 60
     _CHALLENGE_SECONDS = 2 * 60
     _MAX_AUTHORIZATIONS = 32
+    _ALLOWANCE_LEASE_SECONDS = 30
+    _MAX_ALLOWANCE_LEASES = 128
+    _ALLOWANCE_RETENTION = timedelta(days=8)
     _FRICTION_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     _MAX_NATIVE_IMPORT_BYTES = 8 * 1024 * 1024
     def __init__(
@@ -127,6 +143,9 @@ class BlockerService:
         self._statistics = StatisticsState.empty()
         self._website_statistics = WebsiteDenialState.empty()
         self._website_usage = WebsiteUsageState.empty()
+        self._allowance_usage = AllowanceUsageState.empty()
+        self._delay_breaks = DelayBreakState.empty()
+        self._allowance_leases: dict[str, dict[str, Any]] = {}
         self._cached_system_zone_name: str | None = None
         self._statistics_dirty = False
         self._last_statistics_persist = time.monotonic()
@@ -166,6 +185,29 @@ class BlockerService:
             raise RuntimeError("clock returned an invalid time")
         return now.astimezone(timezone.utc)
 
+    def _schedule_active_rule_ids(
+        self, now: datetime, trusted: bool
+    ) -> frozenset[str]:
+        """Return active rules for schedule and Delay lock evaluation."""
+        if self.policy is None:
+            return frozenset()
+        return frozenset(
+            rule.id
+            for rule in self.policy.rules
+            if rule.is_active(now, clock_trusted=trusted)
+        )
+
+    def _effective_lock(
+        self, rule_id: str, now: datetime, trusted: bool, *, root: bool = False
+    ) -> RuleLock | None:
+        return self.controls.effective_lock(
+            rule_id,
+            now,
+            clock_trusted=trusted,
+            root=root,
+            schedule_active=rule_id in self._schedule_active_rule_ids(now, trusted),
+        )
+
     def _active_targets(
         self, policy: Policy | None = None
     ) -> tuple[set[str], set[str], frozenset[str], list[Rule]]:
@@ -181,12 +223,15 @@ class BlockerService:
         trusted = bool(getattr(self.clock, "trusted", True))
         # Breadcrumb (allowance seam): a budget-exhausted rule stays
         # ACTIVE-BLOCKING regardless of schedule or exceptions until its
-        # local day resets, so its targets join the blocked set here.
+        # targets join the blocked set here.
         exhausted = self._exhausted_rule_ids(selected)
+        delayed = self._active_delay_rule_ids(now, trusted)
         for rule in selected.rules:
             if not rule.enabled:
                 continue
             if rule.id not in exhausted and not rule.is_active(now, clock_trusted=trusted):
+                continue
+            if rule.id in delayed:
                 continue
             active.append(rule)
             for target in rule.targets:
@@ -379,6 +424,90 @@ class BlockerService:
         except Exception:
             # Observational data can never degrade policy health.
             self._website_usage = WebsiteUsageState.empty()
+    def _load_allowance_usage(self) -> None:
+        loader = getattr(self.store, "load_allowance_usage", None)
+        if loader is None:
+            self._allowance_usage = AllowanceUsageState.empty()
+            return
+        try:
+            loaded = loader()
+            if isinstance(loaded, dict):
+                loaded = AllowanceUsageState.from_dict(loaded)
+            if not isinstance(loaded, AllowanceUsageState):
+                raise AllowanceError("allowance usage state is invalid")
+            fresh = loaded.prune_before(self._now() - self._ALLOWANCE_RETENTION)
+            if fresh != loaded:
+                saver = getattr(self.store, "save_allowance_usage", None)
+                if saver is None:
+                    raise StorageError("allowance usage storage is unavailable")
+                saver(fresh)
+            self._allowance_usage = fresh
+        except (AllowanceError, OSError, StorageError, TypeError, ValueError) as error:
+            raise StorageError("allowance usage state is invalid") from error
+
+    def _load_delay_breaks(self) -> None:
+        loader = getattr(self.store, "load_delay_breaks", None)
+        if loader is None:
+            self._delay_breaks = DelayBreakState.empty()
+            return
+        try:
+            loaded = loader()
+            if isinstance(loaded, dict):
+                loaded = DelayBreakState.from_dict(loaded)
+            if not isinstance(loaded, DelayBreakState):
+                raise ControlError("Delay break state is invalid")
+            self._delay_breaks = loaded
+        except (ControlError, OSError, StorageError, TypeError, ValueError) as error:
+            raise StorageError("Delay break state is invalid") from error
+
+    def _save_delay_breaks(self, state: DelayBreakState) -> None:
+        saver = getattr(self.store, "save_delay_breaks", None)
+        if saver is None:
+            raise StorageError("Delay break storage is unavailable")
+        saver(state)
+        self._delay_breaks = state
+
+    def _advance_delay_breaks(self) -> bool:
+        if not bool(getattr(self.clock, "trusted", True)) or self.policy is None:
+            return False
+        now = self._now()
+        valid = {
+            rule.id
+            for rule in self.policy.rules
+            if self.controls.lock_for(rule.id) is not None
+            and self.controls.lock_for(rule.id).kind == "delay"
+        }
+        updated = self._delay_breaks
+        for item in self._delay_breaks.items:
+            if item.rule_id not in valid:
+                updated = updated.without(item.rule_id)
+            elif item.break_until_utc is not None and item.break_until_utc <= now:
+                updated = updated.without(item.rule_id)
+            elif item.break_until_utc is None and item.pending_until_utc <= now:
+                updated = updated.replace(item.start_break())
+        if updated == self._delay_breaks:
+            return False
+        try:
+            self._save_delay_breaks(updated)
+        except (OSError, StorageError):
+            return False
+        return True
+
+    def _active_delay_rule_ids(
+        self, now: datetime, trusted: bool
+    ) -> frozenset[str]:
+        active = self._delay_breaks.active_rule_ids(
+            now,
+            clock_trusted=trusted,
+        )
+        return frozenset(
+            rule_id
+            for rule_id in active
+            if (
+                self.controls.lock_for(rule_id) is not None
+                and self.controls.lock_for(rule_id).kind == "delay"
+            )
+        )
 
     def _system_zone_name(self) -> str:
         """Return the cached IANA name of the host time zone."""
@@ -442,12 +571,7 @@ class BlockerService:
         *,
         usage: WebsiteUsageState | None = None,
     ) -> frozenset[str]:
-        """Return enabled rules whose counted starts used up their budget.
-
-        Breadcrumb (allowance seam): these ids drive three views that must
-        agree — list_rules projection, daily-schedule projection, and
-        website-target blocking in _active_targets.
-        """
+        """Return active rules whose allowance budget cannot grant access."""
         selected = policy if policy is not None else self.policy
         if selected is None:
             return frozenset()
@@ -458,11 +582,27 @@ class BlockerService:
         )
         exhausted: set[str] = set()
         for rule in selected.rules:
-            if not rule.enabled or rule.allowance_starts is None:
+            if not rule.enabled:
                 continue
-            day = self._local_day_text(self._rule_zone_name(rule))
-            if current_usage.count_for(rule.id, day) >= rule.allowance_starts:
-                exhausted.add(rule.id)
+            if rule.allowance_starts is not None:
+                day = self._local_day_text(self._rule_zone_name(rule))
+                if current_usage.count_for(rule.id, day) >= rule.allowance_starts:
+                    exhausted.add(rule.id)
+            if rule.time_allowance is not None:
+                if not bool(getattr(self.clock, "trusted", True)):
+                    exhausted.add(rule.id)
+                    continue
+                try:
+                    decision = allowance_decision(
+                        rule,
+                        self._now(),
+                        self._allowance_usage.for_rule(rule.id),
+                    )
+                except AllowanceError:
+                    exhausted.add(rule.id)
+                else:
+                    if decision is not None and decision.active and not decision.allowed:
+                        exhausted.add(rule.id)
         return frozenset(exhausted)
 
     def _policy_projection(
@@ -596,6 +736,8 @@ class BlockerService:
         # Breadcrumb: usage staleness resolves per-rule time zones, so the
         # load must wait until the policy (and its rules) is in memory.
         self._load_website_usage()
+        self._load_allowance_usage()
+        self._load_delay_breaks()
         try:
             # Validate the complete persisted policy, not only currently
             # active targets. A future network rule must never become
@@ -607,16 +749,18 @@ class BlockerService:
         known_rules = {rule.id for rule in self.policy.rules}
         if any(lock.rule_id not in known_rules for lock in self.controls.locks):
             raise RuntimeError("protected lock refers to an unknown rule")
-        # Breadcrumb for reviewers: website state and fanotify marks apply before RPC starts.
+        # A persisted countdown may have crossed its boundary while the
+        # service was stopped; advance it before the first enforcement pass.
+        self._advance_delay_breaks()
         self._reconcile()
         self.applications.start()
         self._reconcile()
         self._started = True
-
     def tick(self) -> None:
         if not self._started:
             raise RuntimeError("service is not started")
         self._expire_staged()
+        self._advance_delay_breaks()
         self._reconcile()
         # Breadcrumb: only this main-thread tick drains and aggregates events.
         self._drain_statistics()
@@ -695,6 +839,28 @@ class BlockerService:
                     "network enforcement is not enabled",
                 )
 
+    def _prune_delay_breaks(
+        self, policy: Policy, controls: ControlState
+    ) -> None:
+        valid = {
+            rule.id
+            for rule in policy.rules
+            if controls.lock_for(rule.id) is not None
+            and controls.lock_for(rule.id).kind == "delay"
+        }
+        stale = tuple(
+            item for item in self._delay_breaks.items
+            if item.rule_id not in valid
+        )
+        if stale:
+            self._save_delay_breaks(DelayBreakState(
+                self._delay_breaks.schema_version,
+                tuple(
+                    item for item in self._delay_breaks.items
+                    if item.rule_id in valid
+                ),
+            ))
+
     def _save(
         self, policy: Policy, controls: ControlState | None = None
     ) -> None:
@@ -744,12 +910,12 @@ class BlockerService:
         self.policy = policy
         self.controls = selected_controls
         self._reconcile(policy)
+        self._prune_delay_breaks(policy, selected_controls)
 
     def _save_controls(self, controls: ControlState) -> None:
         if self.policy is None:
             raise RuntimeError("service is not started")
         self._validate_control_refs(self.policy, controls)
-        self._assert_network_supported(self.policy)
         self.store.save(
             self.policy,
             controls,
@@ -757,6 +923,8 @@ class BlockerService:
             not bool(getattr(self.clock, "trusted", True)),
         )
         self.controls = controls
+        self._reconcile()
+        self._prune_delay_breaks(self.policy, controls)
 
     @staticmethod
     def _rule_active(rule: Rule, now: datetime, trusted: bool) -> bool:
@@ -764,16 +932,23 @@ class BlockerService:
 
     @staticmethod
     def _weakened_allowance(old: Rule, new: Rule) -> bool:
-        # Breadcrumb: an allowance increase, including None to a finite
-        # allowance, is a weakening under the policy change contract.
-        return (
+        # Breadcrumb: adding elapsed-time access is a weakening. Any change
+        # between two configured shapes is conservatively protected until the
+        # allowance engine can prove the new shape is stricter.
+        if (
             old.allowance_starts is None
             and new.allowance_starts is not None
         ) or (
             old.allowance_starts is not None
             and new.allowance_starts is not None
             and new.allowance_starts > old.allowance_starts
-        )
+        ):
+            return True
+        if old.time_allowance is None:
+            return new.time_allowance is not None
+        if new.time_allowance is None:
+            return False
+        return old.time_allowance != new.time_allowance
 
     @staticmethod
     def _weakened_change(old: Rule, new: Rule) -> bool:
@@ -827,21 +1002,31 @@ class BlockerService:
         now = self._now()
         trusted = bool(getattr(self.clock, "trusted", True))
         for rule_id in sorted(set(rule_ids)):
-            lock = self.controls.effective_lock(
+            lock = self._effective_lock(
                 rule_id,
                 now,
-                clock_trusted=trusted,
+                trusted,
                 root=uid == 0,
             )
             if lock is None:
                 continue
-            if lock.kind != "timed" and self._has_grant(uid, rule_id):
+            if lock.kind not in {"timed", "schedule"} and self._has_grant(uid, rule_id):
                 continue
             if lock.kind == "timed":
                 until = lock.to_dict()["until_utc"]
                 return self._error(
                     "timed_lock",
                     f"rule is protected by a timed lock until {until}",
+                )
+            if lock.kind == "schedule":
+                return self._error(
+                    "schedule_lock",
+                    "rule is protected by its active weekly schedule",
+                )
+            if lock.kind == "delay":
+                return self._error(
+                    "delay_lock",
+                    "rule is protected by Delay; request a break instead",
                 )
             return self._error(
                 "authorization_required",
@@ -854,8 +1039,6 @@ class BlockerService:
         trusted = bool(getattr(self.clock, "trusted", True))
         if not self._rule_active(old, now, trusted):
             return None
-        if not new.enabled:
-            return "active rule cannot be disabled"
         if self._weakened_allowance(old, new):
             return "active rule allowance cannot be weakened"
         old_targets = {(target.kind, target.value) for target in old.targets}
@@ -1035,24 +1218,23 @@ class BlockerService:
     def _begin_rule_authorization(
         self, uid: int, rule_id: Any
     ) -> dict[str, Any]:
-        if not isinstance(rule_id, str):
-            return self._error("bad_request", "rule_id is required")
-        if self.policy is None or not any(
-            rule.id == rule_id for rule in self.policy.rules
-        ):
-            return self._error("not_found", "rule was not found")
         now = self._now()
         trusted = bool(getattr(self.clock, "trusted", True))
-        lock = self.controls.effective_lock(
+        lock = self._effective_lock(
             rule_id,
             now,
-            clock_trusted=trusted,
+            trusted,
             root=uid == 0,
         )
         if lock is None:
             return self._error("not_locked", "rule has no effective lock")
-        if lock.kind == "timed":
+        if lock.kind in {"timed", "schedule"}:
             return self._lock_refusal(uid, {rule_id})
+        if lock.kind == "delay":
+            return self._error(
+                "delay_lock",
+                "Delay does not use one-time authorization",
+            )
         if lock.kind == "password":
             if not trusted:
                 return self._error(
@@ -1119,10 +1301,10 @@ class BlockerService:
             )
         now = self._now()
         trusted = bool(getattr(self.clock, "trusted", True))
-        lock = self.controls.effective_lock(
+        lock = self._effective_lock(
             rule_id,
             now,
-            clock_trusted=trusted,
+            trusted,
             root=uid == 0,
         )
         if lock is None or lock.kind != challenge["kind"]:
@@ -1424,7 +1606,8 @@ class BlockerService:
             return self._error("bad_request", "rule_id is required")
         if self.policy is None:
             raise RuntimeError("service is not started")
-        if not any(rule.id == rule_id for rule in self.policy.rules):
+        rule = next((rule for rule in self.policy.rules if rule.id == rule_id), None)
+        if rule is None:
             return self._error("not_found", "rule was not found")
         if not isinstance(raw_lock, dict) or not isinstance(
             raw_lock.get("kind"), str
@@ -1439,6 +1622,7 @@ class BlockerService:
                 now,
                 clock_trusted=trusted,
                 root=uid == 0,
+                schedule_active=rule_id in self._schedule_active_rule_ids(now, trusted),
             )
         )
         authorization_used = False
@@ -1486,6 +1670,41 @@ class BlockerService:
                     if refusal:
                         return refusal
                     authorization_used = True
+        elif kind == "schedule":
+            if set(raw_lock) != {"kind"}:
+                return self._error("bad_request", "lock fields are invalid")
+            if rule.schedule.kind != "weekly":
+                return self._error(
+                    "bad_value",
+                    "a schedule lock requires a weekly rule schedule",
+                )
+            replacement = RuleLock.schedule(rule_id)
+            if current_effective and current.kind != "schedule":
+                refusal = self._lock_refusal(uid, {rule_id})
+                if refusal:
+                    return refusal
+                authorization_used = True
+        elif kind == "delay":
+            if set(raw_lock) != {
+                "kind",
+                "wait_seconds",
+                "break_seconds",
+            }:
+                return self._error("bad_request", "lock fields are invalid")
+            try:
+                replacement = RuleLock.delay(
+                    rule_id,
+                    raw_lock["wait_seconds"],
+                    raw_lock["break_seconds"],
+                )
+            except ControlError as error:
+                return self._error("bad_value", str(error))
+            if current_effective:
+                refusal = self._lock_refusal(uid, {rule_id})
+                if refusal:
+                    return refusal
+                authorization_used = True
+
         elif kind == "friction":
             if set(raw_lock) != {"kind"}:
                 return self._error("bad_request", "lock fields are invalid")
@@ -1530,7 +1749,11 @@ class BlockerService:
                 "retry_after_utc": None,
             })
         return self._ok(
-            replacement.to_summary(now, clock_trusted=trusted)
+            replacement.to_summary(
+                now,
+                clock_trusted=trusted,
+                schedule_active=rule_id in self._schedule_active_rule_ids(now, trusted),
+            )
         )
 
     # Command dispatch table. Each entry maps a command name to the allowed
@@ -1548,6 +1771,8 @@ class BlockerService:
         "clear_denial_stats": ((frozenset({"command"}),), "unknown command field", "_cmd_clear_denial_stats"),
         "set_rule_lock": ((frozenset({"command", "rule_id", "lock"}),), "rule_id and lock are required", "_cmd_set_rule_lock"),
         "begin_rule_authorization": ((frozenset({"command", "rule_id"}),), "rule_id is required", "_cmd_begin_rule_authorization"),
+        "request_delay_break": ((frozenset({"command", "rule_id"}),), "rule_id is required", "_cmd_request_delay_break"),
+        "cancel_delay_break": ((frozenset({"command", "rule_id"}),), "rule_id is required", "_cmd_cancel_delay_break"),
         "complete_rule_authorization": ((frozenset({"command", "rule_id", "challenge_id", "response"}),), "authorization response fields are required", "_cmd_complete_rule_authorization"),
         "list_managed_lists": ((frozenset({"command"}),), "unknown command field", "_cmd_list_managed_lists"),
         "read_managed_list": (
@@ -1586,6 +1811,8 @@ class BlockerService:
 
         "report_website_denials": ((frozenset({"command", "entries"}),), "entries is required", "_cmd_report_website_denials"),
         "report_website_usage": ((frozenset({"command", "entries"}),), "entries is required", "_cmd_report_website_usage"),
+        "request_allowance_lease": ((frozenset({"command", "rule_id", "seconds"}),), "rule_id and seconds are required", "_cmd_request_allowance_lease"),
+        "report_allowance_usage": ((frozenset({"command", "lease_id", "report_id", "start_utc", "end_utc"}),), "allowance usage fields are required", "_cmd_report_allowance_usage"),
 
     }
     def _cmd_list_scheduled_actions(
@@ -1604,6 +1831,22 @@ class BlockerService:
             (item for item in self.actions.items if item.id == candidate.id),
             None,
         )
+        restoring = (
+            current is not None
+            and current.kind == "notifications"
+            and candidate.id in self._active_notification_actions
+            and (
+                candidate.kind != current.kind
+                or candidate.enabled != current.enabled
+                or candidate.schedule != current.schedule
+            )
+            and len(self._active_notification_actions) == 1
+        )
+        if restoring:
+            try:
+                self.notification_runner(current, self.owner_uid, False)
+            except (OSError, subprocess.SubprocessError) as error:
+                return self._error("storage", f"could not restore notifications: {error}")
         candidate = ScheduledAction(
             candidate.id,
             candidate.kind,
@@ -1615,7 +1858,13 @@ class BlockerService:
         try:
             self._save_scheduled_actions(self.actions.replace(candidate))
         except (OSError, StorageError, ValueError) as error:
+            if restoring:
+                try:
+                    self.notification_runner(current, self.owner_uid, True)
+                except (OSError, subprocess.SubprocessError):
+                    pass
             return self._error("storage", str(error))
+        self._active_notification_actions.discard(candidate.id)
         return self._ok(candidate.to_dict())
 
     def _cmd_delete_scheduled_action(
@@ -1675,17 +1924,122 @@ class BlockerService:
             return self._error("storage", str(error))
         return self._ok(updated.to_dict())
 
+    def _delay_summary(
+        self,
+        lock: RuleLock,
+        now: datetime,
+        trusted: bool,
+        schedule_active: bool,
+    ) -> dict[str, Any]:
+        summary = lock.to_summary(
+            now,
+            clock_trusted=trusted,
+            schedule_active=schedule_active,
+        )
+        item = self._delay_breaks.for_rule(lock.rule_id)
+        summary["pending_until_utc"] = (
+            format_utc(item.pending_until_utc)
+            if item is not None and item.break_until_utc is None
+            else None
+        )
+        summary["break_until_utc"] = (
+            format_utc(item.break_until_utc)
+            if item is not None and item.break_until_utc is not None
+            else None
+        )
+        return summary
+
+
+    def _delay_lock_for_rule(self, rule_id: Any) -> tuple[Rule, RuleLock] | None:
+        if not isinstance(rule_id, str):
+            return None
+        rule = next((item for item in self.policy.rules if item.id == rule_id), None)
+        if rule is None:
+            return None
+        lock = self._effective_lock(
+            rule.id,
+            self._now(),
+            bool(getattr(self.clock, "trusted", True)),
+        )
+        if lock is None or lock.kind != "delay":
+            return None
+        return rule, lock
+
+    def _cmd_request_delay_break(
+        self, uid: int, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            rule_id = canonical_uuid(request["rule_id"])
+        except (KeyError, TypeError, CanonicalError):
+            return self._error("bad_request", "rule_id is required")
+        if not bool(getattr(self.clock, "trusted", True)):
+            return self._error(
+                "clock_untrusted",
+                "Delay breaks need a trusted clock",
+            )
+        resolved = self._delay_lock_for_rule(rule_id)
+        if resolved is None:
+            return self._error(
+                "not_active",
+                "the Delay-locked rule is not active",
+            )
+        rule, lock = resolved
+        now = self._now()
+        try:
+            existing = self._delay_breaks.for_rule(rule.id)
+            if existing is not None:
+                if (
+                    existing.break_until_utc is not None
+                    and existing.break_until_utc > now
+                ) or existing.pending_until_utc > now:
+                    return self._ok(
+                        self._delay_summary(lock, now, True, True)
+                    )
+                self._save_delay_breaks(self._delay_breaks.without(rule.id))
+            item = DelayBreak(
+                rule.id,
+                now,
+                now + timedelta(seconds=lock.wait_seconds),
+                lock.break_seconds,
+            )
+            self._save_delay_breaks(self._delay_breaks.replace(item))
+        except (OSError, StorageError) as error:
+            return self._error("storage", str(error))
+        return self._ok(self._delay_summary(lock, now, True, True))
+
+    def _cmd_cancel_delay_break(
+        self, uid: int, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            rule_id = canonical_uuid(request["rule_id"])
+        except (KeyError, TypeError, CanonicalError):
+            return self._error("bad_request", "rule_id is required")
+        item = self._delay_breaks.for_rule(rule_id)
+        if item is None:
+            return self._error("not_found", "no pending Delay break exists")
+        if item.break_until_utc is not None:
+            return self._error(
+                "break_active",
+                "an active Delay break cannot be canceled",
+            )
+        try:
+            self._save_delay_breaks(self._delay_breaks.without(rule_id))
+        except (OSError, StorageError) as error:
+            return self._error("storage", str(error))
+        return self._ok({"canceled": True, "rule_id": rule_id})
+
     def _cmd_list_rules(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         # Breadcrumb: the same projection is returned and size-checked by
         # _save, so an accepted policy always fits the RPC response frame.
         return self._ok(self._policy_projection())
 
     # Refused while enforcement is unhealthy. The gate runs before field
-    # validation, exactly as the previous if-chain ordered it.
+    # validation so an unhealthy service cannot weaken enforcement.
     _UNHEALTHY_COMMANDS = frozenset({
         "put_rule", "delete_rule", "set_enabled", "replace_rules",
         "commit_rule_import", "commit_list_import", "commit_native_import",
         "delete_managed_list", "set_rule_lock", "start_focus",
+        "request_allowance_lease", "request_delay_break",
     })
 
     def dispatch(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
@@ -1695,6 +2049,11 @@ class BlockerService:
         if not isinstance(request, dict) or not isinstance(request.get("command"), str):
             return self._error("bad_request", "command is required")
         command = request["command"]
+        try:
+            if self._advance_delay_breaks():
+                self._reconcile()
+        except (OSError, StorageError) as error:
+            return self._error("storage", str(error))
         entry = self._COMMANDS.get(command)
         if entry is None:
             return self._error("bad_request", "unknown command")
@@ -1721,12 +2080,25 @@ class BlockerService:
 
 
     def _cmd_list_locks(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
-        return self._ok(list(self.controls.summaries(
-            self._now(),
-            clock_trusted=bool(
-                getattr(self.clock, "trusted", True)
-            ),
-        )))
+        now = self._now()
+        trusted = bool(getattr(self.clock, "trusted", True))
+        schedule_active = self._schedule_active_rule_ids(now, trusted)
+        result = []
+        for lock in self.controls.locks:
+            if lock.kind == "delay":
+                result.append(self._delay_summary(
+                    lock,
+                    now,
+                    trusted,
+                    lock.rule_id in schedule_active,
+                ))
+            else:
+                result.append(lock.to_summary(
+                    now,
+                    clock_trusted=trusted,
+                    schedule_active=lock.rule_id in schedule_active,
+                ))
+        return self._ok(result)
 
     def _cmd_list_denial_stats(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         return self._ok(self._statistics_result())
@@ -1774,6 +2146,170 @@ class BlockerService:
                 "too_large", "website statistics response is too large"
             )
         return self._ok(result)
+
+    def _expire_allowance_leases(self, now: datetime) -> None:
+        for lease_id, lease in tuple(self._allowance_leases.items()):
+            if lease["expires_utc"] <= now:
+                del self._allowance_leases[lease_id]
+
+    def _allowance_rule(self, rule_id: str) -> Rule | None:
+        return next(
+            (
+                rule
+                for rule in self.policy.rules
+                if rule.id == rule_id
+                and rule.enabled
+                and rule.time_allowance is not None
+            ),
+            None,
+        )
+
+    def _cmd_request_allowance_lease(
+        self, uid: int, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            rule_id = canonical_uuid(request["rule_id"])
+        except (KeyError, TypeError, CanonicalError):
+            return self._error("bad_request", "rule_id is required")
+        seconds = request["seconds"]
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, int)
+            or not 1 <= seconds <= self._ALLOWANCE_LEASE_SECONDS
+        ):
+            return self._error(
+                "bad_request",
+                f"seconds must be between 1 and {self._ALLOWANCE_LEASE_SECONDS}",
+            )
+        if not bool(getattr(self.clock, "trusted", True)):
+            return self._error(
+                "clock_untrusted",
+                "allowance leases need a trusted clock",
+            )
+        rule = self._allowance_rule(rule_id)
+        if rule is None:
+            return self._error("not_found", "timed allowance rule was not found")
+        now = self._now()
+        self._expire_allowance_leases(now)
+        decision = allowance_decision(
+            rule,
+            now,
+            self._allowance_usage.for_rule(rule.id),
+        )
+        if decision is None or not decision.active:
+            return self._error("not_active", "allowance rule is not active")
+        if not decision.allowed or decision.remaining_seconds is None:
+            return self._error("allowance_exhausted", "allowance budget is exhausted")
+        reserved = sum(
+            int((lease["end_utc"] - lease["start_utc"]).total_seconds())
+            for lease in self._allowance_leases.values()
+            if lease["rule_id"] == rule.id and lease["end_utc"] > now
+        )
+        available = decision.remaining_seconds - reserved
+        window_remaining = int(
+            max(0, (decision.window_end_utc - now).total_seconds())
+        )
+        occurrence_remaining = int(
+            max(0, (decision.occurrence_end_utc - now).total_seconds())
+        )
+        duration = min(seconds, available, window_remaining, occurrence_remaining)
+        if duration < 1:
+            return self._error("allowance_exhausted", "allowance budget is reserved")
+        lease_id = str(uuid.uuid4())
+        end = now + timedelta(seconds=duration)
+        self._allowance_leases[lease_id] = {
+            "rule_id": rule.id,
+            "start_utc": now,
+            "end_utc": end,
+            "expires_utc": end + timedelta(minutes=5),
+        }
+        return self._ok({
+            "lease_id": lease_id,
+            "rule_id": rule.id,
+            "start_utc": format_utc(now),
+            "end_utc": format_utc(end),
+            "seconds": duration,
+        })
+
+    def _cmd_report_allowance_usage(
+        self, uid: int, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            report_id = canonical_uuid(request["report_id"])
+        except (KeyError, TypeError, CanonicalError):
+            return self._error("bad_request", "report_id is required")
+        now = self._now()
+        self._allowance_usage = self._allowance_usage.prune_before(
+            now - self._ALLOWANCE_RETENTION
+        )
+        if self._allowance_usage.contains(report_id):
+            return self._ok({"accepted": True, "duplicate": True})
+        lease_id = request["lease_id"]
+        if not isinstance(lease_id, str):
+            return self._error("bad_request", "lease_id is required")
+        try:
+            lease_id = canonical_uuid(lease_id)
+        except CanonicalError:
+            return self._error("bad_request", "lease_id is invalid")
+        lease = self._allowance_leases.get(lease_id)
+        if lease is None:
+            return self._error("not_found", "allowance lease was not found")
+        try:
+            start = parse_utc(request["start_utc"])
+            end = parse_utc(request["end_utc"])
+            report = AllowanceUsageReport(
+                report_id, lease["rule_id"], start, end
+            )
+        except (KeyError, CanonicalError, AllowanceError, TypeError, ValueError):
+            return self._error("bad_value", "allowance usage interval is invalid")
+        if (
+            not bool(getattr(self.clock, "trusted", True))
+            or report.start_utc < lease["start_utc"]
+            or report.end_utc > lease["end_utc"]
+            or report.end_utc > now
+        ):
+            return self._error(
+                "bad_value",
+                "allowance usage interval is outside its lease",
+            )
+        rule = self._allowance_rule(lease["rule_id"])
+        if rule is None:
+            return self._error("not_found", "timed allowance rule was not found")
+        try:
+            candidate = self._allowance_usage.record(report)
+        except AllowanceError as error:
+            return self._error("storage", str(error))
+        evaluation_now = report.end_utc - timedelta(microseconds=1)
+        decision = allowance_decision(
+            rule,
+            evaluation_now,
+            candidate.for_rule(rule.id),
+        )
+        if (
+            decision is None
+            or not decision.active
+            or decision.period_budget_seconds is None
+            or decision.period_used_seconds > decision.period_budget_seconds
+            or (
+                decision.daily_cap_seconds is not None
+                and decision.daily_used_seconds > decision.daily_cap_seconds
+            )
+        ):
+            return self._error("allowance_exhausted", "allowance budget is exhausted")
+        saver = getattr(self.store, "save_allowance_usage", None)
+        if saver is None:
+            return self._error("storage", "allowance usage storage is unavailable")
+        try:
+            saver(candidate)
+        except Exception as error:
+            return self._error("storage", str(error))
+        self._allowance_usage = candidate
+        self._reconcile()
+        return self._ok({
+            "accepted": True,
+            "duplicate": False,
+            "remaining_seconds": decision.remaining_seconds,
+        })
 
     def _cmd_report_website_usage(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         entries = request["entries"]
@@ -2138,10 +2674,9 @@ class BlockerService:
                 data["enabled"] = request["enabled"]
                 data["revision"] = rule.revision + 1
                 replacement = Rule.from_dict(data)
-                # Indefinite rules remain manually disable-able, as in v1.1.
-                reason = None
-                if request["enabled"] or rule.schedule.kind != "indefinite":
-                    reason = self._weakened_active_change(rule, replacement)
+                # Active rules may be disabled when no effective lock protects
+                # them. The lock refusal below handles every lock kind.
+                reason = self._weakened_active_change(rule, replacement)
                 if reason:
                     return self._error("active_rule", reason)
                 if rule.enabled and not replacement.enabled:

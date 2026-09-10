@@ -9,7 +9,10 @@ from unittest.mock import patch
 from distraction_blocker.actions import ScheduledAction, ScheduledActionsState, new_action
 from distraction_blocker.cli import main
 from distraction_blocker.model import Schedule, Policy
-from distraction_blocker.service import BlockerService
+from distraction_blocker.service import (
+    BlockerService,
+    execute_notification_action,
+)
 from distraction_blocker.storage import ProtectedStore
 from distraction_blocker.transfer import statistics_export_text
 from tests.test_service_rpc import (
@@ -156,6 +159,69 @@ class ServiceActionTests(unittest.TestCase):
         clock.current = datetime(2026, 1, 1, 0, 2, tzinfo=timezone.utc)
         service._run_scheduled_actions()
         self.assertEqual(calls, [True, False])
+    def test_notification_action_passes_owner_session_environment(self) -> None:
+        schedule = Schedule.from_dict({
+            "kind": "one_time",
+            "start_utc": "2026-01-01T00:00:00.000000Z",
+            "end_utc": "2026-01-01T00:01:00.000000Z",
+        })
+        action = new_action("notifications", schedule)
+        account = type(
+            "Account", (), {"pw_name": "owner", "pw_dir": "/home/owner"}
+        )()
+        with (
+            patch(
+                "distraction_blocker.service.pwd.getpwuid",
+                return_value=account,
+            ),
+            patch("distraction_blocker.service.subprocess.run") as run,
+        ):
+            execute_notification_action(action, 1000, True)
+        command = run.call_args.args[0]
+        environment = run.call_args.kwargs["env"]
+        self.assertIn("--preserve-environment", command)
+        self.assertEqual(environment["HOME"], "/home/owner")
+        self.assertEqual(environment["XDG_RUNTIME_DIR"], "/run/user/1000")
+        self.assertEqual(
+            environment["DBUS_SESSION_BUS_ADDRESS"],
+            "unix:path=/run/user/1000/bus",
+        )
+
+    def test_replacing_active_notification_action_restores_state(self) -> None:
+        schedule = Schedule.from_dict({
+            "kind": "one_time",
+            "start_utc": "2026-01-01T00:00:00.000000Z",
+            "end_utc": "2026-01-01T00:01:00.000000Z",
+        })
+        notification = new_action("notifications", schedule)
+        service = BlockerService(
+            FakeStore(Policy(0, ())),
+            FakeClock(),
+            FakeHosts(),
+            FakeApplications(),
+            notification_runner=lambda _action, _uid, block: calls.append(block),
+        )
+        calls: list[bool] = []
+        service._started = True
+        service.actions = ScheduledActionsState((notification,))
+        service._active_notification_actions.add(notification.id)
+        saved: list[ScheduledActionsState] = []
+        service._save_scheduled_actions = saved.append
+        replacement = notification.to_dict()
+        replacement["kind"] = "lock"
+
+        result = service.dispatch(
+            1000,
+            {"command": "put_scheduled_action", "action": replacement},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, [False])
+        self.assertEqual(saved[0].items[0].kind, "lock")
+        self.assertNotIn(
+            notification.id, service._active_notification_actions
+        )
+
 
 class CliFeatureTests(unittest.TestCase):
     def test_actions_add_and_stats_export_use_public_interfaces(self) -> None:

@@ -277,6 +277,35 @@ def copy_asset(
     finally:
         os.close(source_fd)
 
+def configure_service_unit(owner_home: Path, owner_uid: int) -> None:
+    """Allow scheduled notifications to write only the owner's state path."""
+    config_path = str(owner_home / ".config" / "distraction-blocker")
+    escaped_path = config_path.replace("\\", "\\x5c").replace(" ", "\\x20")
+    text = UNIT.read_text(encoding="utf-8")
+    read_write = "ReadWritePaths=/var/lib/distraction-blocker /run/distraction-blocker /etc"
+    if read_write not in text or "[Service]\n" not in text:
+        fail("the service unit has unexpected settings")
+    text = text.replace(read_write, f"{read_write} {escaped_path}", 1)
+    environment = (
+        f"Environment=XDG_RUNTIME_DIR=/run/user/{owner_uid}\n"
+        f"Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{owner_uid}/bus\n"
+    )
+    text = text.replace("[Service]\n", f"[Service]\n{environment}", 1)
+    UNIT.write_text(text, encoding="utf-8")
+    set_mode(UNIT, 0o644)
+
+
+def prepare_notification_directory(
+    owner_home: Path, owner_spec: tuple[int, int]
+) -> None:
+    """Create the owner-writable notification state directory safely."""
+    path = owner_home / ".config" / "distraction-blocker"
+    descriptor = _open_directory_chain(path, create=True, owner=owner_spec)
+    try:
+        os.fchmod(descriptor, 0o700)
+        os.fchown(descriptor, *owner_spec)
+    finally:
+        os.close(descriptor)
 
 def installation_exists() -> bool:
     marker = PREFIX / MARKER_NAME
@@ -510,6 +539,7 @@ def install_files(
             copy_asset(
                 packaging_fd, "distraction-blocker.service", UNIT
             )
+            configure_service_unit(owner_home, owner_uid)
             if network_on:
                 copy_asset(
                     packaging_fd, "network_entry.py",
@@ -622,6 +652,7 @@ def install_files(
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
     RUN.mkdir(mode=0o755, parents=True, exist_ok=True)
     set_mode(STATE, 0o700)
+    prepare_notification_directory(owner_home, owner_spec)
     set_mode(RUN, 0o755)
     if network_on:
         # Breadcrumb: only an explicit operator opt-in writes the

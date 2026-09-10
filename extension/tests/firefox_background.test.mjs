@@ -47,7 +47,7 @@ test("Firefox blocks HTTP requests before the first policy response", async () =
     tabs: { get: async () => ({ active: true }) },
   };
   const context = vm.createContext({ browser, console, Date, Promise, setTimeout });
-  const coreFiles = ["usage.js", "policy.js", "engine.js", "dnr.js"];
+  const coreFiles = ["usage.js", "policy.js", "engine.js", "dnr.js", "allowance.js"];
   const source = [
     ...coreFiles.map((file) =>
       readFileSync(new URL(`../firefox/core/${file}`, import.meta.url), "utf8"),

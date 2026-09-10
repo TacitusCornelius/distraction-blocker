@@ -15,9 +15,24 @@ Each rule supports website, application, and managed-list targets. Each rule use
 
 A weekly period can cross midnight. Overlapping periods act as one continuous block.
 
-An active finite rule cannot lose targets, stop early, or become disabled.
+An active finite rule cannot lose targets or shorten its schedule. An active
+unlocked rule can be disabled manually; an effective lock prevents weakening
+changes until its condition is satisfied.
 
 The service continues after the GUI closes. The service starts during the Ubuntu boot process.
+
+## Version 1.4
+
+Version 1.4 adds timed allowances and Delay locks for URL-level browser
+rules:
+
+- Daily or period-based elapsed-time allowances with service-owned budgets.
+- Short-lived service leases and retry-safe browser usage reports.
+- Delay locks with persisted countdowns and fixed temporary breaks.
+
+Allowance accounting and Delay state remain outside portable policy exports.
+The root service remains the final policy authority.
+
 
 ## Version 1.3
 
@@ -117,11 +132,11 @@ succeeds. The signed policy is preserved.
 Version 1.2 adds these functions:
 
 - Managed domain lists with bounded, staged service imports.
-- Five offline starter categories.
+- Seven offline starter categories, including Video and YouTube.
 - Up to 16 weekly periods in one rule.
 - Quick focus timers that copy targets from an existing rule.
 - A daily schedule overview in the system time zone.
-- Start and end notifications while the GUI runs.
+- Per-rule notification controls for rule-state and upcoming-change alerts.
 - Native backup version 2 with managed-list data.
 
 The service stores managed-list entries once. Normal service responses show metadata and counts, not the domain entries.
@@ -208,6 +223,10 @@ Run a command:
 distraction-blocker status
 distraction-blocker rules
 distraction-blocker managed-lists
+distraction-blocker managed-lists create --name "My list" \
+  --file ~/Downloads/domains.txt
+distraction-blocker managed-lists edit LIST_ID \
+  --add extra.example --remove old.example
 distraction-blocker today
 distraction-blocker focus RULE_ID 30
 distraction-blocker stats
@@ -243,7 +262,13 @@ Ubuntu's `gir1.2-ayatanaappindicator3-0.1` package in addition to
 
 Rule commands are `enable`, `disable`, and `delete`.
 
-Lock commands are `lock-timed`, `lock-friction`, `lock-password`, `clear-lock`, and `authorize`.
+Lock commands are `lock-schedule`, `lock-timed`, `lock-delay`, `lock-friction`, `lock-password`, `clear-lock`, `delay-break`, `cancel-delay-break`, and `authorize`.
+
+`lock-delay RULE_ID WAIT_MINUTES BREAK_MINUTES` configures an explicit Delay
+countdown and temporary break. `delay-break RULE_ID` requests the break while
+the rule is active; `cancel-delay-break RULE_ID` cancels its pending countdown.
+The root service persists Delay state and keeps enforcement active during the
+countdown.
 
 The password commands read hidden terminal input. A password never appears in a command argument or output.
 
@@ -263,9 +288,13 @@ The client returns a nonzero status when validation or the service refuses a req
 4. Select each application executable.
 5. Select a schedule type.
 6. Select dates, times, weekly periods, or Pomodoro values.
-7. Select **Save rule**.
+7. Optionally select **Configure a lock after saving**. The lock setup opens
+   immediately after the new rule is saved.
+8. Select **Save rule**.
 
-Disable an indefinite rule before you delete it. Wait for an active finite rule to end before you weaken or delete it.
+An active rule can be disabled when it is not locked. A locked rule cannot be
+disabled until its schedule period ends, its timed lock expires, or its
+friction/password authorization is completed. Disable a rule before deleting it.
 
 ### One-time date and time selection
 
@@ -294,23 +323,37 @@ Review the accepted, duplicate, ignored, and invalid counts. Then select **Conti
 
 Select **Edit** and **Import domains** to add a file to an existing rule. The service refuses a change that weakens an active rule.
 
-Each direct domain import file has a 4 MiB limit. Normal service messages keep the 65,536-byte limit.
-
-Use a managed list for a large HaGeZi file.
-
 ### Managed lists and starter categories
 
-Select **Managed lists** to import a large domain file or install a starter category.
+Select **Managed lists** to import a large domain file, create a custom list,
+edit an existing roster, or install a starter category.
 
 Each list shows its source, data version, license note, import time, and domain count.
+The GUI's **New custom list** and **Edit roster** actions accept one hostname per
+line. Saves replace the complete roster atomically through the root service; a
+change that weakens an active rule is refused.
+
+The command line has equivalent operations:
+
+```bash
+distraction-blocker managed-lists create --name "My list" --file domains.txt
+distraction-blocker managed-lists edit LIST_ID \
+  --add extra.example --remove old.example
+```
 
 The service receives list entries in chunks of 200 domains. It commits the complete list in one signed policy update.
 
 Select a managed list in the rule editor to use it as a rule target. A list can be the rule's only target.
 
-The starter categories cover social media, games, shopping, streaming media, and adult content.
+
+The rule list has separate state and sort controls. Sort options are **Most
+recent** (newest policy entries first), **Alphabetical A-Z**, and
+**Alphabetical Z-A**.
+The starter categories cover social media, games, shopping, streaming media,
+Video, YouTube, and adult content. Video and YouTube intentionally overlap.
 
 These are small starter sets. Website blocking remains exact-hostname blocking.
+
 
 ### Multiple weekly periods
 
@@ -318,23 +361,40 @@ Select **Weekly**, then select **Add period** for each additional period.
 
 Each period has its own weekdays, start time, and end time. One rule can contain up to 16 periods.
 
-### Quick focus
-
-Select **Quick focus**. Select a source rule and a duration.
-
-The GUI copies the source targets into an immediate one-time rule. The available durations are 15, 30, 60, and 120 minutes.
-
-You can also enter a custom number of minutes.
-
 ### Rule locks
 
-Select **Lock** on a rule. Select a timed, friction, or password lock.
+Select **Lock** on an existing rule, or select **Configure a lock after
+saving** while creating a rule. Choose a schedule, timed, friction, or
+password lock. A schedule lock is valid for weekly rules and automatically
+protects the rule during each active weekly period.
 
-A timed lock cannot be shortened before its UTC expiry. An untrusted clock keeps it effective.
+Locks protect weakening changes: disabling a rule, removing targets, shortening
+a schedule, increasing an allowance, or deleting the rule. An active rule that
+has no effective lock can be disabled manually.
 
-A friction lock shows random text. Select **Authorize**, then type that text exactly.
+A schedule lock is effective only while its weekly rule is active. It cannot
+be removed or weakened during that active period.
 
-A password lock stores only a root-owned scrypt hash. Select **Authorize**, then enter the hidden password.
+A timed lock cannot be shortened or removed before its UTC expiry. An untrusted
+clock keeps it effective.
+
+A friction lock shows random text. Select **Authorize**, then type that text
+exactly to authorize one weakening change.
+
+A password lock stores only a root-owned scrypt hash. Select **Authorize**, then
+enter the hidden password to authorize one weakening change.
+
+### Per-rule notifications
+
+Each rule can turn notifications on or off independently. When notifications
+are on, choose either or both categories:
+
+- **Rule starts and ends** — notify when the observed rule state changes.
+- **Upcoming schedule changes** — notify five minutes before the next boundary.
+
+These notifications are generated by the GUI while it is running. They never
+control enforcement.
+
 
 Version 4 backups include the protected-user DoH target in addition to the
 network target rules, managed-list metadata, and managed-list domains. Native

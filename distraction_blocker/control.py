@@ -1,8 +1,8 @@
 """Protected rule-lock state.
 
 Control records stay separate from :class:`~distraction_blocker.model.Policy`.
-Version 1.3 supports timed, friction, and password locks. A password lock
-stores its scrypt parameter values beside the hash.
+Version 1.3 supports timed, friction, password, weekly schedule, and Delay
+locks. A password lock stores its scrypt parameter values beside the hash.
 """
 from __future__ import annotations
 
@@ -21,6 +21,11 @@ SCRYPT_R = 8
 SCRYPT_P = 1
 PASSWORD_MIN_BYTES = 8
 PASSWORD_MAX_BYTES = 1024
+DELAY_MIN_WAIT_SECONDS = 1
+DELAY_MAX_WAIT_SECONDS = 24 * 60 * 60
+BREAK_MIN_SECONDS = 60
+BREAK_MAX_SECONDS = 24 * 60 * 60
+
 
 
 
@@ -52,6 +57,20 @@ def _rule_id(value: Any) -> str:
         if error.reason in (canonical.REASON_TYPE, canonical.REASON_UUID):
             raise ControlError("rule_id must be a UUID") from error
         raise ControlError("rule_id must be a canonical UUID") from error
+
+def _seconds(
+    value: Any,
+    label: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ControlError(f"{label} must be an integer")
+    if not minimum <= value <= maximum:
+        raise ControlError(f"{label} is out of range")
+    return value
+
 
 
 def _password_bytes(value: Any) -> bytes:
@@ -99,8 +118,6 @@ def _validated_scrypt_params(n: Any, r: Any, p: Any) -> tuple[int, int, int]:
         and 1 <= p <= 8
     ):
         raise ControlError("password scrypt parameters are out of range")
-    # Breadcrumb: hashlib.scrypt fails when 128*n*r exceeds maxmem, so this
-    # bound keeps every stored hash verifiable with the same memory budget.
     if 128 * n * r > 32 * 1024 * 1024:
         raise ControlError("password scrypt parameters exceed the memory budget")
     return n, r, p
@@ -120,9 +137,17 @@ class RuleLock:
     scrypt_r: int | None = None
     scrypt_p: int | None = None
     retry_after_utc: datetime | None = None
+    wait_seconds: int | None = None
+    break_seconds: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "rule_id", _rule_id(self.rule_id))
+        if self.kind != "delay" and any(
+            value is not None
+            for value in (self.wait_seconds, self.break_seconds)
+        ):
+            raise ControlError("non-delay lock fields are invalid")
+
         if self.kind == "timed":
             if (
                 self.until_utc is None
@@ -138,6 +163,18 @@ class RuleLock:
             object.__setattr__(
                 self, "until_utc", _utc(self.until_utc, "until_utc")
             )
+        elif self.kind == "schedule":
+            if any((
+                self.until_utc is not None,
+                self.salt_hex is not None,
+                self.digest_hex is not None,
+                self.failures != 0,
+                self.retry_after_utc is not None,
+                self.scrypt_n is not None,
+                self.scrypt_r is not None,
+                self.scrypt_p is not None,
+            )):
+                raise ControlError("schedule lock fields are invalid")
         elif self.kind == "friction":
             if any((
                 self.until_utc is not None,
@@ -178,6 +215,40 @@ class RuleLock:
             object.__setattr__(self, "scrypt_n", params[0])
             object.__setattr__(self, "scrypt_r", params[1])
             object.__setattr__(self, "scrypt_p", params[2])
+        elif self.kind == "delay":
+            if any(
+                (
+                    self.until_utc is not None,
+                    self.salt_hex is not None,
+                    self.digest_hex is not None,
+                    self.failures != 0,
+                    self.retry_after_utc is not None,
+                    self.scrypt_n is not None,
+                    self.scrypt_r is not None,
+                    self.scrypt_p is not None,
+                )
+            ):
+                raise ControlError("delay lock fields are invalid")
+            object.__setattr__(
+                self,
+                "wait_seconds",
+                _seconds(
+                    self.wait_seconds,
+                    "delay wait_seconds",
+                    minimum=DELAY_MIN_WAIT_SECONDS,
+                    maximum=DELAY_MAX_WAIT_SECONDS,
+                ),
+            )
+            object.__setattr__(
+                self,
+                "break_seconds",
+                _seconds(
+                    self.break_seconds,
+                    "delay break_seconds",
+                    minimum=BREAK_MIN_SECONDS,
+                    maximum=BREAK_MAX_SECONDS,
+                ),
+            )
         else:
             raise ControlError("lock kind is not supported")
 
@@ -186,8 +257,26 @@ class RuleLock:
         return cls(rule_id, "timed", until_utc)
 
     @classmethod
+    def schedule(cls, rule_id: str) -> "RuleLock":
+        return cls(rule_id, "schedule")
+
+    @classmethod
     def friction(cls, rule_id: str) -> "RuleLock":
         return cls(rule_id, "friction")
+
+    @classmethod
+    def delay(
+        cls,
+        rule_id: str,
+        wait_seconds: int,
+        break_seconds: int,
+    ) -> "RuleLock":
+        return cls(
+            rule_id,
+            "delay",
+            wait_seconds=wait_seconds,
+            break_seconds=break_seconds,
+        )
 
     @classmethod
     def password_lock(
@@ -217,10 +306,28 @@ class RuleLock:
             if set(data) != {"rule_id", "kind", "until_utc"}:
                 raise ControlError("timed lock fields are invalid")
             return cls.timed(data["rule_id"], data["until_utc"])
+        if kind == "schedule":
+            if set(data) != {"rule_id", "kind"}:
+                raise ControlError("schedule lock fields are invalid")
+            return cls.schedule(data["rule_id"])
         if kind == "friction":
             if set(data) != {"rule_id", "kind"}:
                 raise ControlError("friction lock fields are invalid")
             return cls.friction(data["rule_id"])
+        if kind == "delay":
+            if set(data) != {
+                "rule_id",
+                "kind",
+                "wait_seconds",
+                "break_seconds",
+            }:
+                raise ControlError("delay lock fields are invalid")
+            return cls.delay(
+                data["rule_id"],
+                data["wait_seconds"],
+                data["break_seconds"],
+            )
+
         if kind == "password":
             base = {
                 "rule_id",
@@ -255,6 +362,9 @@ class RuleLock:
         }
         if self.kind == "timed":
             result["until_utc"] = _utc_text(self.until_utc)
+        elif self.kind == "delay":
+            result["wait_seconds"] = self.wait_seconds
+            result["break_seconds"] = self.break_seconds
         elif self.kind == "password":
             result.update({
                 "salt_hex": self.salt_hex,
@@ -267,19 +377,27 @@ class RuleLock:
             })
         return result
 
+
     def is_effective(
         self,
         now_utc: datetime,
         *,
         clock_trusted: bool = True,
         root: bool = False,
+        schedule_active: bool = False,
     ) -> bool:
         if not isinstance(clock_trusted, bool):
             raise ControlError("clock_trusted must be a boolean")
         if not isinstance(root, bool):
             raise ControlError("root must be a boolean")
+        if not isinstance(schedule_active, bool):
+            raise ControlError("schedule_active must be a boolean")
         if root:
             return False
+        if self.kind == "schedule":
+            return schedule_active
+        if self.kind == "delay":
+            return schedule_active
         if self.kind in {"friction", "password"}:
             return True
         if not clock_trusted:
@@ -346,14 +464,16 @@ class RuleLock:
         *,
         clock_trusted: bool = True,
         root: bool = False,
+        schedule_active: bool = False,
     ) -> dict[str, Any]:
-        return {
+        result = {
             "rule_id": self.rule_id,
             "kind": self.kind,
             "locked": self.is_effective(
                 now_utc,
                 clock_trusted=clock_trusted,
                 root=root,
+                schedule_active=schedule_active,
             ),
             "until_utc": (
                 _utc_text(self.until_utc)
@@ -366,8 +486,179 @@ class RuleLock:
                 else None
             ),
         }
+        if self.kind == "delay":
+            result["wait_seconds"] = self.wait_seconds
+            result["break_seconds"] = self.break_seconds
+        return result
 
 
+
+
+@dataclass(frozen=True)
+class DelayBreak:
+    """One persisted Delay request and its countdown/break boundaries."""
+
+    rule_id: str
+    requested_utc: datetime
+    pending_until_utc: datetime
+    break_seconds: int
+    break_until_utc: datetime | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "rule_id", _rule_id(self.rule_id))
+        requested = _utc(self.requested_utc, "requested_utc")
+        pending = _utc(self.pending_until_utc, "pending_until_utc")
+        if pending <= requested:
+            raise ControlError("Delay countdown must end after it starts")
+        seconds = _seconds(
+            self.break_seconds,
+            "break_seconds",
+            minimum=BREAK_MIN_SECONDS,
+            maximum=BREAK_MAX_SECONDS,
+        )
+        break_until = self.break_until_utc
+        if break_until is not None:
+            break_until = _utc(break_until, "break_until_utc")
+            if break_until <= pending:
+                raise ControlError("Delay break must start after its countdown")
+            if break_until != pending + timedelta(seconds=seconds):
+                raise ControlError("Delay break duration is inconsistent")
+        object.__setattr__(self, "requested_utc", requested)
+        object.__setattr__(self, "pending_until_utc", pending)
+        object.__setattr__(self, "break_seconds", seconds)
+        object.__setattr__(self, "break_until_utc", break_until)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "DelayBreak":
+        if not isinstance(data, Mapping) or set(data) != {
+            "rule_id",
+            "requested_utc",
+            "pending_until_utc",
+            "break_seconds",
+            "break_until_utc",
+        }:
+            raise ControlError("Delay break fields are invalid")
+        return cls(
+            data["rule_id"],
+            _utc(data["requested_utc"], "requested_utc"),
+            _utc(data["pending_until_utc"], "pending_until_utc"),
+            data["break_seconds"],
+            (
+                None
+                if data["break_until_utc"] is None
+                else _utc(data["break_until_utc"], "break_until_utc")
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "requested_utc": _utc_text(self.requested_utc),
+            "pending_until_utc": _utc_text(self.pending_until_utc),
+            "break_seconds": self.break_seconds,
+            "break_until_utc": _utc_text(self.break_until_utc),
+        }
+
+    def start_break(self) -> "DelayBreak":
+        if self.break_until_utc is not None:
+            return self
+        return DelayBreak(
+            self.rule_id,
+            self.requested_utc,
+            self.pending_until_utc,
+            self.break_seconds,
+            self.pending_until_utc + timedelta(seconds=self.break_seconds),
+        )
+
+
+@dataclass(frozen=True)
+class DelayBreakState:
+    """Bounded, signed runtime state for per-rule Delay breaks."""
+
+    schema_version: int = 1
+    items: tuple[DelayBreak, ...] = ()
+
+    MAX_ITEMS = 4096
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or isinstance(self.schema_version, bool):
+            raise ControlError("Delay break state schema is unsupported")
+        items = tuple(self.items)
+        if len(items) > self.MAX_ITEMS:
+            raise ControlError("Delay break state is too large")
+        if any(not isinstance(item, DelayBreak) for item in items):
+            raise ControlError("Delay break state rows are invalid")
+        if len({item.rule_id for item in items}) != len(items):
+            raise ControlError("a rule cannot have multiple Delay breaks")
+        object.__setattr__(
+            self,
+            "items",
+            tuple(sorted(items, key=lambda item: item.rule_id)),
+        )
+
+    @classmethod
+    def empty(cls) -> "DelayBreakState":
+        return cls()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "DelayBreakState":
+        if not isinstance(data, Mapping) or set(data) != {
+            "schema_version",
+            "items",
+        }:
+            raise ControlError("Delay break state fields are invalid")
+        raw_items = data["items"]
+        if not isinstance(raw_items, list):
+            raise ControlError("Delay break state items are invalid")
+        if len(raw_items) > cls.MAX_ITEMS:
+            raise ControlError("Delay break state is too large")
+        return cls(
+            data["schema_version"],
+            tuple(DelayBreak.from_dict(item) for item in raw_items),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "items": [item.to_dict() for item in self.items],
+        }
+
+    def for_rule(self, rule_id: str) -> DelayBreak | None:
+        ident = _rule_id(rule_id)
+        return next((item for item in self.items if item.rule_id == ident), None)
+
+    def replace(self, item: DelayBreak) -> "DelayBreakState":
+        return DelayBreakState(
+            self.schema_version,
+            tuple(
+                item if existing.rule_id == item.rule_id else existing
+                for existing in self.items
+            )
+            if self.for_rule(item.rule_id) is not None
+            else (*self.items, item),
+        )
+
+    def without(self, rule_id: str) -> "DelayBreakState":
+        ident = _rule_id(rule_id)
+        return DelayBreakState(
+            self.schema_version,
+            tuple(item for item in self.items if item.rule_id != ident),
+        )
+
+    def active_rule_ids(
+        self,
+        now_utc: datetime,
+        *,
+        clock_trusted: bool = True,
+    ) -> frozenset[str]:
+        if not clock_trusted:
+            return frozenset()
+        now = _utc(now_utc, "now_utc")
+        return frozenset(
+            item.rule_id
+            for item in self.items
+            if item.break_until_utc is not None and now < item.break_until_utc
+        )
 
 
 @dataclass(frozen=True)
@@ -414,6 +705,7 @@ class ControlState:
         clock_trusted: bool = True,
         *,
         root: bool = False,
+        schedule_active: bool = False,
     ) -> bool:
         if not isinstance(clock_trusted, bool):
             raise ControlError("clock_trusted must be a boolean")
@@ -424,6 +716,7 @@ class ControlState:
             now_utc,
             clock_trusted=clock_trusted,
             root=root,
+            schedule_active=schedule_active,
         )
 
     def effective_lock(
@@ -433,9 +726,15 @@ class ControlState:
         *,
         clock_trusted: bool = True,
         root: bool = False,
+        schedule_active: bool = False,
     ) -> RuleLock | None:
         lock = self.lock_for(rule_id)
-        if lock is not None and lock.is_effective(now_utc, clock_trusted=clock_trusted, root=root):
+        if lock is not None and lock.is_effective(
+            now_utc,
+            clock_trusted=clock_trusted,
+            root=root,
+            schedule_active=schedule_active,
+        ):
             return lock
         return None
 
@@ -445,8 +744,17 @@ class ControlState:
         *,
         clock_trusted: bool = True,
         root: bool = False,
+        schedule_active_rule_ids: frozenset[str] = frozenset(),
     ) -> tuple[dict[str, Any], ...]:
-        return tuple(lock.to_summary(now_utc, clock_trusted=clock_trusted, root=root) for lock in self.locks)
+        return tuple(
+            lock.to_summary(
+                now_utc,
+                clock_trusted=clock_trusted,
+                root=root,
+                schedule_active=lock.rule_id in schedule_active_rule_ids,
+            )
+            for lock in self.locks
+        )
 
     def with_locks(self, locks: tuple[RuleLock, ...] | list[RuleLock]) -> "ControlState":
         return ControlState(tuple(locks))

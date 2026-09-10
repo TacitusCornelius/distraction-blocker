@@ -7,6 +7,8 @@ from distraction_blocker.control import (
     SCRYPT_P,
     ControlError,
     ControlState,
+    DelayBreak,
+    DelayBreakState,
     RuleLock,
     _password_digest,
 )
@@ -27,6 +29,19 @@ class ControlTests(unittest.TestCase):
         self.assertTrue(summary["locked"])
         self.assertEqual(summary["rule_id"], RULE_ID)
 
+
+    def test_schedule_lock_effectiveness_is_supplied_by_weekly_schedule(self):
+        lock = RuleLock.schedule(RULE_ID)
+        restored = RuleLock.from_dict(lock.to_dict())
+        self.assertEqual(restored, lock)
+        self.assertFalse(restored.is_effective(NOW))
+        self.assertTrue(restored.is_effective(NOW, schedule_active=True))
+        self.assertFalse(restored.is_effective(NOW, schedule_active=True, root=True))
+        summary = ControlState((restored,)).summaries(
+            NOW,
+            schedule_active_rule_ids=frozenset({RULE_ID}),
+        )[0]
+        self.assertTrue(summary["locked"])
     def test_expired_only_with_trusted_clock(self):
         lock = RuleLock.timed(RULE_ID, NOW)
         self.assertFalse(lock.is_effective(NOW, clock_trusted=True))
@@ -124,6 +139,67 @@ class ControlTests(unittest.TestCase):
         with self.assertRaises(ControlError):
             RuleLock.from_dict({"rule_id": RULE_ID, "kind": "password", "until_utc": NOW.isoformat()})
 
+
+    def test_delay_lock_round_trip_and_schedule_effectiveness(self):
+        lock = RuleLock.delay(RULE_ID, 60, 1800)
+        restored = RuleLock.from_dict(lock.to_dict())
+        self.assertEqual(restored, lock)
+        self.assertFalse(restored.is_effective(NOW))
+        self.assertTrue(restored.is_effective(NOW, schedule_active=True))
+        self.assertFalse(
+            restored.is_effective(NOW, schedule_active=True, root=True)
+        )
+        summary = restored.to_summary(NOW, schedule_active=True)
+        self.assertEqual(summary["kind"], "delay")
+        self.assertEqual(summary["wait_seconds"], 60)
+        self.assertEqual(summary["break_seconds"], 1800)
+
+    def test_delay_lock_rejects_invalid_ranges_and_fields(self):
+        for wait, duration in ((0, 60), (86401, 60), (60, 59), (60, 86401)):
+            with self.subTest(wait=wait, duration=duration):
+                with self.assertRaises(ControlError):
+                    RuleLock.delay(RULE_ID, wait, duration)
+        with self.assertRaises(ControlError):
+            RuleLock.from_dict({
+                "rule_id": RULE_ID,
+                "kind": "delay",
+                "wait_seconds": 60,
+                "break_seconds": 1800,
+                "extra": True,
+            })
+
+    def test_delay_break_state_round_trip_and_clock_fail_closed(self):
+        pending = DelayBreak(
+            RULE_ID,
+            NOW,
+            NOW + timedelta(minutes=1),
+            1800,
+        )
+        state = DelayBreakState(items=(pending,))
+        self.assertEqual(DelayBreakState.from_dict(state.to_dict()), state)
+        self.assertEqual(
+            state.active_rule_ids(NOW, clock_trusted=True),
+            frozenset(),
+        )
+        self.assertEqual(
+            state.active_rule_ids(
+                NOW + timedelta(minutes=1), clock_trusted=True
+            ),
+            frozenset(),
+        )
+        self.assertEqual(
+            state.active_rule_ids(
+                NOW + timedelta(minutes=1), clock_trusted=False
+            ),
+            frozenset(),
+        )
+        active = state.replace(pending.start_break())
+        self.assertEqual(
+            active.active_rule_ids(NOW + timedelta(minutes=1), clock_trusted=True),
+            frozenset({RULE_ID}),
+        )
+        with self.assertRaises(ControlError):
+            DelayBreakState.from_dict({"items": []})
 
 if __name__ == "__main__":
     unittest.main()

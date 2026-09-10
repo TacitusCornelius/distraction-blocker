@@ -13,8 +13,9 @@ import tempfile
 from typing import Any
 
 from .actions import ScheduledActionsState
+from .allowance import AllowanceUsageState
 from .canonical import CanonicalError, format_utc, parse_utc
-from .control import ControlState
+from .control import ControlState, DelayBreakState
 from .model import POLICY_SCHEMA_VERSION, Policy, ValidationError
 from .statistics import StatisticsState, WebsiteDenialState, WebsiteUsageState
 
@@ -31,7 +32,6 @@ class LoadResult:
     degraded: bool = False
     clock_untrusted: bool = False
 
-
 class ProtectedStore:
     VERSION = 7
     KEY_NAME = "hmac.key"
@@ -40,7 +40,9 @@ class ProtectedStore:
     STATISTICS_NAME = "statistics.json"
     WEBSITE_STATISTICS_NAME = "website-statistics.json"
     WEBSITE_USAGE_NAME = "website-usage.json"
+    ALLOWANCE_USAGE_NAME = "allowance-usage.json"
     ACTIONS_NAME = "scheduled-actions.json"
+    DELAY_BREAKS_NAME = "delay-breaks.json"
     MAX_POLICY_BYTES = 16 * 1024 * 1024
     MAX_STATISTICS_BYTES = 1024 * 1024
 
@@ -68,6 +70,12 @@ class ProtectedStore:
     @property
     def website_usage_path(self) -> Path:
         return self.directory / self.WEBSITE_USAGE_NAME
+    @property
+    def allowance_usage_path(self) -> Path:
+        return self.directory / self.ALLOWANCE_USAGE_NAME
+    @property
+    def delay_breaks_path(self) -> Path:
+        return self.directory / self.DELAY_BREAKS_NAME
 
     def initialize(self) -> None:
         if self.directory.exists() and self.directory.is_symlink():
@@ -176,18 +184,23 @@ class ProtectedStore:
                 StatisticsState,
                 WebsiteDenialState,
                 WebsiteUsageState,
+                AllowanceUsageState,
                 ScheduledActionsState,
+                DelayBreakState,
             ),
         ):
             raise StorageError("signed state has an invalid type")
         unsigned = {"version": 1, "payload": state.to_dict()}
-        signature = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
+        signature = hmac.new(
+            self._require_key(),
+            self._canonical(unsigned),
+            hashlib.sha256,
+        ).hexdigest()
         return self._canonical({**unsigned, "hmac": signature})
-
     def _save_signed_state(
         self,
         path: Path,
-        state: StatisticsState | WebsiteDenialState | WebsiteUsageState | ScheduledActionsState,
+        state: StatisticsState | WebsiteDenialState | WebsiteUsageState | AllowanceUsageState | ScheduledActionsState | DelayBreakState,
         name: str,
     ) -> None:
         """Atomically save one signed state; ``name`` labels errors."""
@@ -255,6 +268,36 @@ class ProtectedStore:
             WebsiteUsageState.empty,
             WebsiteUsageState.from_dict,
             "website usage",
+        )
+
+    def save_allowance_usage(self, state: AllowanceUsageState) -> None:
+        """Atomically save the root-owned elapsed allowance ledger."""
+        self._save_signed_state(
+            self.allowance_usage_path, state, "allowance usage"
+        )
+
+    def load_allowance_usage(self) -> AllowanceUsageState:
+        """Load the signed elapsed allowance ledger, or an empty state."""
+        return self._load_signed_state(
+            self.allowance_usage_path,
+            AllowanceUsageState.empty,
+            AllowanceUsageState.from_dict,
+            "allowance usage",
+        )
+
+    def save_delay_breaks(self, state: DelayBreakState) -> None:
+        """Atomically save root-owned Delay runtime state."""
+        self._save_signed_state(
+            self.delay_breaks_path, state, "Delay breaks"
+        )
+
+    def load_delay_breaks(self) -> DelayBreakState:
+        """Load signed Delay runtime state, or return an empty state."""
+        return self._load_signed_state(
+            self.delay_breaks_path,
+            DelayBreakState.empty,
+            DelayBreakState.from_dict,
+            "Delay breaks",
         )
 
     def save_scheduled_actions(self, state: ScheduledActionsState) -> None:
@@ -342,14 +385,14 @@ class ProtectedStore:
             raise StorageError("policy is invalid")
         if "schema_version" in data and (
             type(data["schema_version"]) is not int
-            or data["schema_version"] not in {1, 2, 3}
+            or data["schema_version"] not in {1, 2, 3, 4}
         ):
             raise StorageError("old policy schema version is invalid")
         migrated = dict(data)
-        # Envelopes 1 through 6 predate the current network-control schema.
-        # Their rule shapes are a strict subset of the current schema, so a
-        # verified old envelope is authenticated and then forced into the
-        # current policy schema version.
+        # Verified pre-v5 policies have no elapsed-time allowance fields.
+        # Their rule shapes are a strict subset of the current schema, so
+        # they can be authenticated and then forced into the current policy
+        # schema version.
         migrated["schema_version"] = POLICY_SCHEMA_VERSION
         migrated.setdefault("managed_lists", [])
         rules = migrated.get("rules")
@@ -359,6 +402,10 @@ class ProtectedStore:
         for rule in rules:
             if not isinstance(rule, dict):
                 raise StorageError("policy rule is invalid")
+            if "allowance_time" in rule:
+                raise StorageError(
+                    "old policy contains an unsupported elapsed-time allowance"
+                )
             converted = dict(rule)
             schedule = converted.get("schedule")
             if isinstance(schedule, dict) and schedule.get("kind") == "weekly" and "periods" not in schedule:
@@ -380,7 +427,7 @@ class ProtectedStore:
         envelope = json.loads(raw.decode("utf-8"))
         version, payload = self._verify_envelope(
             envelope,
-            {1, 2, 3, 4, 5, self.VERSION},
+            {1, 2, 3, 4, 5, 6, self.VERSION},
             "policy",
         )
         old_fields = {"clock_untrusted", "high_water_utc", "policy"}
@@ -393,11 +440,13 @@ class ProtectedStore:
             raise StorageError("policy payload is invalid")
         if not isinstance(payload["clock_untrusted"], bool):
             raise StorageError("clock state is invalid")
-        policy_data = (
-            payload["policy"]
-            if version == self.VERSION
-            else self._migrate_policy(payload["policy"])
-        )
+        raw_policy = payload["policy"]
+        policy_data = raw_policy
+        if version != self.VERSION or (
+            isinstance(raw_policy, dict)
+            and raw_policy.get("schema_version") != POLICY_SCHEMA_VERSION
+        ):
+            policy_data = self._migrate_policy(raw_policy)
         policy = Policy.from_dict(policy_data)
         controls = (
             ControlState.from_dict(payload["controls"])
@@ -411,8 +460,8 @@ class ProtectedStore:
             degraded,
             payload["clock_untrusted"],
         )
-        if version != self.VERSION:
+        if version != self.VERSION or policy_data is not raw_policy:
             # Breadcrumb: verify the old signature first, then write only the
-            # converted v6 form.
+            # converted current form.
             self.save(policy, controls, result.high_water_utc, result.clock_untrusted)
         return result

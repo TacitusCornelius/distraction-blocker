@@ -30,15 +30,48 @@ MAX_POMODORO_CYCLES = 20
 # Breadcrumb: browser counters use exact JavaScript integers. A larger
 # allowance can never be reached by the extension.
 MAX_ALLOWANCE_STARTS = 2**53 - 1
-# Breadcrumb: schema 4 adds best-effort proxy and VPN endpoint controls to
-# the network target kind. Earlier policies are migrated by storage and
-# transfer before strict current-schema parsing.
-POLICY_SCHEMA_VERSION = 4
+MAX_TIME_ALLOWANCE_SECONDS = 24 * 60 * 60
+TIME_ALLOWANCE_MODES = frozenset({"strict", "total", "fixed_window"})
+# Breadcrumb: schema 5 adds elapsed-time allowance configuration while
+# retaining allowance_starts as a separate legacy behavior.
+POLICY_SCHEMA_VERSION = 5
 # Breadcrumb: the closed set of network control names a network target may
 # carry. The value is a fixed control name, never raw firewall input.
 NETWORK_CONTROLS = frozenset(
     {"whole_internet", "alternate_dns", "safe_search", "doh", "proxy", "vpn"}
 )
+
+NOTIFICATION_CATEGORIES = ("state_changes", "upcoming_changes")
+NOTIFICATION_CATEGORY_SET = frozenset(NOTIFICATION_CATEGORIES)
+def _notification_settings(value: Any) -> tuple[bool, tuple[str, ...]]:
+    settings = _object(
+        value,
+        {"enabled", "categories"},
+        "rule notifications",
+    )
+    if not isinstance(settings.get("enabled"), bool):
+        _error("bad_type", "notification enabled must be a boolean")
+    raw_categories = settings.get("categories")
+    if not isinstance(raw_categories, list):
+        _error("bad_type", "notification categories must be a list")
+    if any(
+        not isinstance(category, str)
+        or category not in NOTIFICATION_CATEGORY_SET
+        for category in raw_categories
+    ):
+        _error("bad_value", "notification category is not supported")
+    if settings["enabled"] and not raw_categories:
+        _error("bad_value", "enabled notifications require a category")
+    if len(set(raw_categories)) != len(raw_categories):
+        _error("bad_value", "notification categories must be unique")
+    return (
+        settings["enabled"],
+        tuple(
+            category
+            for category in NOTIFICATION_CATEGORIES
+            if category in raw_categories
+        ),
+    )
 
 
 def _error(code: str, message: str) -> None:
@@ -258,6 +291,111 @@ class Target:
     def to_dict(self) -> dict[str, str]:
         return {"kind": self.kind, "value": self.value}
 
+@dataclass(frozen=True)
+class PeriodAllowance:
+    """Elapsed-time budget for one weekly period occurrence."""
+
+    mode: str
+    quota_seconds: int | None = None
+    window_seconds: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PeriodAllowance":
+        obj = _object(
+            data,
+            {"mode", "quota_seconds", "window_seconds"},
+            "period allowance",
+        )
+        mode = _string(obj.get("mode"), "period allowance mode").strip()
+        if mode not in TIME_ALLOWANCE_MODES:
+            _error("bad_value", "period allowance mode is not supported")
+        if mode == "strict":
+            if set(obj) != {"mode"}:
+                _error("bad_value", "strict period allowance fields are invalid")
+            return cls(mode)
+        if mode == "total":
+            if set(obj) != {"mode", "quota_seconds"}:
+                _error("bad_value", "total period allowance fields are invalid")
+            quota = _integer(
+                obj["quota_seconds"],
+                "period allowance quota_seconds",
+                minimum=60,
+                maximum=MAX_TIME_ALLOWANCE_SECONDS,
+            )
+            return cls(mode, quota)
+        if set(obj) != {"mode", "quota_seconds", "window_seconds"}:
+            _error("bad_value", "fixed period allowance fields are invalid")
+        quota = _integer(
+            obj["quota_seconds"],
+            "period allowance quota_seconds",
+            minimum=60,
+            maximum=MAX_TIME_ALLOWANCE_SECONDS,
+        )
+        window = _integer(
+            obj["window_seconds"],
+            "period allowance window_seconds",
+            minimum=60,
+            maximum=MAX_TIME_ALLOWANCE_SECONDS,
+        )
+        if quota > window:
+            _error("bad_value", "period allowance quota exceeds its window")
+        return cls(mode, quota, window)
+
+    def to_dict(self) -> dict[str, Any]:
+        result = {"mode": self.mode}
+        if self.mode == "total":
+            result["quota_seconds"] = self.quota_seconds
+        elif self.mode == "fixed_window":
+            result["quota_seconds"] = self.quota_seconds
+            result["window_seconds"] = self.window_seconds
+        return result
+
+
+@dataclass(frozen=True)
+class TimeAllowance:
+    """Elapsed-time allowances attached to a weekly rule."""
+
+    periods: tuple[PeriodAllowance, ...]
+    daily_cap_seconds: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TimeAllowance":
+        obj = _object(
+            data,
+            {"periods", "daily_cap_seconds"},
+            "time allowance",
+        )
+        if set(obj) != {"periods", "daily_cap_seconds"}:
+            _error("bad_value", "time allowance fields are incomplete")
+        raw_periods = obj["periods"]
+        if not isinstance(raw_periods, list) or not raw_periods:
+            _error(
+                "bad_type" if not isinstance(raw_periods, list) else "bad_value",
+                "time allowance periods must be a non-empty list",
+            )
+        if len(raw_periods) > MAX_WEEKLY_PERIODS:
+            _error("bad_value", "too many time allowance periods")
+        periods = tuple(PeriodAllowance.from_dict(item) for item in raw_periods)
+        raw_daily = obj["daily_cap_seconds"]
+        daily = (
+            None
+            if raw_daily is None
+            else _integer(
+                raw_daily,
+                "time allowance daily_cap_seconds",
+                minimum=60,
+                maximum=MAX_TIME_ALLOWANCE_SECONDS,
+            )
+        )
+        return cls(periods, daily)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "periods": [period.to_dict() for period in self.periods],
+            "daily_cap_seconds": self.daily_cap_seconds,
+        }
+
+
 
 @dataclass(frozen=True)
 class WeeklyPeriod:
@@ -375,6 +513,46 @@ class Schedule:
         pause = timedelta(minutes=self.break_minutes)
         return self.start_utc + work * self.cycles + pause * (self.cycles - 1)
 
+    def has_overlapping_periods(self) -> bool:
+        """Return whether weekly period rows overlap on the local week."""
+        if self.kind != "weekly":
+            return False
+        week_seconds = 7 * 24 * 60 * 60
+        day_seconds = 24 * 60 * 60
+        intervals: list[tuple[int, int]] = []
+        for period in self.periods:
+            start_clock = (
+                period.start_local.hour * 60 * 60
+                + period.start_local.minute * 60
+                + period.start_local.second
+            )
+            end_clock = (
+                period.end_local.hour * 60 * 60
+                + period.end_local.minute * 60
+                + period.end_local.second
+            )
+            duration = (
+                end_clock - start_clock
+                if end_clock > start_clock
+                else day_seconds + end_clock - start_clock
+            )
+            for weekday in period.weekdays:
+                start = weekday * day_seconds + start_clock
+                end = start + duration
+                if end <= week_seconds:
+                    intervals.append((start, end))
+                else:
+                    intervals.append((start, week_seconds))
+                    intervals.append((0, end - week_seconds))
+        intervals.sort()
+        previous_end = -1
+        for start, end in intervals:
+            if start < previous_end:
+                return True
+            previous_end = max(previous_end, end)
+        return False
+
+
     def is_active(self, now_utc: datetime) -> bool:
         if not isinstance(now_utc, datetime) or now_utc.tzinfo is None or now_utc.utcoffset() != timedelta(0):
             _error("bad_value", "now_utc must be an aware UTC time")
@@ -430,11 +608,15 @@ class Rule:
     targets: tuple[Target, ...]
     schedule: Schedule
     revision: int
-    # Breadcrumb: the optional daily budget remains part of policy schema 3.
-    # Future incompatible shapes must increment POLICY_SCHEMA_VERSION.
+    # Breadcrumb: allowance_starts remains the legacy daily URL-start budget.
     allowance_starts: int | None = None
+    # Elapsed-time allowances are a separate, weekly URL-level contract.
+    time_allowance: TimeAllowance | None = None
     # URL-level exceptions are browser-only allows inside matching rules.
     exceptions: tuple[Target, ...] = ()
+    notifications_enabled: bool = True
+    notification_categories: tuple[str, ...] = NOTIFICATION_CATEGORIES
+
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Rule":
@@ -448,7 +630,9 @@ class Rule:
                 "schedule",
                 "revision",
                 "allowance_starts",
+                "allowance_time",
                 "exceptions",
+                "notifications",
             },
             "rule",
         )
@@ -476,11 +660,9 @@ class Rule:
         if len(set(exceptions)) != len(exceptions):
             _error("bad_value", "exceptions must be unique")
         schedule = Schedule.from_dict(obj.get("schedule"))
-        revision = _integer(obj.get("revision"), "revision", minimum=0)
+        revision = _integer(obj.get("revision"), "rule revision", minimum=0)
         # Breadcrumb: _integer rejects bools, so true/false can never pose
-        # as an allowance; absence keeps the field optional.
-        # Breadcrumb: only URL-level targets have main-frame start events that
-        # the extension can count. Rules without a budget keep all target kinds.
+        # as an allowance; absence keeps both fields optional.
         allowance = (
             _integer(
                 obj["allowance_starts"],
@@ -498,6 +680,45 @@ class Rule:
                 "bad_value",
                 "allowance_starts requires URL-level targets",
             )
+        time_allowance = (
+            TimeAllowance.from_dict(obj["allowance_time"])
+            if "allowance_time" in obj
+            else None
+        )
+        if time_allowance is not None:
+            if allowance is not None:
+                _error(
+                    "bad_value",
+                    "allowance_starts and allowance_time cannot coexist",
+                )
+            if schedule.kind != "weekly":
+                _error(
+                    "bad_value",
+                    "allowance_time requires a weekly schedule",
+                )
+            if len(time_allowance.periods) != len(schedule.periods):
+                _error(
+                    "bad_value",
+                    "allowance_time periods must match the weekly schedule",
+                )
+            if any(
+                target.kind not in Target.URL_LIKE_KINDS
+                for target in targets
+            ):
+                _error(
+                    "bad_value",
+                    "allowance_time requires URL-level targets",
+                )
+            if schedule.has_overlapping_periods():
+                _error(
+                    "bad_value",
+                    "allowance_time does not support overlapping periods",
+                )
+        notifications_enabled, notification_categories = (
+            _notification_settings(obj["notifications"])
+            if "notifications" in obj
+            else (True, NOTIFICATION_CATEGORIES)
+        )
         return cls(
             ident,
             name,
@@ -506,8 +727,12 @@ class Rule:
             schedule,
             revision,
             allowance,
+            time_allowance,
             exceptions,
+            notifications_enabled,
+            notification_categories,
         )
+
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -520,10 +745,20 @@ class Rule:
         }
         if self.allowance_starts is not None:
             data["allowance_starts"] = self.allowance_starts
+        if self.time_allowance is not None:
+            data["allowance_time"] = self.time_allowance.to_dict()
         if self.exceptions:
             data["exceptions"] = [
                 target.to_dict() for target in self.exceptions
             ]
+        if (
+            not self.notifications_enabled
+            or self.notification_categories != NOTIFICATION_CATEGORIES
+        ):
+            data["notifications"] = {
+                "enabled": self.notifications_enabled,
+                "categories": list(self.notification_categories),
+            }
         return data
 
     def is_active(self, now_utc: datetime, clock_trusted: bool = True) -> bool:
@@ -663,7 +898,12 @@ class PolicyProjection:
             "revision",
             "budget_exhausted",
         }
-        allowed = required | {"allowance_starts", "exceptions"}
+        allowed = required | {
+            "allowance_starts",
+            "allowance_time",
+            "exceptions",
+            "notifications",
+        }
         normalized: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         for raw_rule in raw_rules:

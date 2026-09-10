@@ -8,7 +8,7 @@ from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from distraction_blocker.control import ControlState
+from distraction_blocker.control import ControlState, DelayBreakState
 from distraction_blocker.model import POLICY_SCHEMA_VERSION, ManagedList, Policy, Rule
 from distraction_blocker.rpc import Client, RpcServer, response_fits
 from distraction_blocker.service import BlockerService
@@ -50,6 +50,9 @@ class FakeStore:
         self.statistics_saves = []
         self.fail_statistics = False
         self.fail_policy = False
+        self.delay_breaks = DelayBreakState.empty()
+        self.delay_break_saves = []
+        self.fail_delay_breaks = False
 
     def initialize(self):
         return None
@@ -75,6 +78,14 @@ class FakeStore:
 
     def load_website_usage(self):
         return self.website_usage
+    def load_delay_breaks(self):
+        return self.delay_breaks
+
+    def save_delay_breaks(self, state):
+        if self.fail_delay_breaks:
+            raise OSError("delay break storage unavailable")
+        self.delay_breaks = state
+        self.delay_break_saves.append(state)
 
     def save_website_usage(self, state):
         if self.fail_statistics:
@@ -426,7 +437,7 @@ class ServiceTests(unittest.TestCase):
         service.close()
         self.assertEqual(len(store.statistics_saves), 1)
 
-    def test_active_finite_rule_rejects_weaker_changes(self):
+    def test_active_finite_rule_can_disable_when_unlocked(self):
         rule = Rule.from_dict({
             "id": "12345678-1234-5678-1234-567812345678",
             "name": "Work",
@@ -446,16 +457,18 @@ class ServiceTests(unittest.TestCase):
             FakeStore(Policy(0, (rule,))), FakeClock(), FakeHosts(), FakeApplications()
         )
         service.start()
-        disabled = service.dispatch(
-            1000, {"command": "set_enabled", "rule_id": rule.id, "enabled": False}
-        )
-        self.assertEqual(disabled["error"]["code"], "active_rule")
-        deleted = service.dispatch(1000, {"command": "delete_rule", "rule_id": rule.id})
-        self.assertEqual(deleted["error"]["code"], "active_rule")
         changed = rule.to_dict()
         changed["targets"] = changed["targets"][:1]
         edited = service.dispatch(1000, {"command": "put_rule", "rule": changed})
         self.assertEqual(edited["error"]["code"], "active_rule")
+        disabled = service.dispatch(
+            1000, {"command": "set_enabled", "rule_id": rule.id, "enabled": False}
+        )
+        self.assertTrue(disabled["ok"])
+        deleted = service.dispatch(
+            1000, {"command": "delete_rule", "rule_id": rule.id}
+        )
+        self.assertTrue(deleted["ok"])
 
     def test_indefinite_rule_can_be_disabled_then_deleted(self):
         rule = Rule.from_dict({
@@ -559,6 +572,243 @@ class ServiceTests(unittest.TestCase):
             1000, {"command": "delete_rule", "rule_id": rule.id}
         )
         self.assertTrue(deleted["ok"])
+
+
+    def test_schedule_lock_follows_weekly_active_period(self):
+        clock = FakeClock(datetime(2026, 1, 1, 12, tzinfo=timezone.utc))
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Scheduled",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {
+                "kind": "weekly",
+                "timezone": "UTC",
+                "periods": [
+                    {"weekdays": [3], "start": "09:00", "end": "17:00"}
+                ],
+            },
+            "revision": 0,
+        })
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,))),
+            clock,
+            FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        locked = service.dispatch(1000, {
+            "command": "set_rule_lock",
+            "rule_id": rule.id,
+            "lock": {"kind": "schedule"},
+        })
+        self.assertTrue(locked["ok"], locked)
+        self.assertTrue(locked["result"]["locked"])
+        refused = service.dispatch(1000, {
+            "command": "set_enabled",
+            "rule_id": rule.id,
+            "enabled": False,
+        })
+        self.assertEqual(refused["error"]["code"], "schedule_lock")
+        clock.current = datetime(2026, 1, 1, 18, tzinfo=timezone.utc)
+        listed = service.dispatch(1000, {"command": "list_locks"})
+        self.assertFalse(listed["result"][0]["locked"])
+        disabled = service.dispatch(1000, {
+            "command": "set_enabled",
+            "rule_id": rule.id,
+            "enabled": False,
+        })
+        self.assertTrue(disabled["ok"], disabled)
+    def test_delay_lock_configuration_round_trips_through_service(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Delayed",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,))),
+            FakeClock(),
+            FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        result = service.dispatch(1000, {
+            "command": "set_rule_lock",
+            "rule_id": rule.id,
+            "lock": {
+                "kind": "delay",
+                "wait_seconds": 60,
+                "break_seconds": 1800,
+            },
+        })
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"]["kind"], "delay")
+        self.assertEqual(result["result"]["wait_seconds"], 60)
+        self.assertEqual(result["result"]["break_seconds"], 1800)
+        listed = service.dispatch(1000, {"command": "list_locks"})
+        self.assertEqual(listed["result"][0]["kind"], "delay")
+        refused = service.dispatch(1000, {
+            "command": "set_enabled",
+            "rule_id": rule.id,
+            "enabled": False,
+        })
+        self.assertEqual(refused["error"]["code"], "delay_lock")
+
+
+    def test_delay_break_lifecycle_persists_and_preserves_other_rule_enforcement(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Delayed",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        clock = FakeClock()
+        store = FakeStore(Policy(0, (rule,)))
+        service = BlockerService(store, clock, FakeHosts(), FakeApplications())
+        service.start()
+        self.assertEqual(service.hosts.values, {"example.com"})
+        configured = service.dispatch(1000, {
+            "command": "set_rule_lock",
+            "rule_id": rule.id,
+            "lock": {"kind": "delay", "wait_seconds": 60, "break_seconds": 180},
+        })
+        self.assertTrue(configured["ok"], configured)
+        pending = service.dispatch(1000, {
+            "command": "request_delay_break", "rule_id": rule.id,
+        })
+        self.assertTrue(pending["ok"], pending)
+        self.assertIsNotNone(pending["result"]["pending_until_utc"])
+        self.assertEqual(service.hosts.values, {"example.com"})
+        repeated = service.dispatch(1000, {
+            "command": "request_delay_break", "rule_id": rule.id,
+        })
+        self.assertEqual(
+            repeated["result"]["pending_until_utc"],
+            pending["result"]["pending_until_utc"],
+        )
+        canceled = service.dispatch(1000, {
+            "command": "cancel_delay_break", "rule_id": rule.id,
+        })
+        self.assertTrue(canceled["ok"], canceled)
+        pending = service.dispatch(1000, {
+            "command": "request_delay_break", "rule_id": rule.id,
+        })
+        self.assertTrue(pending["ok"], pending)
+        restarted_hosts = FakeHosts()
+        restarted = BlockerService(
+            store, clock, restarted_hosts, FakeApplications()
+        )
+        restarted.start()
+        self.assertEqual(restarted_hosts.values, {"example.com"})
+        clock.current += timedelta(seconds=60)
+        restarted.tick()
+        self.assertEqual(restarted_hosts.values, set())
+        active = restarted.dispatch(1000, {"command": "list_locks"})
+        cannot_cancel = restarted.dispatch(1000, {
+            "command": "cancel_delay_break", "rule_id": rule.id,
+        })
+        self.assertEqual(cannot_cancel["error"]["code"], "break_active")
+        self.assertIsNotNone(active["result"][0]["break_until_utc"])
+        clock.trusted = False
+        untrusted = restarted.dispatch(1000, {
+            "command": "request_delay_break", "rule_id": rule.id,
+        })
+        self.assertEqual(untrusted["error"]["code"], "clock_untrusted")
+        clock.trusted = True
+        other = Rule.from_dict({
+            "id": "22345678-1234-5678-1234-567812345678",
+            "name": "Other",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        added = restarted.dispatch(1000, {
+            "command": "put_rule", "rule": other.to_dict(),
+        })
+        self.assertTrue(added["ok"], added)
+        clock.current += timedelta(seconds=181)
+        restarted.tick()
+        self.assertEqual(restarted_hosts.values, {"example.com"})
+
+    def test_clearing_active_delay_lock_reconciles_immediately(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Delayed",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        clock = FakeClock()
+        store = FakeStore(Policy(0, (rule,)))
+        service = BlockerService(store, clock, FakeHosts(), FakeApplications())
+        service.start()
+        service.dispatch(1000, {
+            "command": "set_rule_lock",
+            "rule_id": rule.id,
+            "lock": {"kind": "delay", "wait_seconds": 60, "break_seconds": 180},
+        })
+        service.dispatch(1000, {
+            "command": "request_delay_break", "rule_id": rule.id,
+        })
+        clock.current += timedelta(seconds=60)
+        service.tick()
+        self.assertEqual(service.hosts.values, set())
+        cleared = service.dispatch(0, {
+            "command": "set_rule_lock",
+            "rule_id": rule.id,
+            "lock": {"kind": "none"},
+        })
+        self.assertTrue(cleared["ok"], cleared)
+        self.assertEqual(service.hosts.values, {"example.com"})
+        self.assertEqual(store.delay_breaks.items, ())
+
+    def test_failed_delay_lock_change_preserves_break_state(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Delayed",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        clock = FakeClock()
+        store = FakeStore(Policy(0, (rule,)))
+        service = BlockerService(store, clock, FakeHosts(), FakeApplications())
+        service.start()
+        service.dispatch(1000, {
+            "command": "set_rule_lock",
+            "rule_id": rule.id,
+            "lock": {"kind": "delay", "wait_seconds": 60, "break_seconds": 180},
+        })
+        service.dispatch(1000, {
+            "command": "request_delay_break", "rule_id": rule.id,
+        })
+        clock.current += timedelta(seconds=60)
+        service.tick()
+        store.fail_policy = True
+        with self.assertRaises(OSError):
+            service.dispatch(0, {
+                "command": "set_rule_lock",
+                "rule_id": rule.id,
+                "lock": {"kind": "none"},
+            })
+        self.assertEqual(service.hosts.values, set())
+        self.assertEqual(len(service._delay_breaks.items), 1)
+        self.assertEqual(store.delay_breaks, service._delay_breaks)
+        renamed = {**rule.to_dict(), "name": "Still delayed"}
+        with self.assertRaises(OSError):
+            service.dispatch(1000, {
+                "command": "put_rule", "rule": renamed,
+            })
+        self.assertEqual(len(service._delay_breaks.items), 1)
+        self.assertEqual(store.delay_breaks, service._delay_breaks)
 
     def test_friction_authorization_is_exact_and_single_use(self):
         rule = Rule.from_dict({

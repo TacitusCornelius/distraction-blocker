@@ -80,7 +80,7 @@ class ExportTests(unittest.TestCase):
         text = native_export_text(policy, datetime(2026, 8, 13, 12, tzinfo=timezone.utc))
         value = json.loads(text)
         self.assertEqual(value["format"], "distraction-blocker")
-        self.assertEqual(value["version"], 5)
+        self.assertEqual(value["version"], 6)
         self.assertEqual(parse_native_export(text), policy)
 
     def test_native_v1_import_converts_to_empty_lists(self):
@@ -121,7 +121,7 @@ class ExportTests(unittest.TestCase):
         })
         policy = Policy(0, (rule,))
         text = native_export_text(policy, datetime(2026, 8, 13, 12, tzinfo=timezone.utc))
-        self.assertEqual(json.loads(text)["version"], 5)
+        self.assertEqual(json.loads(text)["version"], 6)
         self.assertEqual(parse_native_export(text), policy)
 
     def test_native_v2_import_refuses_network_targets(self):

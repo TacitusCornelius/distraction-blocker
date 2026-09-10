@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { rules_from_policy } from "../core/policy.js";
 
 const current = {
-  schema_version: 4,
+  schema_version: 5,
   revision: 7,
   rules: [{ id: "rule-1" }],
 };
@@ -21,7 +21,7 @@ test("policy parser rejects missing, unknown, and invalid outer values", () => {
     [],
     { revision: 7, rules: [] },
     { ...current, schema_version: 1 },
-    { ...current, schema_version: 5 },
+    { ...current, schema_version: 6 },
     { ...current, revision: -1 },
     { ...current, revision: true },
     { ...current, rules: {} },

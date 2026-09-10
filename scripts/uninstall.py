@@ -77,6 +77,7 @@ POLICY_FILES = (
     "website-statistics.json",
     "website-usage.json",
     "scheduled-actions.json",
+    "delay-breaks.json",
 )
 MARKER_NAME = "INSTALLATION"
 MARKER_TEXT = "distraction-blocker\n"
@@ -233,18 +234,21 @@ def restore_owner_notifications(uid: int | None) -> None:
     if source.is_symlink() or not source.is_file():
         fail("refusing to read an unsafe notification preference path")
     try:
-        saved = json.loads(source.read_text(encoding="utf-8"))
-        if (
-            set(saved) != {"show_banners", "show_in_lock_screen"}
-            or not isinstance(saved["show_banners"], bool)
-            or not isinstance(saved["show_in_lock_screen"], bool)
-        ):
-            raise ValueError
+        source_root = str(Path(__file__).resolve().parent.parent)
+        if source_root not in sys.path:
+            sys.path.insert(0, source_root)
+        from distraction_blocker.notifications import NotificationState
+
+        state = NotificationState.from_dict(
+            json.loads(source.read_text(encoding="utf-8"))
+        )
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
         fail("saved notification preferences are invalid")
     try:
-        for key in ("show-banners", "show-in-lock-screen"):
-            value = "true" if saved[key.replace("-", "_")] else "false"
+        for key, value in zip(
+            ("show-banners", "show-in-lock-screen"),
+            (state.show_banners, state.show_in_lock_screen),
+        ):
             subprocess.run(
                 [
                     "/usr/sbin/runuser",
@@ -255,7 +259,7 @@ def restore_owner_notifications(uid: int | None) -> None:
                     "set",
                     "org.gnome.desktop.notifications",
                     key,
-                    value,
+                    "true" if value else "false",
                 ],
                 check=True,
                 timeout=30,

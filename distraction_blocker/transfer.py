@@ -15,9 +15,9 @@ from uuid import uuid4
 from .model import POLICY_SCHEMA_VERSION, ManagedList, Policy, Rule, Schedule, Target, ValidationError
 
 NATIVE_FORMAT = "distraction-blocker"
-# Version 5 adds best-effort proxy and VPN endpoint controls; earlier
-# portable files are migrated on import when their targets remain supported.
-NATIVE_VERSION = 5
+# Version 6 adds elapsed-time allowance policy fields; earlier portable
+# files are migrated on import when their targets remain supported.
+NATIVE_VERSION = 6
 MAX_DOMAIN_IMPORT_BYTES = 4 * 1024 * 1024
 MAX_NATIVE_IMPORT_BYTES = 8 * 1024 * 1024
 MAX_IMPORT_ENTRIES = 50_000
@@ -546,7 +546,7 @@ def parse_native_export(text: str) -> Policy:
     if value.get("format") != NATIVE_FORMAT:
         raise TransferError("native export format is not supported")
     version = value.get("version")
-    if type(version) is not int or version not in {1, 2, 3, 4, NATIVE_VERSION}:
+    if type(version) is not int or version not in {1, 2, 3, 4, 5, NATIVE_VERSION}:
         raise TransferError("native export version is not supported")
     raw_rules = value.get("rules")
     if not isinstance(raw_rules, list):
@@ -555,6 +555,10 @@ def parse_native_export(text: str) -> Policy:
         for raw_rule in raw_rules:
             if not isinstance(raw_rule, Mapping) or not isinstance(raw_rule.get("targets"), list):
                 raise TransferError("native rule targets are invalid")
+            if version < NATIVE_VERSION and "allowance_time" in raw_rule:
+                raise TransferError(
+                    "elapsed-time allowances require native format v6"
+                )
             for target in raw_rule["targets"]:
                 if not isinstance(target, Mapping) or target.get("kind") != "network":
                     continue

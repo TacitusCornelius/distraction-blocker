@@ -11,6 +11,7 @@
 "use strict";
 
 import { compile_dnr, compile_inactive_tab_rule } from "./core/dnr.js";
+import { AllowanceTracker } from "./core/allowance.js";
 // Breadcrumb: observational attribution only. DNR does the blocking; this
 // matcher just attributes observed loads so denial counts match Firefox.
 import { compile } from "./core/engine.js";
@@ -20,6 +21,7 @@ import {
   bump_usage,
   COUNTER_MAX,
   decode_usage_key,
+  is_time_allowance_rule,
   partition_rules,
   prune_usage,
   restore_usage,
@@ -51,12 +53,54 @@ let usage_backup_scheduled = false;
 
 const TOTALS_KEY = "match_totals";
 const POLICY_KEY = "policy_snapshot";
+const ALLOWANCE_REPORTS_KEY = "allowance_reports";
+const TIMED_BLOCK_BASE = 1000000;
 let attribution_initialized = false;
 let attribution_paused = false;
 let startup_observations = [];
 let totals_backup_scheduled = false;
 let match_enforced = null;
 let match_allowance = null;
+let match_time_allowance = null;
+let active_tab_id = null;
+let active_tab_url = null;
+let allowance_timer = null;
+let timed_policy_rules = new Map();
+let timed_available_rules = new Set();
+let timed_block_ids = new Map();
+// Session rule updates share the lifecycle queue below.
+const allowance_tracker = new AllowanceTracker({
+  request_lease: (rule_id, seconds) =>
+    host_request({ command: "request_allowance_lease", rule_id, seconds }),
+  report_usage: ({ lease_id, report_id, start_utc, end_utc }) =>
+    host_request({
+      command: "report_allowance_usage",
+      lease_id,
+      report_id,
+      start_utc,
+      end_utc,
+    }),
+  on_exhausted: (rule_id) => {
+    timed_available_rules.delete(rule_id);
+    queue_timed_rule_block(rule_id, true);
+    queue_refresh();
+    schedule_allowance_pulse();
+  },
+  on_unavailable: (rule_id) => {
+    timed_available_rules.delete(rule_id);
+    queue_timed_rule_block(rule_id, true);
+    schedule_allowance_pulse();
+  },
+  on_available: (rule_id) => {
+    timed_available_rules.add(rule_id);
+    queue_timed_rule_block(rule_id, false);
+  },
+  on_pending_changed: (reports) => {
+    chrome.storage.session
+      .set({ [ALLOWANCE_REPORTS_KEY]: reports.map((report) => ({ ...report })) })
+      .catch(() => {});
+  },
+});
 let block_inactive = false;
 let inactive_error = null;
 let inactive_tab_ids = new Set();
@@ -123,6 +167,15 @@ const usage_ready = chrome.storage.session
   })
   .catch(() => {});
 
+const allowance_reports_ready = chrome.storage.session
+  .get(ALLOWANCE_REPORTS_KEY)
+  .then((stored) => {
+    allowance_tracker.restore_pending(
+      stored && stored[ALLOWANCE_REPORTS_KEY],
+    );
+  })
+  .catch(() => {});
+
 function restore_policy_snapshot(stored) {
   const snapshot = stored && stored[POLICY_KEY];
   if (!snapshot || !Array.isArray(snapshot.rules)) {
@@ -130,9 +183,16 @@ function restore_policy_snapshot(stored) {
   }
   try {
     const { enforced, allowance } = partition_rules(snapshot.rules);
+    const timed_allowance = allowance.filter(is_time_allowance_rule);
     const compiled = compile_dnr(enforced);
     match_enforced = compile(enforced);
     match_allowance = compile(allowance);
+    match_time_allowance = compile(timed_allowance);
+    timed_policy_rules = new Map(
+      timed_allowance.map((rule) => [rule.id, rule]),
+    );
+    timed_available_rules.clear();
+    queue_timed_blocks(timed_allowance);
     rule_meta.clear();
     for (const entry of compiled) {
       rule_meta.set(entry.rule.id, {
@@ -151,7 +211,8 @@ const attribution_ready = chrome.storage.session
   .get(POLICY_KEY)
   .then(async (stored) => {
     const restored = restore_policy_snapshot(stored);
-    await Promise.all([totals_ready, usage_ready]);
+    await Promise.all([totals_ready, usage_ready, allowance_reports_ready]);
+    await session_rule_queue;
     attribution_initialized = true;
     // Requests observed before restoration cannot be attributed safely
     // unless the persisted policy describes the dynamic DNR rules.
@@ -175,11 +236,11 @@ function queue_refresh() {
   });
 }
 
-// Breadcrumb: tab events can overlap while updateSessionRules is pending.
-// Serialize full tab snapshots so the last event always wins.
-let inactive_refresh_queue = Promise.resolve();
+// Browser lifecycle events can overlap while updateSessionRules is pending.
+// One queue keeps inactive and timed rules from racing each other.
+let session_rule_queue = Promise.resolve();
 function queue_inactive_refresh() {
-  inactive_refresh_queue = inactive_refresh_queue
+  session_rule_queue = session_rule_queue
     .then(refresh_inactive_tabs)
     .catch((error) => {
       inactive_error = String(error);
@@ -206,6 +267,55 @@ async function refresh_inactive_tabs() {
     inactive_ok: true,
     inactive_error: null,
   }).catch(() => {});
+}
+
+function rebuild_timed_blocks() {
+  const entries = compile_dnr([...timed_policy_rules.values()]);
+  const remove_rule_ids = [...timed_block_ids.values()].flat();
+  const add_rules = [];
+  const next_ids = new Map();
+  for (const [index, entry] of entries.entries()) {
+    const id = TIMED_BLOCK_BASE + index;
+    if (!timed_available_rules.has(entry.rule_id)) {
+      add_rules.push({ ...entry.rule, id });
+      const ids = next_ids.get(entry.rule_id) ?? [];
+      ids.push(id);
+      next_ids.set(entry.rule_id, ids);
+    }
+  }
+  return chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: remove_rule_ids,
+    addRules: add_rules,
+  }).then(() => {
+    timed_block_ids = next_ids;
+  });
+}
+
+function queue_timed_blocks(rules) {
+  timed_policy_rules = new Map(rules.map((rule) => [rule.id, rule]));
+  timed_available_rules.clear();
+  session_rule_queue = session_rule_queue
+    .then(rebuild_timed_blocks)
+    .catch((error) => {
+      record_state(`Timed allowance blocking update failed: ${String(error)}`);
+    });
+  return session_rule_queue;
+}
+
+function queue_timed_rule_block(rule_id, blocked) {
+  if (!timed_policy_rules.has(rule_id)) {
+    return;
+  }
+  if (blocked) {
+    timed_available_rules.delete(rule_id);
+  } else {
+    timed_available_rules.add(rule_id);
+  }
+  session_rule_queue = session_rule_queue
+    .then(rebuild_timed_blocks)
+    .catch((error) => {
+      record_state(`Timed allowance blocking update failed: ${String(error)}`);
+    });
 }
 
 chrome.storage.local.get(["block_inactive", "denials"]).then((stored) => {
@@ -314,6 +424,83 @@ function host_request(message) {
   });
 }
 
+function schedule_allowance_pulse() {
+  if (allowance_timer !== null) {
+    return;
+  }
+  allowance_timer = setTimeout(async () => {
+    allowance_timer = null;
+    try {
+      await allowance_tracker.pulse();
+    } finally {
+      if (allowance_tracker.needs_pulse) {
+        schedule_allowance_pulse();
+      }
+    }
+  }, 5000);
+  allowance_timer.unref?.();
+}
+
+function update_allowance_url(tab_id, url) {
+  if (tab_id !== active_tab_id) {
+    return;
+  }
+  active_tab_url = typeof url === "string" ? url : null;
+  void allowance_tracker.set_tab_match(
+    tab_id,
+    typeof url === "string" && match_time_allowance !== null
+      ? match_time_allowance(url)
+      : null,
+  );
+  schedule_allowance_pulse();
+}
+
+async function sync_active_tab(tab_id) {
+  try {
+    await allowance_reports_ready;
+    const tab = await chrome.tabs.get(tab_id);
+    if (tab && tab.id === tab_id) {
+      active_tab_id = tab_id;
+      active_tab_url = typeof tab.url === "string" ? tab.url : null;
+      await allowance_tracker.set_active_tab(
+        tab_id,
+        active_tab_url && match_time_allowance !== null
+          ? match_time_allowance(active_tab_url)
+          : null,
+      );
+      schedule_allowance_pulse();
+    }
+  } catch {
+    if (active_tab_id === tab_id) {
+      active_tab_id = null;
+      active_tab_url = null;
+      void allowance_tracker.set_active_tab(null, null);
+    }
+  }
+}
+
+async function sync_active_window() {
+  try {
+    await allowance_reports_ready;
+    if (chrome.windows?.getLastFocused) {
+      const window = await chrome.windows.getLastFocused();
+      await allowance_tracker.set_focused(window?.focused === true);
+    } else {
+      await allowance_tracker.set_focused(false);
+    }
+    const tabs = await chrome.tabs.query({
+      active: true,
+      lastFocusedWindow: true,
+    });
+    const tab = tabs[0];
+    if (tab?.id !== undefined) {
+      await sync_active_tab(tab.id);
+    }
+  } catch {
+    // A browser shutdown can invalidate a query; the next lifecycle event retries.
+  }
+}
+
 export async function apply_policy(policy) {
   await attribution_ready;
   let rules;
@@ -325,14 +512,17 @@ export async function apply_policy(policy) {
   }
 
   const { enforced, allowance } = partition_rules(rules);
+  const timed_allowance = allowance.filter(is_time_allowance_rule);
   let next_match_enforced;
   let next_match_allowance;
+  let next_match_time_allowance;
   let compiled;
   try {
     // Breadcrumb: compile every matcher before touching the active state.
     // A bad policy must not replace a working policy with a partial one.
     next_match_enforced = compile(enforced);
     next_match_allowance = compile(allowance);
+    next_match_time_allowance = compile(timed_allowance);
     compiled = compile_dnr(enforced);
   } catch (error) {
     record_state(`Policy compile failed: ${String(error.message ?? error)}`);
@@ -365,11 +555,17 @@ export async function apply_policy(policy) {
     });
   }
 
-  // Breadcrumb: DNR accepted the set, so now commit matchers and metadata.
-  // Stable pending totals stay queued, even when a rule leaves the policy.
+  // DNR accepted the set, so now commit matchers and metadata. Timed rules
+  // start blocked; a successful lease removes only its rule's session block.
   prune_usage(usage_totals, rules);
+  allowance_tracker.reset();
   match_enforced = next_match_enforced;
   match_allowance = next_match_allowance;
+  match_time_allowance = next_match_time_allowance;
+  await queue_timed_blocks(timed_allowance);
+  if (active_tab_id !== null && active_tab_url !== null) {
+    update_allowance_url(active_tab_id, active_tab_url);
+  }
   rule_meta.clear();
   for (const [dnr_id, meta] of next_rule_meta) {
     rule_meta.set(dnr_id, meta);
@@ -387,12 +583,14 @@ export async function apply_policy(policy) {
 async function refresh() {
   await totals_ready;
   await usage_ready;
+  await allowance_reports_ready;
   const response = await host_request({ command: "list_rules" });
   if (response && response.ok) {
     last_refresh_ms = Date.now();
     if (await apply_policy(response.result)) {
       await report_matches();
       await report_usage();
+      await allowance_tracker.pulse();
     }
   } else {
     record_state(
@@ -491,6 +689,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === REFRESH_ALARM) {
     queue_refresh();
   }
+  void allowance_tracker.pulse();
 });
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -502,6 +701,35 @@ chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create(REFRESH_ALARM, { periodInMinutes: REFRESH_MINUTES });
   queue_refresh();
 });
+chrome.tabs.onActivated?.addListener(({ tabId }) => {
+  active_tab_id = tabId;
+  active_tab_url = null;
+  void allowance_tracker.set_active_tab(tabId, null);
+  void sync_active_tab(tabId);
+});
+chrome.tabs.onUpdated?.addListener((tabId, changeInfo) => {
+  if (typeof changeInfo.url === "string") {
+    update_allowance_url(tabId, changeInfo.url);
+  }
+});
+chrome.tabs.onRemoved?.addListener((tabId) => {
+  if (tabId === active_tab_id) {
+    active_tab_id = null;
+    active_tab_url = null;
+    void allowance_tracker.set_active_tab(null, null);
+  }
+});
+chrome.windows?.onFocusChanged?.addListener((windowId) => {
+  const none = chrome.windows?.WINDOW_ID_NONE ?? -1;
+  void allowance_tracker.set_focused(windowId !== none);
+  if (windowId !== none) {
+    void sync_active_window();
+  }
+});
+chrome.idle?.onStateChanged?.addListener((state) => {
+  void allowance_tracker.set_idle(state !== "active");
+});
+void sync_active_window();
 
 // Breadcrumb: observation only (no "blocking") — DNR enforces. Denial
 // counting here matches Firefox: a scope hit covered by rule_meta is about
@@ -521,14 +749,23 @@ function observe_request(details) {
       totals.count = Math.min(COUNTER_MAX, totals.count + 1);
       match_totals.set(key, totals);
       schedule_totals_backup();
+      if (details.type === "main_frame") {
+        update_allowance_url(details.tabId, null);
+      }
       return;
     }
   }
-  if (details.type === "main_frame" && match_allowance !== null) {
-    const allowed = match_allowance(details.url);
-    if (allowed !== null) {
-      bump_usage(usage_totals, allowed.rule_id, allowed.value);
-      schedule_usage_backup();
+  if (details.type === "main_frame") {
+    const timed = match_time_allowance === null
+      ? null
+      : match_time_allowance(details.url);
+    update_allowance_url(details.tabId, details.url);
+    if (timed === null && match_allowance !== null) {
+      const allowed = match_allowance(details.url);
+      if (allowed !== null) {
+        bump_usage(usage_totals, allowed.rule_id, allowed.value);
+        schedule_usage_backup();
+      }
     }
   }
   // Breadcrumb: the session DNR rule performs the block. This listener

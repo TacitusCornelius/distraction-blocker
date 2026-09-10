@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Distraction Blocker",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyOTL5DAZdFqTyKXv8EF8jKA3QK+OfKgptNDynphbMnIlcImz0Ml9aswf9CJ+iOicSF7RVikgyjA8/GGAgFFE7L1/lz23aQUQ07/gJZ3Ia8E18D8n7oSBMOjzx/fAi3wkVL4MUYqUUnwyp75WlP4AFQ95s8gg1gLEa60f8CtCPJjl87oWvXnqReIaU8283P0cxZJLda2XebCFX8iqGidBGrNVf9Fs37/j8ieQJz1H1IlZklQkflmlwon3RZWxC98WhvgwwRg4KQwmz8BNYuo+Bax5MK99raQXMeAMmP86i5pGSrCJVZwo3rfrZST3D7IGquJxqBt5ydNg96PyWfYMpwIDAQAB",
   "description": "Enforces URL-level rules authored by the Distraction Blocker root service.",
   "minimum_chrome_version": "121.0",
@@ -14,7 +14,9 @@
     "storage",
     "declarativeNetRequest",
     "alarms",
-    "webRequest"
+    "webRequest",
+    "tabs",
+    "idle"
   ],
   "host_permissions": ["<all_urls>"],
   "action": {

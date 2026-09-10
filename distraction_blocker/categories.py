@@ -48,6 +48,44 @@ _STARTER_DATA: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "Video",
+        "video",
+        (
+            "youtube.com", "www.youtube.com", "m.youtube.com",
+            "music.youtube.com", "gaming.youtube.com", "studio.youtube.com",
+            "tv.youtube.com", "kids.youtube.com",
+            "creatoracademy.youtube.com", "youtube-nocookie.com",
+            "www.youtube-nocookie.com", "youtu.be",
+            "youtube.googleapis.com", "googlevideo.com", "ytimg.com",
+            "i.ytimg.com", "s.ytimg.com", "yt3.ggpht.com",
+            "vimeo.com", "www.vimeo.com", "player.vimeo.com",
+            "dailymotion.com", "www.dailymotion.com",
+            "twitch.tv", "www.twitch.tv", "kick.com", "www.kick.com",
+            "rumble.com", "www.rumble.com", "streamable.com",
+            "www.streamable.com", "netflix.com", "www.netflix.com",
+            "hulu.com", "www.hulu.com", "disneyplus.com",
+            "www.disneyplus.com", "primevideo.com", "www.primevideo.com",
+            "max.com", "www.max.com", "peacocktv.com", "www.peacocktv.com",
+            "paramountplus.com", "www.paramountplus.com",
+            "crunchyroll.com", "www.crunchyroll.com", "tubitv.com",
+            "www.tubitv.com", "pluto.tv", "www.pluto.tv", "plex.tv",
+            "www.plex.tv", "fubo.tv", "www.fubo.tv",
+        ),
+    ),
+    (
+        "YouTube",
+        "youtube",
+        (
+            "youtube.com", "www.youtube.com", "m.youtube.com",
+            "music.youtube.com", "gaming.youtube.com", "studio.youtube.com",
+            "tv.youtube.com", "kids.youtube.com",
+            "creatoracademy.youtube.com", "youtube-nocookie.com",
+            "www.youtube-nocookie.com", "youtu.be",
+            "youtube.googleapis.com", "googlevideo.com", "ytimg.com",
+            "i.ytimg.com", "s.ytimg.com", "yt3.ggpht.com",
+        ),
+    ),
+    (
         "Adult content",
         "adult-content",
         (
@@ -63,11 +101,13 @@ _STARTER_IDS = (
     "8d2b8c55-29b7-4d2e-94b8-4dbd6a0d0003",
     "8d2b8c55-29b7-4d2e-94b8-4dbd6a0d0004",
     "8d2b8c55-29b7-4d2e-94b8-4dbd6a0d0005",
+    "8d2b8c55-29b7-4d2e-94b8-4dbd6a0d0006",
+    "8d2b8c55-29b7-4d2e-94b8-4dbd6a0d0007",
 )
 
 
 def starter_categories(imported_utc: datetime | None = None) -> tuple[ManagedList, ...]:
-    """Return the five built-in categories as normal managed lists."""
+    """Return the seven built-in categories as normal managed lists."""
     stamp = imported_utc or datetime.now(timezone.utc)
     if stamp.tzinfo is None or stamp.utcoffset() != timezone.utc.utcoffset(stamp):
         raise ValueError("imported_utc must be aware UTC")

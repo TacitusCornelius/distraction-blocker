@@ -24,7 +24,7 @@ from .model import (
     MAX_POMODORO_CYCLES,
     MAX_WEEKLY_PERIODS,
     NETWORK_CONTROLS,
-    POLICY_SCHEMA_VERSION,
+    NOTIFICATION_CATEGORIES,
     ManagedList,
     Policy,
     PolicyProjection,
@@ -90,6 +90,21 @@ SCHEDULE_KINDS = ("one_time", "weekly", "pomodoro", "indefinite")
 THEME_LABELS = ("System", "Light", "Dark")
 RULE_FILTER_LABELS = ("All", "Active", "Inactive", "Enabled", "Disabled")
 RULE_FILTERS = ("all", "active", "inactive", "enabled", "disabled")
+RULE_SORT_LABELS = ("Most recent", "Alphabetical A-Z", "Alphabetical Z-A")
+RULE_SORTS = ("recent", "name_asc", "name_desc")
+
+NOTIFICATION_CATEGORY_OPTIONS = (
+    (
+        "state_changes",
+        "Rule starts and ends",
+        "Notify when this rule becomes active or inactive.",
+    ),
+    (
+        "upcoming_changes",
+        "Upcoming schedule changes",
+        "Notify five minutes before this rule changes state.",
+    ),
+)
 FOCUS_DURATIONS = (15, 30, 60, 120)
 RPC_LIST_CHUNK_SIZE = 200
 # Breadcrumb for reviewers: JSON ASCII escaping can triple the UTF-8 size.
@@ -147,7 +162,10 @@ class LockSummary:
     locked: bool
     until_utc: datetime | None
     retry_after_utc: datetime | None
-
+    wait_seconds: int | None = None
+    break_seconds: int | None = None
+    pending_until_utc: datetime | None = None
+    break_until_utc: datetime | None = None
 
 @dataclass(frozen=True)
 class DenialStatView:
@@ -251,7 +269,11 @@ class RuleForm:
     allowance_starts: int | None = None
     # Breadcrumb: checked network controls; values are the exact network
     # target names and round-trip as kind "network" targets.
+    # New-rule convenience: open the full lock configuration after saving.
+    configure_lock_after_save: bool = False
     network_controls: tuple[str, ...] = ()
+    notifications_enabled: bool = True
+    notification_categories: tuple[str, ...] = NOTIFICATION_CATEGORIES
 
 
 @dataclass(frozen=True)
@@ -527,6 +549,16 @@ def form_to_rule(
                 "Daily start allowances require URL-level targets only."
             )
         rule_data["allowance_starts"] = form.allowance_starts
+    if form.notifications_enabled and not form.notification_categories:
+        raise FormError("Select at least one notification category.")
+    if (
+        not form.notifications_enabled
+        or form.notification_categories != NOTIFICATION_CATEGORIES
+    ):
+        rule_data["notifications"] = {
+            "enabled": form.notifications_enabled,
+            "categories": list(form.notification_categories),
+        }
     return Rule.from_dict(rule_data)
 
 
@@ -561,6 +593,8 @@ def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
         url_exceptions=url_exceptions,
         allowance_starts=rule.allowance_starts,
         network_controls=network_controls,
+        notifications_enabled=rule.notifications_enabled,
+        notification_categories=rule.notification_categories,
     )
 
 
@@ -713,21 +747,28 @@ def lock_summaries_from_results(
     items: Sequence[Mapping[str, object]],
 ) -> tuple[LockSummary, ...]:
     """Parse only the public rule-lock summary contract."""
-    expected = {"rule_id", "kind", "locked", "until_utc", "retry_after_utc"}
+    base = {"rule_id", "kind", "locked", "until_utc", "retry_after_utc"}
+    delay_fields = {
+        "wait_seconds",
+        "break_seconds",
+        "pending_until_utc",
+        "break_until_utc",
+    }
     summaries: list[LockSummary] = []
     seen_rule_ids: set[str] = set()
     for item in items:
-        # Breadcrumb for reviewers: lock summaries have a fixed public shape.
-        # Rejecting extra fields keeps passwords and protected state out of the GUI.
-        if not isinstance(item, Mapping) or set(item) != expected:
+        if not isinstance(item, Mapping) or not base.issubset(item):
+            raise FormError("The service returned an invalid lock summary.")
+        kind = item["kind"]
+        expected = base | delay_fields if kind == "delay" else base
+        if set(item) != expected:
             raise FormError("The service returned an invalid lock summary.")
         rule_id = _canonical_uuid(
             item["rule_id"], "The service returned an invalid lock rule ID."
         )
         if rule_id in seen_rule_ids:
             raise FormError("The service returned an invalid lock rule ID.")
-        kind = item["kind"]
-        if kind not in {"timed", "friction", "password"}:
+        if kind not in {"timed", "schedule", "friction", "password", "delay"}:
             raise FormError("The service returned an unsupported lock kind.")
         if not isinstance(item["locked"], bool):
             raise FormError("The service returned an invalid lock state.")
@@ -742,6 +783,30 @@ def lock_summaries_from_results(
             raise FormError("The service returned an invalid lock expiry.")
         if kind != "password" and retry_after_utc is not None:
             raise FormError("The service returned invalid lock retry data.")
+        wait_seconds = break_seconds = None
+        pending_until_utc = break_until_utc = None
+        if kind == "delay":
+            wait_seconds = item["wait_seconds"]
+            break_seconds = item["break_seconds"]
+            if (
+                isinstance(wait_seconds, bool)
+                or not isinstance(wait_seconds, int)
+                or not 1 <= wait_seconds <= 86400
+                or isinstance(break_seconds, bool)
+                or not isinstance(break_seconds, int)
+                or not 60 <= break_seconds <= 86400
+            ):
+                raise FormError("The service returned invalid Delay settings.")
+            pending_until_utc = _optional_utc_result(
+                item["pending_until_utc"],
+                "The service returned invalid Delay countdown data.",
+            )
+            break_until_utc = _optional_utc_result(
+                item["break_until_utc"],
+                "The service returned invalid Delay break data.",
+            )
+            if pending_until_utc is not None and break_until_utc is not None:
+                raise FormError("The service returned invalid Delay state.")
         seen_rule_ids.add(rule_id)
         summaries.append(
             LockSummary(
@@ -750,6 +815,10 @@ def lock_summaries_from_results(
                 item["locked"],
                 until_utc,
                 retry_after_utc,
+                wait_seconds,
+                break_seconds,
+                pending_until_utc,
+                break_until_utc,
             )
         )
     return tuple(summaries)
@@ -892,6 +961,46 @@ def website_usage_from_result(result: Mapping[str, object]) -> tuple[WebsiteUsag
         )
     return tuple(parsed)
 
+def delay_lock_request(
+    rule_id: str,
+    wait_seconds: int,
+    break_seconds: int,
+) -> dict[str, object]:
+    """Build the exact request fields for a Delay lock."""
+    _canonical_uuid(rule_id, "The rule ID is invalid.")
+    if (
+        isinstance(wait_seconds, bool)
+        or not isinstance(wait_seconds, int)
+        or not 1 <= wait_seconds <= 86400
+    ):
+        raise FormError("The Delay wait must be between 1 and 86400 seconds.")
+    if (
+        isinstance(break_seconds, bool)
+        or not isinstance(break_seconds, int)
+        or not 60 <= break_seconds <= 86400
+    ):
+        raise FormError("The Delay break must be between 60 and 86400 seconds.")
+    return {
+        "rule_id": rule_id,
+        "lock": {
+            "kind": "delay",
+            "wait_seconds": wait_seconds,
+            "break_seconds": break_seconds,
+        },
+    }
+
+
+def request_delay_break_request(rule_id: str) -> dict[str, object]:
+    """Build the exact fields for requesting a Delay break."""
+    _canonical_uuid(rule_id, "The rule ID is invalid.")
+    return {"rule_id": rule_id}
+
+
+def cancel_delay_break_request(rule_id: str) -> dict[str, object]:
+    """Build the exact fields for cancelling a pending Delay break."""
+    _canonical_uuid(rule_id, "The rule ID is invalid.")
+    return {"rule_id": rule_id}
+
 def timed_lock_request(
     rule_id: str,
     local_until: str,
@@ -917,6 +1026,12 @@ def friction_lock_request(rule_id: str) -> dict[str, object]:
     """Build the exact request fields for a friction lock."""
     _canonical_uuid(rule_id, "The rule ID is invalid.")
     return {"rule_id": rule_id, "lock": {"kind": "friction"}}
+
+def schedule_lock_request(rule_id: str) -> dict[str, object]:
+    """Build the exact request fields for a weekly schedule lock."""
+    _canonical_uuid(rule_id, "The rule ID is invalid.")
+    return {"rule_id": rule_id, "lock": {"kind": "schedule"}}
+
 
 def _validated_password(password: object) -> str:
     if not isinstance(password, str):
@@ -952,13 +1067,40 @@ def remove_rule_lock_request(rule_id: str) -> dict[str, object]:
     """Build the exact request fields that remove a rule lock."""
     _canonical_uuid(rule_id, "The rule ID is invalid.")
     return {"rule_id": rule_id, "lock": {"kind": "none"}}
-
-
 def lock_summary_text(
     summary: LockSummary,
     timezone_name: str,
 ) -> str:
-    """Describe the effective state of a timed, friction, or password lock."""
+    """Describe the public state of any supported rule lock."""
+    if summary.kind == "delay":
+        if summary.wait_seconds is None or summary.break_seconds is None:
+            raise FormError("The Delay lock settings are invalid.")
+        text = (
+            f"Delay lock: {summary.wait_seconds}s wait, "
+            f"{summary.break_seconds // 60}m break."
+        )
+        boundary = summary.pending_until_utc or summary.break_until_utc
+        if boundary is None:
+            return text + (
+                " Request a break while this rule is active."
+                if summary.locked
+                else " Not effective outside the rule's active period."
+            )
+        try:
+            zone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as error:
+            raise FormError("The system time zone is invalid.") from error
+        utc_text = boundary.strftime("%Y-%m-%d %H:%M:%S UTC")
+        local_text = boundary.astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+        if summary.pending_until_utc is not None:
+            return f"{text} Countdown ends: {utc_text} ({local_text} local)."
+        return f"{text} Break ends: {utc_text} ({local_text} local)."
+    if summary.kind == "schedule":
+        return (
+            "Schedule lock: active during the rule's weekly periods."
+            if summary.locked
+            else "Schedule lock: not effective outside the rule's weekly periods."
+        )
     state = "locked" if summary.locked else "expired"
     if summary.kind == "friction":
         return (
@@ -1250,6 +1392,21 @@ def duplicate_rule(
     data["enabled"] = False
     data["revision"] = 0
     return Rule.from_dict(data)
+def sort_rules(
+    rules: Sequence[Rule], sort_filter: str
+) -> tuple[Rule, ...]:
+    """Sort policy-order rules by recency or case-insensitive name."""
+    if sort_filter not in RULE_SORTS:
+        raise FormError("Select a valid rule sort.")
+    if sort_filter == "recent":
+        # The service preserves policy insertion order; newest rules are last.
+        return tuple(reversed(rules))
+    reverse = sort_filter == "name_desc"
+    return tuple(sorted(
+        rules,
+        key=lambda rule: (rule.name.casefold(), rule.id),
+        reverse=reverse,
+    ))
 
 
 def filter_rules(
@@ -1258,9 +1415,12 @@ def filter_rules(
     state_filter: str,
     now_utc: datetime,
     clock_trusted: bool,
+    sort_filter: str = "recent",
 ) -> tuple[Rule, ...]:
     if state_filter not in RULE_FILTERS:
         raise FormError("Select a valid rule filter.")
+    if sort_filter not in RULE_SORTS:
+        raise FormError("Select a valid rule sort.")
     needle = query.strip().casefold()
     result: list[Rule] = []
     for rule in rules:
@@ -1278,7 +1438,7 @@ def filter_rules(
             if not any(needle in value.casefold() for value in values):
                 continue
         result.append(rule)
-    return tuple(result)
+    return sort_rules(result, sort_filter)
 
 
 def import_preview_text(preview: ImportPreview) -> str:
@@ -1407,19 +1567,56 @@ def _display_time(value: datetime) -> str:
     return value.astimezone(zone).strftime("%Y-%m-%d %H:%M %Z")
 
 
-def active_lock_explanation(rule: Rule, now_utc: datetime, clock_trusted: bool) -> str:
-    """Explain an active rule lock."""
+def active_lock_explanation(
+    rule: Rule,
+    now_utc: datetime,
+    clock_trusted: bool,
+    lock: LockSummary | None = None,
+) -> str:
+    """Explain why an effective rule lock blocks weakening changes."""
     if not rule.is_active(now_utc, clock_trusted=clock_trusted):
         return ""
-    kind = rule.to_dict()["schedule"]["kind"]
-    if kind == "indefinite":
-        return "This rule stays active until you disable it."
-    if not clock_trusted:
-        return "The clock is not trusted. The service blocks finite rules until root recovery."
-    change = next_state_change(rule, now_utc)
-    if change is None:
-        return "This active rule cannot be disabled or deleted."
-    return f"This active rule cannot be weakened before {_display_time(change.at_utc)}."
+    if lock is None or not lock.locked:
+        if rule.schedule.kind == "indefinite":
+            return "This rule stays active until you disable it."
+        return ""
+    if lock.kind == "timed":
+        if lock.until_utc is None:
+            return ""
+        return (
+            "This locked rule cannot be weakened before "
+            f"{_display_time(lock.until_utc)}."
+        )
+    if lock.kind == "schedule":
+        if not clock_trusted:
+            return (
+                "This locked rule remains effective until the trusted clock "
+                "is restored."
+            )
+        change = next_state_change(rule, now_utc, clock_trusted)
+        if change is not None:
+            return (
+                "This locked rule cannot be weakened before "
+                f"{_display_time(change.at_utc)}."
+            )
+        return "This locked rule cannot be weakened until its weekly period ends."
+    if lock.kind == "delay":
+        if lock.pending_until_utc is not None:
+            return (
+                "This Delay lock is counting down; the rule remains enforced "
+                f"until {_display_time(lock.pending_until_utc)}."
+            )
+        if lock.break_until_utc is not None:
+            return (
+                "This Delay lock's temporary break ends "
+                f"at {_display_time(lock.break_until_utc)}."
+            )
+        return "Request a temporary break; this Delay lock still blocks weakening changes."
+    if lock.kind == "friction":
+        return "This rule cannot be weakened before friction authorization is completed."
+    if lock.kind == "password":
+        return "This rule cannot be weakened before the password unlock condition is met."
+    return ""
 
 
 def _pomodoro_end(schedule: Mapping[str, object]) -> datetime:
@@ -1505,6 +1702,12 @@ def _target_summary(rule: Rule) -> str:
             f"{networks} network control" + ("s" if networks != 1 else "")
         )
     return ", ".join(parts)
+def _rule_notifications_include(rule: Rule, category: str) -> bool:
+    return (
+        rule.notifications_enabled
+        and category in rule.notification_categories
+    )
+
 
 
 class GuiController:
@@ -1537,7 +1740,9 @@ class GuiController:
             prefer_dark = False
         else:
             prefer_dark = self.system_prefers_dark
-        self.gtk_settings.set_property("gtk-application-prefer-dark-theme", prefer_dark)
+        self.gtk_settings.set_property(
+            "gtk-application-prefer-dark-theme", prefer_dark
+        )
 
     def _theme_changed(self, dropdown: object, _parameter: object) -> None:
         selected = dropdown.get_selected()
@@ -1556,8 +1761,8 @@ class GuiController:
     def _build_window(self) -> object:
         Gtk = self.Gtk
         window = Gtk.ApplicationWindow(application=self.application)
-        window.set_title("Distraction Blocker")
-        window.set_default_size(820, 640)
+        window.set_default_size(960, 700)
+        window.set_resizable(True)
         header = Gtk.HeaderBar()
         title = Gtk.Label(label="Distraction Blocker")
         title.add_css_class("title")
@@ -1656,7 +1861,13 @@ class GuiController:
             "clicked", lambda _button: self._choose_export("native")
         )
         transfer_bar.append(self.export_backup_button)
-        root.append(transfer_bar)
+        transfer_scroller = Gtk.ScrolledWindow()
+        transfer_scroller.set_hexpand(True)
+        transfer_scroller.set_policy(
+            Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER
+        )
+        transfer_scroller.set_child(transfer_bar)
+        root.append(transfer_scroller)
         search_row = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
         )
@@ -1665,6 +1876,11 @@ class GuiController:
         self.search_entry.set_hexpand(True)
         self.search_entry.connect("search-changed", self._filter_changed)
         search_row.append(self.search_entry)
+        self.sort_dropdown = Gtk.DropDown.new_from_strings(RULE_SORT_LABELS)
+        self.sort_dropdown.set_selected(0)
+        self.sort_dropdown.connect("notify::selected", self._filter_changed)
+        self.sort_dropdown.set_tooltip_text("Sort matching rules")
+        search_row.append(self.sort_dropdown)
         self.filter_dropdown = Gtk.DropDown.new_from_strings(RULE_FILTER_LABELS)
         self.filter_dropdown.set_selected(0)
         self.filter_dropdown.connect("notify::selected", self._filter_changed)
@@ -1764,8 +1980,19 @@ class GuiController:
             snapshot.rules, now_utc, snapshot.clock_trusted
         )
         if self._observed_states is not None:
+            rules_by_id = {rule.id: rule for rule in snapshot.rules}
+            transitions = detect_rule_transitions(
+                self._observed_states, current_states
+            )
             self._send_transition_notifications(
-                detect_rule_transitions(self._observed_states, current_states)
+                tuple(
+                    transition
+                    for transition in transitions
+                    if (
+                        (rule := rules_by_id.get(transition.rule_id)) is not None
+                        and _rule_notifications_include(rule, "state_changes")
+                    )
+                )
             )
         self._observed_states = current_states
         self._send_advance_notifications(
@@ -1813,6 +2040,8 @@ class GuiController:
             return
         horizon = now_utc + timedelta(minutes=5)
         for rule in rules:
+            if not _rule_notifications_include(rule, "upcoming_changes"):
+                continue
             change = next_state_change(rule, now_utc, clock_trusted)
             if change is None or not now_utc < change.at_utc <= horizon:
                 continue
@@ -1875,14 +2104,25 @@ class GuiController:
         Gtk = self.Gtk
         self._clear_rules()
         now_utc = datetime.now(UTC)
-        selected = self.filter_dropdown.get_selected()
-        state_filter = RULE_FILTERS[selected] if selected < len(RULE_FILTERS) else "all"
+        state_selected = self.filter_dropdown.get_selected()
+        state_filter = (
+            RULE_FILTERS[state_selected]
+            if state_selected < len(RULE_FILTERS)
+            else "all"
+        )
+        sort_selected = self.sort_dropdown.get_selected()
+        sort_filter = (
+            RULE_SORTS[sort_selected]
+            if sort_selected < len(RULE_SORTS)
+            else "recent"
+        )
         rules = filter_rules(
             snapshot.rules,
             self.search_entry.get_text(),
             state_filter,
             now_utc,
             snapshot.clock_trusted,
+            sort_filter,
         )
         locks_by_rule = {item.rule_id: item for item in snapshot.locks}
         if not rules:
@@ -1995,7 +2235,12 @@ class GuiController:
             label = Gtk.Label(label="Next state change: after root restores the trusted clock.")
             label.set_xalign(0)
             outer.append(label)
-        explanation = active_lock_explanation(rule, now_utc, snapshot.clock_trusted)
+        explanation = active_lock_explanation(
+            rule,
+            now_utc,
+            snapshot.clock_trusted,
+            lock,
+        )
         if explanation:
             label = Gtk.Label(label=explanation)
             label.set_xalign(0)
@@ -2017,20 +2262,14 @@ class GuiController:
         )
         actions.append(export)
         toggle = Gtk.Button.new_with_mnemonic("_Disable" if data["enabled"] else "_Enable")
-        finite_lock = active and kind != "indefinite"
-        timed_disable_lock = (
-            lock is not None
-            and lock.kind == "timed"
-            and lock.locked
-            and data["enabled"]
+        disable_locked = (
+            data["enabled"] and lock is not None and lock.locked
         )
-        toggle.set_sensitive(
-            snapshot.healthy and not finite_lock and not timed_disable_lock
-        )
-        if timed_disable_lock:
-            toggle.set_tooltip_text("The timed lock blocks disabling this rule.")
-        elif finite_lock:
-            toggle.set_tooltip_text(explanation)
+        toggle.set_sensitive(snapshot.healthy and not disable_locked)
+        if disable_locked:
+            toggle.set_tooltip_text(
+                "The active lock blocks disabling this rule."
+            )
         toggle.connect("clicked", lambda _button, item=rule, enabled=not data["enabled"]: self._set_enabled(item, enabled))
         actions.append(toggle)
         lock_button = Gtk.Button.new_with_mnemonic("_Lock")
@@ -2057,6 +2296,30 @@ class GuiController:
                 lambda _button, item=rule: self.open_rule_authorization(item),
             )
             actions.append(authorize)
+        if lock is not None and lock.kind == "delay" and lock.locked:
+            if lock.pending_until_utc is not None:
+                delay_action = Gtk.Button.new_with_mnemonic("_Cancel delay")
+                delay_action.set_tooltip_text(
+                    "Cancel the pending Delay break."
+                )
+                delay_action.connect(
+                    "clicked",
+                    lambda _button, item=rule: self._cancel_delay_break(item),
+                )
+            elif lock.break_until_utc is None:
+                delay_action = Gtk.Button.new_with_mnemonic("_Request break")
+                delay_action.set_tooltip_text(
+                    "Start the configured Delay countdown."
+                )
+                delay_action.connect(
+                    "clicked",
+                    lambda _button, item=rule: self._request_delay_break(item),
+                )
+            else:
+                delay_action = None
+            if delay_action is not None:
+                delay_action.set_sensitive(snapshot.healthy)
+                actions.append(delay_action)
         delete = Gtk.Button.new_with_mnemonic("_Delete")
         delete.add_css_class("destructive-action")
         timed_delete_lock = (
@@ -2109,6 +2372,30 @@ class GuiController:
 
     def _refresh_after_request(self, _result: object) -> None:
         self.refresh()
+    def _request_delay_break(self, rule: Rule) -> None:
+        try:
+            fields = request_delay_break_request(rule.id)
+        except FormError as error:
+            self._show_error(str(error))
+            return
+        self._request_async(
+            "request_delay_break",
+            fields,
+            self._refresh_after_request,
+        )
+
+    def _cancel_delay_break(self, rule: Rule) -> None:
+        try:
+            fields = cancel_delay_break_request(rule.id)
+        except FormError as error:
+            self._show_error(str(error))
+            return
+        self._request_async(
+            "cancel_delay_break",
+            fields,
+            self._refresh_after_request,
+        )
+
 
 
     def _set_enabled(self, rule: Rule, enabled: bool) -> None:
@@ -2550,9 +2837,33 @@ class GuiController:
             starter_categories(datetime.now(UTC)),
             healthy,
             self._choose_managed_list_import,
+            self._create_managed_list,
+            self._edit_managed_list,
             self._install_starter_category,
             self._confirm_managed_list_delete,
         ).present()
+
+    def _create_managed_list(self, parent: object) -> None:
+        ManagedListEditorWindow(
+            GtkModules(self.Gtk, self.Gio, self.GLib),
+            parent,
+            None,
+            self._upload_managed_list,
+        ).present()
+
+    def _edit_managed_list(
+        self, parent: object, summary: ManagedListSummary
+    ) -> None:
+        self._run_worker(
+            lambda: self._read_managed_lists((summary,))[0],
+            lambda managed_list: ManagedListEditorWindow(
+                GtkModules(self.Gtk, self.Gio, self.GLib),
+                parent,
+                managed_list,
+                self._upload_managed_list,
+            ).present(),
+            lambda error: self._show_dialog_error(parent, self._rpc_error(error)),
+        )
 
     def _choose_managed_list_import(self, parent: object) -> None:
         Gtk = self.Gtk
@@ -2603,7 +2914,7 @@ class GuiController:
         self._run_worker(
             lambda: self._upload_list(managed_list),
             lambda _result: self._managed_list_changed(
-                f"Installed {managed_list.name}.", completed
+                f"Saved {managed_list.name}.", completed
             ),
             lambda error: completed(self._rpc_error(error)),
         )
@@ -2875,7 +3186,21 @@ class GuiController:
             completed(str(error))
             return
 
-        def saved(_result: object) -> None:
+        def saved(result: object) -> None:
+            if existing is None and form.configure_lock_after_save:
+                try:
+                    if not isinstance(result, Mapping):
+                        raise FormError(
+                            "The service returned an invalid saved rule."
+                        )
+                    saved_rule = Rule.from_dict(result)
+                except (FormError, ValidationError, ValueError) as error:
+                    completed(str(error))
+                    return
+                completed(None)
+                self.refresh()
+                self.open_rule_lock(saved_rule, None)
+                return
             completed(None)
             self.refresh()
 
@@ -3122,6 +3447,9 @@ class RuleLockWindow:
         self.remove_button: object | None = None
         self.kind_dropdown: object | None = None
         self.expiry_widgets: tuple[object, ...] = ()
+        self.delay_wait: object | None = None
+        self.delay_break: object | None = None
+        self.delay_widgets: tuple[object, ...] = ()
         self.password_entry: object | None = None
         self.password_confirmation: object | None = None
         self.password_widgets: tuple[object, ...] = ()
@@ -3154,7 +3482,10 @@ class RuleLockWindow:
         outer.append(heading)
         intro = Gtk.Label(
             label=(
+                "A schedule lock follows a weekly rule schedule and blocks "
+                "weakening changes during each active period. "
                 "A timed lock blocks weakening changes until its expiry. "
+                "A Delay lock starts a countdown before a temporary break. "
                 "A friction lock requires exact-text authorization. "
                 "A password lock requires its password before one weakening change."
             )
@@ -3178,28 +3509,27 @@ class RuleLockWindow:
         )
         outer.append(state)
 
-        can_set = self.summary is None or self.summary.locked
+        can_set = self.summary is None or self.healthy
         if can_set:
             kind_label = Gtk.Label(label="Lock type")
             kind_label.set_xalign(0)
-            outer.append(kind_label)
             self.kind_dropdown = Gtk.DropDown.new_from_strings(
-                ("Timed", "Friction", "Password")
+                ("Schedule", "Timed", "Delay", "Friction", "Password")
             )
             selected_kind = "timed" if self.summary is None else self.summary.kind
             self.kind_dropdown.set_selected(
-                {"timed": 0, "friction": 1, "password": 2}[selected_kind]
+                {"schedule": 0, "timed": 1, "delay": 2, "friction": 3, "password": 4}[selected_kind]
             )
             self.kind_dropdown.set_sensitive(
                 self.healthy
                 and not (
                     self.summary is not None
-                    and self.summary.kind == "timed"
+                    and self.summary.kind in {"timed", "schedule", "delay"}
                     and self.summary.locked
                 )
             )
             self.kind_dropdown.set_tooltip_text(
-                "Choose a timed, friction, or password lock"
+                "Choose a schedule, timed, Delay, friction, or password lock"
             )
             kind_label.set_mnemonic_widget(self.kind_dropdown)
             outer.append(self.kind_dropdown)
@@ -3236,6 +3566,46 @@ class RuleLockWindow:
                 self.until_picker.button,
                 zone_label,
             )
+            delay_wait_label = Gtk.Label(label="Delay wait (minutes)")
+            delay_wait_label.set_xalign(0)
+            outer.append(delay_wait_label)
+            self.delay_wait = Gtk.SpinButton.new_with_range(1, 1440, 1)
+            self.delay_wait.set_value(
+                max(
+                    1,
+                    (
+                        (self.summary.wait_seconds or 300)
+                        if self.summary is not None and self.summary.kind == "delay"
+                        else 300
+                    ) + 59
+                ) // 60
+            )
+            delay_wait_label.set_mnemonic_widget(self.delay_wait)
+            outer.append(self.delay_wait)
+            delay_break_label = Gtk.Label(label="Temporary break (minutes)")
+            delay_break_label.set_xalign(0)
+            outer.append(delay_break_label)
+            self.delay_break = Gtk.SpinButton.new_with_range(1, 1440, 1)
+            self.delay_break.set_value(
+                max(
+                    1,
+                    (
+                        (self.summary.break_seconds or 900)
+                        if self.summary is not None and self.summary.kind == "delay"
+                        else 900
+                    ) + 59
+                ) // 60
+            )
+            delay_break_label.set_mnemonic_widget(self.delay_break)
+            outer.append(self.delay_break)
+            self.delay_widgets = (
+                delay_wait_label,
+                self.delay_wait,
+                delay_break_label,
+                self.delay_break,
+            )
+            for widget in self.delay_widgets:
+                widget.set_sensitive(not self._active_delay_lock())
 
             password_label = Gtk.Label(label="Password")
             password_label.set_xalign(0)
@@ -3290,12 +3660,13 @@ class RuleLockWindow:
             self.remove_button.set_sensitive(
                 self.healthy
                 and not (
-                    self.summary.kind == "timed" and self.summary.locked
+                    self.summary.kind in {"timed", "schedule", "delay"}
+                    and self.summary.locked
                 )
             )
-            if self.summary.kind == "timed" and self.summary.locked:
+            if self.summary.kind in {"timed", "schedule", "delay"} and self.summary.locked:
                 self.remove_button.set_tooltip_text(
-                    "An active timed lock cannot be removed."
+                    "An active timed, schedule, or Delay lock cannot be removed."
                 )
             elif (
                 self.summary.kind in {"friction", "password"}
@@ -3313,7 +3684,9 @@ class RuleLockWindow:
             label = "_Update lock" if self.summary is not None else "_Create lock"
             self.primary_button = Gtk.Button.new_with_mnemonic(label)
             self.primary_button.add_css_class("suggested-action")
-            self.primary_button.set_sensitive(self.healthy)
+            self.primary_button.set_sensitive(
+                self.healthy and not self._active_delay_lock()
+            )
             self.primary_button.connect(
                 "clicked",
                 lambda _button: self._submit(),
@@ -3326,11 +3699,18 @@ class RuleLockWindow:
             )
         return window
 
+    def _active_delay_lock(self) -> bool:
+        return (
+            self.summary is not None
+            and self.summary.kind == "delay"
+            and self.summary.locked
+        )
+
     def _selected_kind(self) -> str:
         if self.kind_dropdown is None:
             return "timed"
         selected = self.kind_dropdown.get_selected()
-        return ("timed", "friction", "password")[selected]
+        return ("schedule", "timed", "delay", "friction", "password")[selected]
 
     def _lock_kind_changed(
         self,
@@ -3340,6 +3720,8 @@ class RuleLockWindow:
         selected_kind = self._selected_kind()
         for widget in self.expiry_widgets:
             widget.set_visible(selected_kind == "timed")
+        for widget in self.delay_widgets:
+            widget.set_visible(selected_kind == "delay")
         for widget in self.password_widgets:
             widget.set_visible(selected_kind == "password")
         if selected_kind != "password":
@@ -3350,24 +3732,25 @@ class RuleLockWindow:
 
     def _set_busy(self, busy: bool) -> None:
         if self.primary_button is not None:
-            self.primary_button.set_sensitive(self.healthy and not busy)
-        if self.kind_dropdown is not None:
-            active_timed = (
-                self.summary is not None
-                and self.summary.kind == "timed"
-                and self.summary.locked
+            self.primary_button.set_sensitive(
+                self.healthy and not busy and not self._active_delay_lock()
             )
+        active_time_lock = (
+            self.summary is not None
+            and self.summary.kind in {"timed", "schedule", "delay"}
+            and self.summary.locked
+        )
+        if self.kind_dropdown is not None:
             self.kind_dropdown.set_sensitive(
-                self.healthy and not busy and not active_timed
+                self.healthy and not busy and not active_time_lock
             )
         if self.remove_button is not None:
-            active_timed = (
-                self.summary is not None
-                and self.summary.kind == "timed"
-                and self.summary.locked
-            )
             self.remove_button.set_sensitive(
-                self.healthy and not busy and not active_timed
+                self.healthy and not busy and not active_time_lock
+            )
+        for widget in self.delay_widgets:
+            widget.set_sensitive(
+                self.healthy and not busy and not self._active_delay_lock()
             )
         if self.password_entry is not None:
             self.password_entry.set_sensitive(self.healthy and not busy)
@@ -3377,7 +3760,17 @@ class RuleLockWindow:
     def _submit(self) -> None:
         try:
             kind = self._selected_kind()
-            if kind == "friction":
+            if kind == "schedule":
+                fields = schedule_lock_request(self.rule.id)
+            elif kind == "delay":
+                if self.delay_wait is None or self.delay_break is None:
+                    raise FormError("The Delay fields are not available.")
+                fields = delay_lock_request(
+                    self.rule.id,
+                    self.delay_wait.get_value_as_int() * 60,
+                    self.delay_break.get_value_as_int() * 60,
+                )
+            elif kind == "friction":
                 fields = friction_lock_request(self.rule.id)
             elif kind == "password":
                 if (
@@ -3767,6 +4160,8 @@ class RuleEditor:
         initial_domains: Sequence[str] = (),
     ):
         self.Gtk, self.GLib = modules.Gtk, modules.GLib
+        self.notifications_enabled_check: object | None = None
+        self.notification_checks: dict[str, object] = {}
         if existing is not None:
             schedule = existing.to_dict()["schedule"]
             if schedule["kind"] == "weekly":
@@ -3977,6 +4372,39 @@ class RuleEditor:
         network_note.set_wrap(True)
         network_note.add_css_class("dim-label")
         outer.append(network_note)
+        notifications_heading = Gtk.Label(label="Notifications")
+        notifications_heading.add_css_class("heading")
+        notifications_heading.set_xalign(0)
+        outer.append(notifications_heading)
+        self.notifications_enabled_check = Gtk.CheckButton(
+            label="Notifications (On/Off)"
+        )
+        self.notifications_enabled_check.set_active(True)
+        self.notifications_enabled_check.connect(
+            "toggled", self._notifications_changed
+        )
+        outer.append(self.notifications_enabled_check)
+        notification_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.COMPACT)
+        )
+        for category, label, tooltip in NOTIFICATION_CATEGORY_OPTIONS:
+            check = Gtk.CheckButton(label=label)
+            check.set_tooltip_text(tooltip)
+            check.set_active(True)
+            notification_box.append(check)
+            self.notification_checks[category] = check
+        outer.append(notification_box)
+        self._notifications_changed(self.notifications_enabled_check)
+
+        self.configure_lock_check = Gtk.CheckButton(
+            label="Configure a lock after saving"
+        )
+        self.configure_lock_check.set_visible(self.existing is None)
+        self.configure_lock_check.set_tooltip_text(
+            "After this new rule is saved, open the schedule, timed, "
+            "friction, or password lock setup."
+        )
+        outer.append(self.configure_lock_check)
 
         # Breadcrumb (allowance seam): 0 in the editor means "no daily
         # limit"; any value from 1 up is stored as allowance_starts and
@@ -4124,6 +4552,13 @@ class RuleEditor:
         outer.append(actions)
         window.set_default_widget(self.save_button)
         return window
+    def _notifications_changed(
+        self, check: object, _parameter: object | None = None
+    ) -> None:
+        enabled = check.get_active()
+        for category_check in self.notification_checks.values():
+            category_check.set_sensitive(enabled)
+
 
     def _add_weekly_period(self, value: WeeklyPeriodForm) -> None:
         if len(self.weekly_rows) >= MAX_WEEKLY_PERIODS:
@@ -4442,6 +4877,12 @@ class RuleEditor:
                 for control, check in self.network_checks.items()
                 if check.get_active()
             ),
+            notifications_enabled=self.notifications_enabled_check.get_active(),
+            notification_categories=tuple(
+                category
+                for category, check in self.notification_checks.items()
+                if check.get_active()
+            ),
             schedule_kind=SCHEDULE_KINDS[selected],
             timezone=self.timezone_name,
             one_time_start=self.one_start.get_text(),
@@ -4457,6 +4898,7 @@ class RuleEditor:
                 None if self.allowance_spin.get_value_as_int() == 0
                 else self.allowance_spin.get_value_as_int()
             ),
+            configure_lock_after_save=self.configure_lock_check.get_active(),
         )
 
     def _submit(self) -> None:
@@ -4485,6 +4927,13 @@ class RuleEditor:
         self._render_applications()
         self.url_targets = list(form.url_targets)
         self.url_exceptions = list(form.url_exceptions)
+        self._render_url_targets()
+        enabled_check = getattr(self, "notifications_enabled_check", None)
+        if enabled_check is not None:
+            enabled_check.set_active(form.notifications_enabled)
+            for category, check in self.notification_checks.items():
+                check.set_active(category in form.notification_categories)
+            self._notifications_changed(enabled_check)
         for list_id in form.managed_list_ids:
             check = self.managed_list_checks.get(list_id)
             if check is not None:
@@ -4529,6 +4978,8 @@ class ManagedListWindow:
         starters: Sequence[ManagedList],
         healthy: bool,
         choose_import: Callable[[object], None],
+        create: Callable[[object], None],
+        edit: Callable[[object, ManagedListSummary], None],
         install: Callable[
             [ManagedList, Callable[[str | None], None]], None
         ],
@@ -4538,8 +4989,10 @@ class ManagedListWindow:
         self.summaries = tuple(summaries)
         self.starters = tuple(starters)
         self.healthy = healthy
-        self.choose_import, self.install, self.delete = (
+        self.choose_import, self.create, self.edit, self.install, self.delete = (
             choose_import,
+            create,
+            edit,
             install,
             delete,
         )
@@ -4579,6 +5032,12 @@ class ManagedListWindow:
         actions = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
         )
+        create_button = Gtk.Button.new_with_mnemonic("_New custom list")
+        create_button.set_sensitive(self.healthy)
+        create_button.connect(
+            "clicked", lambda _button: self.create(window)
+        )
+        actions.append(create_button)
         import_button = Gtk.Button.new_with_mnemonic("_Import file")
         import_button.set_sensitive(self.healthy)
         import_button.connect(
@@ -4658,6 +5117,13 @@ class ManagedListWindow:
         name.set_xalign(0)
         name.set_hexpand(True)
         heading_row.append(name)
+        edit_button = Gtk.Button.new_with_mnemonic("_Edit roster")
+        edit_button.set_sensitive(self.healthy)
+        edit_button.connect(
+            "clicked",
+            lambda _button: self.edit(self.window, summary),
+        )
+        heading_row.append(edit_button)
         delete_button = Gtk.Button.new_with_mnemonic("_Delete")
         delete_button.add_css_class("destructive-action")
         delete_button.set_sensitive(self.healthy)
@@ -4682,10 +5148,13 @@ class ManagedListWindow:
 
     def _update_install_button(self) -> None:
         selected = self.starter_dropdown.get_selected()
-        installed = {item.id for item in self.summaries}
+        installed = {(item.name, item.source) for item in self.summaries}
         available = (
             selected < len(self.starters)
-            and self.starters[selected].id not in installed
+            and (
+                self.starters[selected].name,
+                self.starters[selected].source,
+            ) not in installed
         )
         self.install_button.set_sensitive(self.healthy and available)
 
@@ -4708,6 +5177,173 @@ class ManagedListWindow:
 
     def present(self) -> None:
         self.window.present()
+
+class ManagedListEditorWindow:
+    """Create a managed list or edit its complete domain roster."""
+
+    def __init__(
+        self,
+        modules: GtkModules,
+        parent: object,
+        existing: ManagedList | None,
+        save: Callable[
+            [ManagedList, Callable[[str | None], None]], None
+        ],
+    ):
+        self.Gtk = modules.Gtk
+        self.parent = parent
+        self.existing = existing
+        self.save = save
+        self.window = self._build(parent)
+
+    def _entry(self, value: str) -> object:
+        entry = self.Gtk.Entry()
+        entry.set_hexpand(True)
+        entry.set_text(value)
+        return entry
+
+    def _build(self, parent: object) -> object:
+        Gtk = self.Gtk
+        editing = self.existing is not None
+        window = Gtk.Window(
+            title="Edit managed list" if editing else "New custom managed list",
+            transient_for=parent,
+            modal=True,
+        )
+        window.set_default_size(640, 700)
+        outer = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.SMALL)
+        )
+        for method in (
+            outer.set_margin_top,
+            outer.set_margin_bottom,
+            outer.set_margin_start,
+            outer.set_margin_end,
+        ):
+            method(int(Space.LARGE))
+        window.set_child(outer)
+        heading = Gtk.Label(
+            label="Edit managed list" if editing else "New custom managed list"
+        )
+        heading.add_css_class("title-2")
+        heading.set_xalign(0)
+        outer.append(heading)
+        intro = Gtk.Label(
+            label=(
+                "Enter one hostname per line. Changes replace the roster "
+                "atomically when you save."
+            )
+        )
+        intro.set_xalign(0)
+        intro.set_wrap(True)
+        outer.append(intro)
+        current = self.existing
+        self.name_entry = self._entry("" if current is None else current.name)
+        self.source_entry = self._entry(
+            "custom" if current is None else current.source
+        )
+        self.version_entry = self._entry(
+            "1" if current is None else current.version
+        )
+        self.license_entry = self._entry(
+            "User-provided domains."
+            if current is None
+            else current.license
+        )
+        for text, entry in (
+            ("List name", self.name_entry),
+            ("Source", self.source_entry),
+            ("Data version", self.version_entry),
+            ("License note", self.license_entry),
+        ):
+            label = Gtk.Label(label=text)
+            label.set_xalign(0)
+            label.set_mnemonic_widget(entry)
+            outer.append(label)
+            outer.append(entry)
+        domain_label = Gtk.Label(label="Domains")
+        domain_label.set_xalign(0)
+        outer.append(domain_label)
+        domain_scroller = Gtk.ScrolledWindow()
+        domain_scroller.set_vexpand(True)
+        domain_scroller.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        self.domain_view = Gtk.TextView()
+        self.domain_view.set_wrap_mode(Gtk.WrapMode.NONE)
+        self.domain_view.set_monospace(True)
+        self.domain_view.get_buffer().set_text(
+            "" if current is None else "\n".join(current.domains)
+        )
+        domain_scroller.set_child(self.domain_view)
+        outer.append(domain_scroller)
+        self.error_label = Gtk.Label(label="")
+        self.error_label.set_xalign(0)
+        self.error_label.set_wrap(True)
+        self.error_label.add_css_class("error")
+        outer.append(self.error_label)
+        actions = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
+        )
+        actions.set_halign(Gtk.Align.END)
+        cancel = Gtk.Button.new_with_mnemonic("_Cancel")
+        cancel.connect("clicked", lambda _button: window.destroy())
+        actions.append(cancel)
+        self.save_button = Gtk.Button.new_with_mnemonic("_Save")
+        self.save_button.add_css_class("suggested-action")
+        self.save_button.connect("clicked", lambda _button: self._submit())
+        actions.append(self.save_button)
+        outer.append(actions)
+        window.set_default_widget(self.save_button)
+        return window
+
+    def _submit(self) -> None:
+        buffer = self.domain_view.get_buffer()
+        text = buffer.get_text(
+            buffer.get_start_iter(), buffer.get_end_iter(), True
+        )
+        try:
+            preview = parse_domain_text(text)
+            if preview.issues:
+                issue = preview.issues[0]
+                raise FormError(
+                    f"Invalid domain on line {issue.line}: {issue.reason}"
+                )
+            if not preview.domains:
+                raise FormError("The managed list contains no valid domains.")
+            current = self.existing
+            managed_list = ManagedList.from_dict(
+                {
+                    "id": str(uuid4()) if current is None else current.id,
+                    "name": self.name_entry.get_text().strip(),
+                    "source": self.source_entry.get_text().strip(),
+                    "version": self.version_entry.get_text().strip(),
+                    "license": self.license_entry.get_text().strip(),
+                    "imported_utc": datetime.now(UTC),
+                    "domains": list(preview.domains),
+                }
+            )
+        except (TransferError, ValidationError, ValueError) as error:
+            self.error_label.set_text(str(error))
+            return
+        self.save_button.set_sensitive(False)
+        self.error_label.remove_css_class("error")
+        self.error_label.set_text("Saving list.")
+        self.save(managed_list, self._saved)
+
+    def _saved(self, message: str | None) -> None:
+        if message is None:
+            self.window.destroy()
+            self.parent.destroy()
+            return
+        self.save_button.set_sensitive(True)
+        self.error_label.set_text(message)
+        self.error_label.add_css_class("error")
+
+    def present(self) -> None:
+        self.window.present()
+        self.name_entry.grab_focus()
+
 
 
 class ManagedListImportWindow:

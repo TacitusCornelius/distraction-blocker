@@ -12,7 +12,7 @@ function policy(id, value, revision) {
     ? value
     : [{ kind: "url_path", value }];
   return {
-    schema_version: 4,
+    schema_version: 5,
     revision,
     rules: [{
       id,
@@ -180,7 +180,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   assert.equal(status.denials["old → example.com/blocked"], 2);
   updateFailure = false;
   const overlap = {
-    schema_version: 4,
+    schema_version: 5,
     revision: 3,
     rules: [
       {
@@ -214,7 +214,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   );
 
   const exhausted = {
-    schema_version: 4,
+    schema_version: 5,
     revision: 4,
     rules: [{
       id: "spent",
@@ -261,7 +261,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
     1,
   );
   const allowance = {
-    schema_version: 4,
+    schema_version: 5,
     revision: 5,
     rules: [{
       id: "usage",

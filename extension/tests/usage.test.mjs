@@ -19,6 +19,7 @@ const {
   bump_usage,
   decode_usage_key,
   is_allowance_rule,
+  is_time_allowance_rule,
   merge_usage,
   merge_labels,
   partition_rules,
@@ -39,6 +40,18 @@ test("is_allowance_rule accepts only integer allowance_starts >= 1", () => {
   assert.equal(is_allowance_rule({ allowance_starts: 2.5 }), false);
   assert.equal(is_allowance_rule({ allowance_starts: "5" }), false);
   assert.equal(is_allowance_rule(null), false);
+});
+
+test("is_time_allowance_rule recognizes active timed budgets", () => {
+  assert.equal(is_time_allowance_rule({ allowance_time: { periods: [] } }), true);
+  assert.equal(
+    is_time_allowance_rule({
+      allowance_time: { periods: [] },
+      budget_exhausted: true,
+    }),
+    false,
+  );
+  assert.equal(is_time_allowance_rule({ allowance_time: null }), false);
 });
 
 test("exhausted allowance rules move to enforced rules", () => {

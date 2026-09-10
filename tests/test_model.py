@@ -4,13 +4,16 @@ import uuid
 
 from distraction_blocker.model import (
     MAX_ALLOWANCE_STARTS,
+    NOTIFICATION_CATEGORIES,
     POLICY_SCHEMA_VERSION,
     ManagedList,
+    PeriodAllowance,
     Policy,
     PolicyProjection,
     Rule,
     Schedule,
     Target,
+    TimeAllowance,
     ValidationError,
 )
 
@@ -35,6 +38,34 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(Target.from_dict({"kind": "website", "value": "Bücher.Example."}).value, "xn--bcher-kva.example")
         with self.assertRaises(ValidationError):
             Target.from_dict({"kind": "website", "value": "example.test/path"})
+
+    def test_rule_notification_settings_default_and_round_trip(self):
+        base = {
+            "id": str(uuid.uuid4()),
+            "name": "x",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.test"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        }
+        default = Rule.from_dict(base)
+        self.assertTrue(default.notifications_enabled)
+        self.assertEqual(default.notification_categories, NOTIFICATION_CATEGORIES)
+        self.assertNotIn("notifications", default.to_dict())
+
+        custom = Rule.from_dict({
+            **base,
+            "notifications": {
+                "enabled": False,
+                "categories": ["upcoming_changes"],
+            },
+        })
+        self.assertFalse(custom.notifications_enabled)
+        self.assertEqual(custom.notification_categories, ("upcoming_changes",))
+        self.assertEqual(
+            Rule.from_dict(custom.to_dict()),
+            custom,
+        )
 
     def test_managed_list_target_and_reference_validation(self):
         item = managed_list()
@@ -420,6 +451,102 @@ class AllowanceStartsTests(unittest.TestCase):
                     allowance_starts=5,
                 )
             )
+class TimeAllowanceTests(unittest.TestCase):
+    def _rule(self, *, schedule=None, targets=None, allowance=None):
+        return {
+            "id": RULE_ID,
+            "name": "Timed budget",
+            "enabled": True,
+            "targets": targets
+            or [{"kind": "url_path", "value": "example.com/feed"}],
+            "schedule": schedule
+            or {
+                "kind": "weekly",
+                "timezone": "UTC",
+                "periods": [
+                    {"weekdays": [0], "start": "09:00", "end": "10:00"},
+                    {"weekdays": [0], "start": "10:00", "end": "12:00"},
+                ],
+            },
+            "revision": 0,
+            "allowance_time": allowance
+            or {
+                "periods": [
+                    {"mode": "strict"},
+                    {
+                        "mode": "fixed_window",
+                        "quota_seconds": 600,
+                        "window_seconds": 3600,
+                    },
+                ],
+                "daily_cap_seconds": 1200,
+            },
+        }
+
+    def test_period_modes_and_rule_round_trip(self):
+        rule = Rule.from_dict(self._rule())
+        self.assertEqual(rule.time_allowance.periods[0].mode, "strict")
+        self.assertEqual(rule.time_allowance.periods[1].quota_seconds, 600)
+        self.assertEqual(Rule.from_dict(rule.to_dict()), rule)
+
+    def test_rejects_invalid_period_allowance_values(self):
+        for invalid in (
+            {"mode": "unknown"},
+            {"mode": "strict", "quota_seconds": 60},
+            {"mode": "total", "quota_seconds": 59},
+            {
+                "mode": "fixed_window",
+                "quota_seconds": 601,
+                "window_seconds": 600,
+            },
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValidationError):
+                    PeriodAllowance.from_dict(invalid)
+
+    def test_rejects_non_weekly_mismatched_and_unsupported_rules(self):
+        with self.assertRaisesRegex(ValidationError, "weekly schedule"):
+            Rule.from_dict(
+                self._rule(
+                    schedule={"kind": "indefinite"},
+                    allowance={
+                        "periods": [{"mode": "strict"}],
+                        "daily_cap_seconds": None,
+                    },
+                )
+            )
+        with self.assertRaisesRegex(ValidationError, "match the weekly"):
+            Rule.from_dict(
+                self._rule(
+                    allowance={
+                        "periods": [{"mode": "strict"}],
+                        "daily_cap_seconds": None,
+                    }
+                )
+            )
+        with self.assertRaisesRegex(ValidationError, "URL-level"):
+            Rule.from_dict(
+                self._rule(
+                    targets=[{"kind": "website", "value": "example.com"}]
+                )
+            )
+
+    def test_rejects_overlapping_periods_and_legacy_budget_combination(self):
+        overlapping = self._rule(
+            schedule={
+                "kind": "weekly",
+                "timezone": "UTC",
+                "periods": [
+                    {"weekdays": [0], "start": "09:00", "end": "11:00"},
+                    {"weekdays": [0], "start": "10:00", "end": "12:00"},
+                ],
+            }
+        )
+        with self.assertRaisesRegex(ValidationError, "overlapping"):
+            Rule.from_dict(overlapping)
+        with self.assertRaisesRegex(ValidationError, "cannot coexist"):
+            Rule.from_dict(self._rule() | {"allowance_starts": 2})
+
 
 
 class PolicyProjectionTests(unittest.TestCase):
@@ -438,6 +565,40 @@ class PolicyProjectionTests(unittest.TestCase):
             PolicyProjection.from_dict(projection).to_dict(),
             projection,
         )
+    def test_projection_round_trips_non_default_notifications(self):
+        rule = Rule.from_dict(
+            self._rule() | {
+                "notifications": {
+                    "enabled": False,
+                    "categories": ["state_changes"],
+                },
+            }
+        )
+        projection = PolicyProjection.from_policy(
+            Policy(0, (rule,), ()),
+        )
+        self.assertEqual(
+            projection.to_dict()["rules"][0]["notifications"],
+            {
+                "enabled": False,
+                "categories": ["state_changes"],
+            },
+        )
+
+    def test_enabled_notifications_require_a_category(self):
+        with self.assertRaisesRegex(
+            ValidationError, "require a category"
+        ):
+            Rule.from_dict(
+                self._rule()
+                | {
+                    "notifications": {
+                        "enabled": True,
+                        "categories": [],
+                    },
+                }
+            )
+
 
     def test_rejects_bool_versions_and_invalid_rule_mappings(self):
         base = {

@@ -33,8 +33,11 @@ READONLY_COMMANDS = frozenset({
 FIELD_COMMANDS = {
     "report_website_denials": frozenset({"command", "entries"}),
     "report_website_usage": frozenset({"command", "entries"}),
+    "request_allowance_lease": frozenset({"command", "rule_id", "seconds"}),
+    "report_allowance_usage": frozenset({
+        "command", "lease_id", "report_id", "start_utc", "end_utc",
+    }),
 }
-
 
 def read_message(stream) -> dict | None:
     """Read one length-prefixed JSON message from a binary stream."""

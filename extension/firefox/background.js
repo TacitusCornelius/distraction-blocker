@@ -15,20 +15,47 @@ const HOST_NAME = "org.distraction_blocker.extension";
 const REFRESH_ALARM = "policy-refresh";
 const REFRESH_MINUTES = 1;
 const INACTIVE_KEY = "inactive-tab";
-
+const ALLOWANCE_REPORTS_KEY = "allowance_reports";
 let match = compile([]);
+let match_time_allowance = compile([]);
 let policy_ready = false;
 let last_error = "No policy loaded yet.";
 let last_refresh_ms = 0;
 let block_inactive = false;
+let active_tab_id = null;
+let active_tab_url = null;
+let allowance_timer = null;
 
 const pending_denials = new Map(); // encoded rule_id/value -> count
 const inactive_denials = new Map(); // URL -> local-only count
 
-// Breadcrumb: allowance rules are permitted, not blocked - their
-// top-of-page starts count toward a budget the service enforces later.
+// Timed allowance starts are tracked by leases, not legacy start counters.
 let match_allowance = compile([]);
 const pending_usage = new Map(); // encoded rule_id/value -> permitted starts
+const allowance_tracker = new AllowanceTracker({
+  request_lease: (rule_id, seconds) =>
+    host_request({ command: "request_allowance_lease", rule_id, seconds }),
+  report_usage: ({ lease_id, report_id, start_utc, end_utc }) =>
+    host_request({
+      command: "report_allowance_usage",
+      lease_id,
+      report_id,
+      start_utc,
+      end_utc,
+    }),
+  on_exhausted: () => {
+    queue_refresh();
+    schedule_allowance_pulse();
+  },
+  on_unavailable: () => {
+    schedule_allowance_pulse();
+  },
+  on_pending_changed: (reports) => {
+    browser.storage.local
+      .set({ [ALLOWANCE_REPORTS_KEY]: reports.map((report) => ({ ...report })) })
+      .catch(() => {});
+  },
+});
 
 // Breadcrumb: onInstalled/onStartup/alarm ticks can overlap; serialize
 // refreshes so interleaved host_request/apply_rules pairs never race.
@@ -52,8 +79,8 @@ browser.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === REFRESH_ALARM) {
     queue_refresh();
   }
+  void allowance_tracker.pulse();
 });
-
 browser.storage.local.get("block_inactive").then((stored) => {
   block_inactive = stored.block_inactive === true;
 });
@@ -103,9 +130,14 @@ function apply_policy(policy) {
   // Breadcrumb: partition before compiling. Enforced rules keep blocking;
   // allowance rules permit starts until their budget is exhausted.
   const { enforced, allowance } = partition_rules(rules);
+  const timed_allowance = allowance.filter(is_time_allowance_rule);
   match = compile(enforced);
   match_allowance = compile(allowance);
+  match_time_allowance = compile(timed_allowance);
   prune_usage(pending_usage, rules);
+  if (active_tab_id !== null && active_tab_url !== null) {
+    update_allowance_url(active_tab_id, active_tab_url);
+  }
   // Breadcrumb: Firefox has no persisted DNR equivalent. Once compilation
   // succeeds, requests can leave the startup fail-closed state.
   policy_ready = true;
@@ -142,6 +174,84 @@ function host_request(message) {
     port.postMessage(message);
   });
 }
+
+function schedule_allowance_pulse() {
+  if (allowance_timer !== null) {
+    return;
+  }
+  allowance_timer = setTimeout(async () => {
+    allowance_timer = null;
+    try {
+      await allowance_tracker.pulse();
+    } finally {
+      if (allowance_tracker.needs_pulse) {
+        schedule_allowance_pulse();
+      }
+    }
+  }, 5000);
+  allowance_timer.unref?.();
+}
+
+async function update_allowance_url(tab_id, url) {
+  if (tab_id !== active_tab_id) {
+    return false;
+  }
+  active_tab_url = typeof url === "string" ? url : null;
+  await allowance_tracker.set_tab_match(
+    tab_id,
+    typeof url === "string" && match_time_allowance !== null
+      ? match_time_allowance(url)
+      : null,
+  );
+  schedule_allowance_pulse();
+  return true;
+}
+async function sync_active_tab(tab_id) {
+  await state_ready;
+  try {
+    const tab = await browser.tabs.get(tab_id);
+    if (tab && tab.id === tab_id) {
+      active_tab_id = tab_id;
+      active_tab_url = typeof tab.url === "string" ? tab.url : null;
+      await allowance_tracker.set_active_tab(
+        tab_id,
+        active_tab_url && match_time_allowance !== null
+          ? match_time_allowance(active_tab_url)
+          : null,
+      );
+      schedule_allowance_pulse();
+    }
+  } catch {
+    if (active_tab_id === tab_id) {
+      active_tab_id = null;
+      active_tab_url = null;
+      void allowance_tracker.set_active_tab(null, null);
+    }
+  }
+}
+
+async function sync_active_window() {
+  await state_ready;
+  try {
+    let focused = false;
+    if (browser.windows?.getLastFocused) {
+      const window = await browser.windows.getLastFocused();
+      focused = window?.focused === true;
+    }
+    await allowance_tracker.set_focused(focused);
+    const tabs = await browser.tabs.query({
+      active: true,
+      lastFocusedWindow: true,
+    });
+    const tab = tabs[0];
+    if (tab?.id !== undefined) {
+      await sync_active_tab(tab.id);
+    }
+  } catch {
+    // A browser shutdown can invalidate a query; the next lifecycle event retries.
+  }
+}
+
 
 async function flush_denials() {
   // Only rule-matched denials travel to the service. Inactive-tab counts stay
@@ -196,6 +306,7 @@ async function refresh() {
     if (apply_policy(response.result)) {
       await flush_denials();
       await flush_usage();
+      await allowance_tracker.pulse();
     }
   } else {
     record_state(
@@ -207,25 +318,49 @@ async function refresh() {
 }
 
 /** True when the tab holding this request is not the visible tab. */
-async function tab_is_inactive(tabId) {
-  try {
-    const tab = await browser.tabs.get(tabId);
-    return tab.active === false;
-  } catch {
-    return false;
-  }
-}
-
-const state_ready = browser.storage.local.get(["denials", "usage"]).then((stored) => {
-  merge_labels(pending_denials, stored?.denials, [INACTIVE_KEY]);
-  merge_labels(pending_usage, stored?.usage);
-  const prefix = `${INACTIVE_KEY} → `;
-  for (const [label, count] of Object.entries(stored?.denials ?? {})) {
-    if (label.startsWith(prefix)) {
-      bump_bounded(inactive_denials, label.slice(prefix.length), count);
+const state_ready = browser.storage.local
+  .get(["denials", "usage", ALLOWANCE_REPORTS_KEY])
+  .then((stored) => {
+    merge_labels(pending_denials, stored?.denials, [INACTIVE_KEY]);
+    merge_labels(pending_usage, stored?.usage);
+    allowance_tracker.restore_pending(stored?.[ALLOWANCE_REPORTS_KEY]);
+    const prefix = `${INACTIVE_KEY} → `;
+    for (const [label, count] of Object.entries(stored?.denials ?? {})) {
+      if (label.startsWith(prefix)) {
+        bump_bounded(inactive_denials, label.slice(prefix.length), count);
+      }
     }
+  });
+browser.tabs.onActivated?.addListener(({ tabId }) => {
+  active_tab_id = tabId;
+  active_tab_url = null;
+  void allowance_tracker.set_active_tab(tabId, null);
+  void sync_active_tab(tabId);
+});
+browser.tabs.onUpdated?.addListener((tabId, changeInfo) => {
+  if (typeof changeInfo.url === "string") {
+    update_allowance_url(tabId, changeInfo.url);
   }
 });
+browser.tabs.onRemoved?.addListener((tabId) => {
+  if (tabId === active_tab_id) {
+    active_tab_id = null;
+    active_tab_url = null;
+    void allowance_tracker.set_active_tab(null, null);
+  }
+});
+browser.windows?.onFocusChanged?.addListener((windowId) => {
+  const none = browser.windows?.WINDOW_ID_NONE ?? -1;
+  void allowance_tracker.set_focused(windowId !== none);
+  if (windowId !== none) {
+    void sync_active_window();
+  }
+});
+browser.idle?.onStateChanged?.addListener((state) => {
+  void allowance_tracker.set_idle(state !== "active");
+});
+void sync_active_window();
+
 
 browser.webRequest.onBeforeRequest.addListener(
   async (details) => {
@@ -237,15 +372,25 @@ browser.webRequest.onBeforeRequest.addListener(
     }
     const hit = match(details.url);
     if (hit !== null) {
+      if (details.type === "main_frame") {
+        await update_allowance_url(details.tabId, null);
+      }
       bump_usage(pending_denials, hit.rule_id, hit.value);
       record_state(null);
       return { cancel: true };
     }
-    // Breadcrumb: reaching here means no enforced rule matched, so this
-    // load cannot have been blocked. A permitted main-frame start under an
-    // allowance rule is exactly one unit of usage; sub_frame loads never
-    // count as starts.
+    const timed = match_time_allowance(details.url);
     if (details.type === "main_frame") {
+      await update_allowance_url(details.tabId, details.url);
+    }
+    if (timed !== null && !allowance_tracker.has_lease(timed.rule_id)) {
+      if (allowance_tracker.is_exhausted(timed.rule_id)) {
+        bump_usage(pending_denials, timed.rule_id, timed.value);
+        record_state(null);
+      }
+      return { cancel: true };
+    }
+    if (details.type === "main_frame" && timed === null) {
       const allowed = match_allowance(details.url);
       if (allowed !== null) {
         bump_usage(pending_usage, allowed.rule_id, allowed.value);
