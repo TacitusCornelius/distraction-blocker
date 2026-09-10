@@ -23,6 +23,7 @@ from distraction_blocker.gui import (
     ObservedRuleState,
     RuleEditor,
     RuleForm,
+    PeriodAllowanceForm,
     WeeklyPeriodForm,
     authorization_challenge_from_result,
     authorization_grant_from_result,
@@ -213,6 +214,57 @@ class FormConversionTests(unittest.TestCase):
                 ],
             },
         )
+    def test_weekly_form_converts_timed_allowances_per_period(self) -> None:
+        form = RuleForm(
+            name="Allowance",
+            websites=(),
+            applications=(),
+            managed_list_ids=(),
+            schedule_kind="weekly",
+            timezone="UTC",
+            weekly_periods=(
+                WeeklyPeriodForm((0,), "09:00", "17:00"),
+                WeeklyPeriodForm((1,), "09:00", "17:00"),
+            ),
+            url_targets=(
+                {"kind": "url_path", "value": "example.com/feed"},
+            ),
+            time_allowance_enabled=True,
+            time_allowance_periods=(
+                PeriodAllowanceForm("total", quota_minutes=30),
+                PeriodAllowanceForm(
+                    "fixed_window", quota_minutes=10, window_minutes=60
+                ),
+            ),
+            time_allowance_daily_cap_minutes=45,
+        )
+        rule_data = form_to_request(
+            form, id_factory=lambda: UUID(RULE_ID)
+        )["rule"]
+        self.assertEqual(
+            rule_data["allowance_time"],
+            {
+                "periods": [
+                    {"mode": "total", "quota_seconds": 1800},
+                    {
+                        "mode": "fixed_window",
+                        "quota_seconds": 600,
+                        "window_seconds": 3600,
+                    },
+                ],
+                "daily_cap_seconds": 2700,
+            },
+        )
+        round_trip = rule_to_form(Rule.from_dict(rule_data), "UTC")
+        self.assertTrue(round_trip.time_allowance_enabled)
+        self.assertEqual(
+            round_trip.time_allowance_periods,
+            (
+                PeriodAllowanceForm("total", 30),
+                PeriodAllowanceForm("fixed_window", 10, 60),
+            ),
+        )
+        self.assertEqual(round_trip.time_allowance_daily_cap_minutes, 45)
 
     def test_pomodoro_form_converts_local_start_and_exact_fields(self) -> None:
         form = RuleForm(

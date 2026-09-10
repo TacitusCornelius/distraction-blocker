@@ -361,6 +361,21 @@ Select **Weekly**, then select **Add period** for each additional period.
 
 Each period has its own weekdays, start time, and end time. One rule can contain up to 16 periods.
 
+### Timed allowances
+
+Timed allowances are configured in the **Weekly** section of the rule editor,
+directly below the weekly period rows. Select **Enable elapsed-time allowance
+for these periods**, then choose a mode for each period:
+
+- **No allowance** keeps that period fully blocked.
+- **Total minutes** permits one elapsed-time quota for each period occurrence.
+- **Fixed refill window** permits a quota within each repeating window.
+
+You can also set an optional daily timed-allowance ceiling. Timed allowances
+require URL-level targets and non-overlapping weekly periods. They cannot be
+combined with the separate **Daily start allowance** control above the
+schedule.
+
 ### Rule locks
 
 Select **Lock** on an existing rule, or select **Configure a lock after

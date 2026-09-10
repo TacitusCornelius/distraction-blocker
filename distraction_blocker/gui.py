@@ -22,9 +22,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .categories import starter_categories
 from .model import (
     MAX_POMODORO_CYCLES,
+    MAX_TIME_ALLOWANCE_SECONDS,
     MAX_WEEKLY_PERIODS,
     NETWORK_CONTROLS,
     NOTIFICATION_CATEGORIES,
+    TIME_ALLOWANCE_MODES,
     ManagedList,
     Policy,
     PolicyProjection,
@@ -122,7 +124,18 @@ class WeeklyPeriodForm:
     weekdays: tuple[int, ...]
     start: str
     end: str
+    allowance_mode: str = "strict"
+    allowance_quota_minutes: int | None = None
+    allowance_window_minutes: int | None = None
 
+
+@dataclass(frozen=True)
+class PeriodAllowanceForm:
+    """Pure values from one weekly allowance row."""
+
+    mode: str = "strict"
+    quota_minutes: int | None = None
+    window_minutes: int | None = None
 
 @dataclass(frozen=True)
 class ObservedRuleState:
@@ -267,10 +280,15 @@ class RuleForm:
     # Breadcrumb: optional daily start budget; None means "no limit" and
     # round-trips through put_rule exactly like the other rule fields.
     allowance_starts: int | None = None
+    # Timed allowances are enabled only for weekly URL-level rules. Each
+    # allowance row corresponds by position to one weekly schedule period.
+    time_allowance_enabled: bool = False
+    time_allowance_periods: tuple[PeriodAllowanceForm, ...] = ()
+    time_allowance_daily_cap_minutes: int | None = None
+    configure_lock_after_save: bool = False
     # Breadcrumb: checked network controls; values are the exact network
     # target names and round-trip as kind "network" targets.
     # New-rule convenience: open the full lock configuration after saving.
-    configure_lock_after_save: bool = False
     network_controls: tuple[str, ...] = ()
     notifications_enabled: bool = True
     notification_categories: tuple[str, ...] = NOTIFICATION_CATEGORIES
@@ -382,6 +400,88 @@ def _local_to_utc(value: str, timezone_name: str) -> datetime:
     if candidate.utcoffset() != second.utcoffset():
         raise FormError("This local time occurs twice. Select a different time.")
     return candidate.astimezone(UTC)
+
+
+def _time_allowance_data(
+    form: RuleForm,
+    schedule: Schedule,
+    targets: Sequence[Target],
+) -> dict[str, object] | None:
+    """Validate and serialize the optional weekly timed allowance."""
+    if not form.time_allowance_enabled:
+        return None
+    if form.schedule_kind != "weekly" or schedule.kind != "weekly":
+        raise FormError("Timed allowances require a weekly schedule.")
+    if any(target.kind not in Target.URL_LIKE_KINDS for target in targets):
+        raise FormError("Timed allowances require URL-level targets only.")
+    if schedule.has_overlapping_periods():
+        raise FormError(
+            "Timed allowances require non-overlapping weekly periods."
+        )
+    if len(form.time_allowance_periods) != len(schedule.periods):
+        raise FormError(
+            "Add one timed allowance setting for each weekly period."
+        )
+    daily_minutes = form.time_allowance_daily_cap_minutes
+    if daily_minutes is not None and (
+        isinstance(daily_minutes, bool)
+        or not isinstance(daily_minutes, int)
+        or not 1 <= daily_minutes <= MAX_TIME_ALLOWANCE_SECONDS // 60
+    ):
+        raise FormError("The daily timed allowance must be 1 to 1440 minutes.")
+    periods: list[dict[str, object]] = []
+    for index, item in enumerate(form.time_allowance_periods, 1):
+        if item.mode not in TIME_ALLOWANCE_MODES:
+            raise FormError(f"Allowance mode for period {index} is invalid.")
+        if item.mode == "strict":
+            if item.quota_minutes is not None or item.window_minutes is not None:
+                raise FormError(
+                    f"Strict allowance period {index} cannot have durations."
+                )
+            periods.append({"mode": "strict"})
+            continue
+        quota = item.quota_minutes
+        if (
+            isinstance(quota, bool)
+            or not isinstance(quota, int)
+            or not 1 <= quota <= MAX_TIME_ALLOWANCE_SECONDS // 60
+        ):
+            raise FormError(
+                f"Allowance quota for period {index} must be 1 to 1440 minutes."
+            )
+        if item.mode == "total":
+            if item.window_minutes is not None:
+                raise FormError(
+                    f"Total allowance period {index} cannot have a window."
+                )
+            periods.append(
+                {"mode": "total", "quota_seconds": quota * 60}
+            )
+            continue
+        window = item.window_minutes
+        if (
+            isinstance(window, bool)
+            or not isinstance(window, int)
+            or not 1 <= window <= MAX_TIME_ALLOWANCE_SECONDS // 60
+        ):
+            raise FormError(
+                f"Allowance window for period {index} must be 1 to 1440 minutes."
+            )
+        if quota > window:
+            raise FormError(
+                f"Allowance quota for period {index} exceeds its window."
+            )
+        periods.append(
+            {
+                "mode": "fixed_window",
+                "quota_seconds": quota * 60,
+                "window_seconds": window * 60,
+            }
+        )
+    return {
+        "periods": periods,
+        "daily_cap_seconds": None if daily_minutes is None else daily_minutes * 60,
+    }
 
 
 def _normalize_clock(value: str) -> str:
@@ -518,6 +618,11 @@ def form_to_rule(
         raise FormError("Select a valid schedule type.")
 
     schedule = Schedule.from_dict(schedule_data)
+    if form.allowance_starts is not None and form.time_allowance_enabled:
+        raise FormError(
+            "Choose either a daily start allowance or a timed allowance."
+        )
+    time_allowance_data = _time_allowance_data(form, schedule, targets)
     if existing is None:
         rule_id, enabled, revision = str(id_factory()), True, 0
     else:
@@ -549,6 +654,8 @@ def form_to_rule(
                 "Daily start allowances require URL-level targets only."
             )
         rule_data["allowance_starts"] = form.allowance_starts
+    if time_allowance_data is not None:
+        rule_data["allowance_time"] = time_allowance_data
     if form.notifications_enabled and not form.notification_categories:
         raise FormError("Select at least one notification category.")
     if (
@@ -587,11 +694,34 @@ def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
     network_controls = tuple(
         item["value"] for item in targets if item["kind"] == "network"
     )
+    time_allowance = rule.time_allowance
     return replace(
         form,
         url_targets=url_targets,
         url_exceptions=url_exceptions,
         allowance_starts=rule.allowance_starts,
+        time_allowance_enabled=time_allowance is not None,
+        time_allowance_periods=(
+            tuple(
+                PeriodAllowanceForm(
+                    period.mode,
+                    None
+                    if period.quota_seconds is None
+                    else (period.quota_seconds + 59) // 60,
+                    None
+                    if period.window_seconds is None
+                    else (period.window_seconds + 59) // 60,
+                )
+                for period in time_allowance.periods
+            )
+            if time_allowance is not None
+            else ()
+        ),
+        time_allowance_daily_cap_minutes=(
+            None
+            if time_allowance is None or time_allowance.daily_cap_seconds is None
+            else (time_allowance.daily_cap_seconds + 59) // 60
+        ),
         network_controls=network_controls,
         notifications_enabled=rule.notifications_enabled,
         notification_categories=rule.notification_categories,
@@ -4127,7 +4257,71 @@ class WeeklyPeriodRow:
         end_box.append(self.end_entry)
         times.append(end_box)
         self.container.append(times)
+        allowance_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.COMPACT)
+        )
+        allowance_label = Gtk.Label(label="Timed allowance")
+        allowance_label.set_xalign(0)
+        allowance_box.append(allowance_label)
+        self.allowance_mode_dropdown = Gtk.DropDown.new_from_strings(
+            ("No allowance", "Total minutes", "Fixed refill window")
+        )
+        allowance_box.append(self.allowance_mode_dropdown)
+        self.allowance_quota_label = Gtk.Label(label="Allowed minutes")
+        self.allowance_quota_label.set_xalign(0)
+        allowance_box.append(self.allowance_quota_label)
+        self.allowance_quota = Gtk.SpinButton.new_with_range(1, 1440, 1)
+        self.allowance_quota.set_numeric(True)
+        self.allowance_quota.set_value(value.allowance_quota_minutes or 30)
+        allowance_box.append(self.allowance_quota)
+        self.allowance_window_label = Gtk.Label(label="Refill window minutes")
+        self.allowance_window_label.set_xalign(0)
+        allowance_box.append(self.allowance_window_label)
+        self.allowance_window = Gtk.SpinButton.new_with_range(1, 1440, 1)
+        self.allowance_window.set_numeric(True)
+        self.allowance_window.set_value(value.allowance_window_minutes or 60)
+        allowance_box.append(self.allowance_window)
+        self.container.append(allowance_box)
+        self.allowance_mode_dropdown.set_selected(
+            {"strict": 0, "total": 1, "fixed_window": 2}.get(value.allowance_mode, 0)
+        )
+        self.allowance_mode_dropdown.connect(
+            "notify::selected", self._allowance_mode_changed
+        )
+        self._allowance_mode_changed(self.allowance_mode_dropdown)
+        self.set_allowance_enabled(False)
         self.set_index(index)
+    
+    def set_allowance_enabled(self, enabled: bool) -> None:
+        """Enable or disable this row's timed allowance controls."""
+        for widget in (
+            self.allowance_mode_dropdown,
+            self.allowance_quota,
+            self.allowance_window,
+        ):
+            widget.set_sensitive(enabled)
+    
+    def _allowance_mode_changed(
+        self, dropdown: object, _parameter: object | None = None
+    ) -> None:
+        selected = dropdown.get_selected()
+        self.allowance_quota_label.set_visible(selected in {1, 2})
+        self.allowance_quota.set_visible(selected in {1, 2})
+        self.allowance_window_label.set_visible(selected == 2)
+        self.allowance_window.set_visible(selected == 2)
+
+    def allowance_value(self) -> PeriodAllowanceForm:
+        selected = self.allowance_mode_dropdown.get_selected()
+        mode = ("strict", "total", "fixed_window")[selected]
+        if mode == "strict":
+            return PeriodAllowanceForm(mode)
+        quota = self.allowance_quota.get_value_as_int()
+        if mode == "total":
+            return PeriodAllowanceForm(mode, quota)
+        return PeriodAllowanceForm(
+            mode, quota, self.allowance_window.get_value_as_int()
+        )
+    
 
     def set_index(self, index: int) -> None:
         self.heading.set_text(f"Period {index}")
@@ -4479,6 +4673,46 @@ class RuleEditor:
         note.set_wrap(True)
         note.add_css_class("dim-label")
         weekly.append(note)
+        allowance_heading = Gtk.Label(label="Timed allowance")
+        allowance_heading.add_css_class("heading")
+        allowance_heading.set_xalign(0)
+        weekly.append(allowance_heading)
+        self.time_allowance_check = Gtk.CheckButton(
+            label="Enable elapsed-time allowance for these periods"
+        )
+        self.time_allowance_check.set_tooltip_text(
+            "Allow focused browser time during each weekly period. "
+            "This requires URL-level targets and non-overlapping periods."
+        )
+        self.time_allowance_check.connect(
+            "toggled", self._time_allowance_changed
+        )
+        weekly.append(self.time_allowance_check)
+        self.time_allowance_daily_spin = Gtk.SpinButton.new_with_range(
+            0, MAX_TIME_ALLOWANCE_SECONDS // 60, 1
+        )
+        self.time_allowance_daily_spin.set_numeric(True)
+        self.time_allowance_daily_spin.set_value(0)
+        self.time_allowance_daily_spin.set_tooltip_text(
+            "Optional daily ceiling in minutes; 0 means no ceiling."
+        )
+        weekly.append(
+            self._label_for(
+                "Daily timed allowance ceiling (minutes)",
+                self.time_allowance_daily_spin,
+            )
+        )
+        weekly.append(self.time_allowance_daily_spin)
+        allowance_note = Gtk.Label(
+            label="Each period below has its own allowance mode. "
+            "No allowance blocks the full period; total and fixed-window "
+            "modes permit elapsed browser time."
+        )
+        allowance_note.set_xalign(0)
+        allowance_note.set_wrap(True)
+        allowance_note.add_css_class("dim-label")
+        weekly.append(allowance_note)
+        self._time_allowance_changed(self.time_allowance_check)
         self.schedule_stack.add_named(weekly, "weekly")
         pomodoro = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.SMALL)
@@ -4520,6 +4754,7 @@ class RuleEditor:
             label="The rule blocks during work and permits each break. "
             "It ends after the final work interval."
         )
+
         pomodoro_note.set_xalign(0)
         pomodoro_note.set_wrap(True)
         pomodoro_note.add_css_class("dim-label")
@@ -4558,6 +4793,16 @@ class RuleEditor:
         enabled = check.get_active()
         for category_check in self.notification_checks.values():
             category_check.set_sensitive(enabled)
+    def _time_allowance_changed(
+        self, check: object, _parameter: object | None = None
+    ) -> None:
+        enabled = check.get_active()
+        if enabled:
+            self.allowance_spin.set_value(0)
+        self.allowance_spin.set_sensitive(not enabled)
+        self.time_allowance_daily_spin.set_sensitive(enabled)
+        for row in self.weekly_rows:
+            row.set_allowance_enabled(enabled)
 
 
     def _add_weekly_period(self, value: WeeklyPeriodForm) -> None:
@@ -4568,6 +4813,7 @@ class RuleEditor:
         )
         self.weekly_rows.append(row)
         self.weekly_period_box.append(row.container)
+        row.set_allowance_enabled(self.time_allowance_check.get_active())
         self.add_period_button.set_sensitive(
             len(self.weekly_rows) < MAX_WEEKLY_PERIODS
         )
@@ -4898,6 +5144,18 @@ class RuleEditor:
                 None if self.allowance_spin.get_value_as_int() == 0
                 else self.allowance_spin.get_value_as_int()
             ),
+            time_allowance_enabled=(
+                SCHEDULE_KINDS[selected] == "weekly"
+                and self.time_allowance_check.get_active()
+            ),
+            time_allowance_periods=tuple(
+                row.allowance_value() for row in self.weekly_rows
+            ),
+            time_allowance_daily_cap_minutes=(
+                None
+                if self.time_allowance_daily_spin.get_value_as_int() == 0
+                else self.time_allowance_daily_spin.get_value_as_int()
+            ),
             configure_lock_after_save=self.configure_lock_check.get_active(),
         )
 
@@ -4943,24 +5201,36 @@ class RuleEditor:
         selected = SCHEDULE_KINDS.index(form.schedule_kind)
         self.schedule_dropdown.set_selected(selected)
         self.schedule_stack.set_visible_child_name(form.schedule_kind)
-        # Breadcrumb for reviewers: unused schedule fields are blank in a
-        # RuleForm. DateTimePicker rejects blank text, so populate only the
-        # controls for the stored schedule kind.
-        if form.schedule_kind == "one_time":
-            self.one_start.set_text(form.one_time_start)
-            self.one_end.set_text(form.one_time_end)
+        # Breadcrumb: 0 means "no daily limit" in the editor.
+        self.allowance_spin.set_value(form.allowance_starts or 0)
+        time_allowance_check = getattr(self, "time_allowance_check", None)
+        if time_allowance_check is not None:
+            time_allowance_check.set_active(form.time_allowance_enabled)
+            self.time_allowance_daily_spin.set_value(
+                form.time_allowance_daily_cap_minutes or 0
+            )
+        for row in tuple(self.weekly_rows):
+            self._remove_weekly_period(row)
+        if form.schedule_kind == "weekly":
+            for index, period in enumerate(form.weekly_periods):
+                allowance = (
+                    form.time_allowance_periods[index]
+                    if index < len(form.time_allowance_periods)
+                    else PeriodAllowanceForm()
+                )
+                self._add_weekly_period(
+                    replace(
+                        period,
+                        allowance_mode=allowance.mode,
+                        allowance_quota_minutes=allowance.quota_minutes,
+                        allowance_window_minutes=allowance.window_minutes,
+                    )
+                )
         elif form.schedule_kind == "pomodoro":
             self.pomodoro_start.set_text(form.pomodoro_start)
             self.pomodoro_work.set_value(form.pomodoro_work_minutes)
             self.pomodoro_break.set_value(form.pomodoro_break_minutes)
             self.pomodoro_cycles.set_value(form.pomodoro_cycles)
-        # Breadcrumb: 0 means "no daily limit" in the editor.
-        self.allowance_spin.set_value(form.allowance_starts or 0)
-        for row in tuple(self.weekly_rows):
-            self._remove_weekly_period(row)
-        if form.schedule_kind == "weekly":
-            for period in form.weekly_periods:
-                self._add_weekly_period(period)
 
     def present(self) -> None:
         self.window.present()
