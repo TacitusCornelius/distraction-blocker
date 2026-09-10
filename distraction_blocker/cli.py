@@ -7,16 +7,29 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import getpass as _getpass
 import json
 import sys
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .actions import ACTION_KINDS, new_action
 from .canonical import CanonicalError, canonical_uuid
-from .model import PolicyProjection
+from .model import PolicyProjection, Schedule
+from .notifications import (
+    block as block_notifications,
+    current_state as current_notification_state,
+    unblock as unblock_notifications,
+)
 from .rpc import Client, RpcError
+from .transfer import (
+    atomic_write_text,
+    block_list_preview_text,
+    parse_block_list_export,
+    read_block_list_text,
+    statistics_export_text,
+)
 
 UTC = timezone.utc
 DEFAULT_SOCKET = "/run/distraction-blocker/control.sock"
@@ -37,7 +50,48 @@ def _parser() -> argparse.ArgumentParser:
     command("status", "show service health")
     command("rules", "list rules")
     command("managed-lists", "list managed lists")
+    block_list = command(
+        "import-block-list", "preview or import a Block List .blocklist.json export"
+    )
+    block_list.add_argument("path")
+    block_list.add_argument(
+        "--timezone", default="UTC", help="IANA time zone for scheduled blocks"
+    )
+    block_list.add_argument(
+        "--enable",
+        action="store_true",
+        help="enable imported rules (default: disabled for review)",
+    )
+    block_list.add_argument(
+        "--apply",
+        action="store_true",
+        help="write accepted rules to the service after previewing",
+    )
+
     today = command("today", "show the projected schedule for one local day")
+    actions = command("actions", "list or manage scheduled workstation actions")
+    actions.add_argument(
+        "operation", choices=("list", "add", "remove", "enable", "disable")
+    )
+    actions.add_argument("action_id", nargs="?")
+    actions.add_argument("--kind", choices=ACTION_KINDS)
+    actions.add_argument("--at", help="one-time local date/time")
+    actions.add_argument("--timezone", default="UTC", help="IANA time zone for --at")
+    actions.add_argument(
+        "--weekdays",
+        help="comma-separated weekday numbers (0=Monday through 6=Sunday)",
+    )
+    actions.add_argument("--start", help="weekly local start time HH:MM")
+    actions.add_argument("--end", help="weekly local end time HH:MM")
+    actions.add_argument(
+        "--confirm-shutdown",
+        action="store_true",
+        help="confirm that shutdown may power off this workstation",
+    )
+    notifications = command("notifications", "control desktop notifications")
+    notifications.add_argument(
+        "operation", choices=("status", "block", "unblock")
+    )
     today.add_argument("--date", dest="day", help="local date in YYYY-MM-DD form")
     today.add_argument("--timezone", help="IANA time zone (default: system)")
     focus = command("focus", "start a focus period")
@@ -45,6 +99,11 @@ def _parser() -> argparse.ArgumentParser:
     focus.add_argument("minutes", type=int)
     stats = command("stats", "show denial statistics")
     stats.add_argument("--clear", action="store_true", help="clear statistics after reading them")
+    stats.add_argument(
+        "--export",
+        dest="export_path",
+        help="write application and website statistics to this path",
+    )
     for name, help_text, enabled in (("enable", "enable a rule", True), ("disable", "disable a rule", False)):
         sub = command(name, help_text)
         sub.add_argument("rule_id")
@@ -111,6 +170,20 @@ def _human_lines(command: str, value: Any) -> list[str]:
             )
             for item in value
         ]
+    if command == "import-block-list" and isinstance(value, dict):
+        lines = [
+            f"Imported blocks: {value.get('accepted_blocks', 0)}",
+            f"Exact hostnames: {value.get('accepted_websites', 0)}",
+            f"Duplicates: {value.get('duplicates', 0)}",
+            f"Unsupported or invalid entries: {len(value.get('issues', []))}",
+            f"Applied: {value.get('applied', 0)}",
+        ]
+        lines.extend(
+            f"- {item.get('path', '')}: {item.get('reason', '')}"
+            for item in value.get("issues", [])[:32]
+            if isinstance(item, dict)
+        )
+        return lines
     if command == "today" and isinstance(value, dict):
         lines = [
             f"Date: {value.get('date', '')}",
@@ -125,6 +198,26 @@ def _human_lines(command: str, value: Any) -> list[str]:
                 f"{item.get('start', '')} to {item.get('end', '')}  "
                 f"{item.get('rule_name', '')}"
                 for item in intervals
+            ),
+        ]
+    if command == "actions" and isinstance(value, (dict, list)):
+        items = value if isinstance(value, list) else [value]
+        if not items:
+            return ["No scheduled actions."]
+        return [
+            (
+                f"{item.get('id', '')}  {item.get('kind', '')}  "
+                f"{'enabled' if item.get('enabled') else 'disabled'}  "
+                f"{item.get('schedule', {}).get('kind', '')}"
+            )
+            for item in items
+        ]
+    if command == "notifications" and isinstance(value, dict):
+        return [
+            f"Notification banners: {'enabled' if value.get('show_banners') else 'blocked'}",
+            (
+                "Notifications on lock screen: "
+                + ("enabled" if value.get("show_in_lock_screen") else "blocked")
             ),
         ]
     if command == "stats" and isinstance(value, dict):
@@ -222,6 +315,71 @@ def _password(value: str) -> str:
     return value
 
 
+def _scheduled_action(
+    arguments: argparse.Namespace,
+    now: Callable[[], datetime],
+) -> dict[str, Any] | None:
+    if arguments.operation == "list":
+        return None
+    if arguments.operation in {"enable", "disable"}:
+        if not arguments.action_id:
+            raise ValueError("action ID is required")
+        return {
+            "action_id": _rule_id(arguments.action_id),
+            "enabled": arguments.operation == "enable",
+        }
+    if arguments.operation == "remove":
+        if not arguments.action_id:
+            raise ValueError("action ID is required")
+        return {"action_id": _rule_id(arguments.action_id)}
+    if arguments.kind is None:
+        raise ValueError("action kind is required")
+    if arguments.kind == "shutdown" and not arguments.confirm_shutdown:
+        raise ValueError("shutdown requires --confirm-shutdown")
+    if arguments.at:
+        if arguments.weekdays or arguments.start or arguments.end:
+            raise ValueError("one-time and weekly schedule fields cannot be combined")
+        utc_text = _utc_expiry(arguments.at, arguments.timezone)
+        start = datetime.fromisoformat(utc_text.replace("Z", "+00:00"))
+        schedule = Schedule.from_dict({
+            "kind": "one_time",
+            "start_utc": utc_text,
+            "end_utc": (start + timedelta(minutes=1)).isoformat().replace(
+                "+00:00", "Z"
+            ),
+        })
+    else:
+        if not arguments.weekdays or not arguments.start or not arguments.end:
+            raise ValueError("weekly actions require --weekdays, --start, and --end")
+        try:
+            weekdays = [int(item) for item in arguments.weekdays.split(",")]
+        except ValueError as error:
+            raise ValueError("weekdays must be comma-separated numbers") from error
+        schedule = Schedule.from_dict({
+            "kind": "weekly",
+            "timezone": arguments.timezone,
+            "periods": [{
+                "weekdays": weekdays,
+                "start": arguments.start,
+                "end": arguments.end,
+            }],
+        })
+    return new_action(arguments.kind, schedule).to_dict()
+
+
+def _notification_command(operation: str) -> dict[str, Any]:
+    if operation == "block":
+        state = block_notifications()
+    elif operation == "unblock":
+        state = unblock_notifications()
+    else:
+        state = current_notification_state()
+    return {
+        "show_banners": state.show_banners,
+        "show_in_lock_screen": state.show_in_lock_screen,
+    }
+
+
 def _today(
     client: Any,
     arguments: argparse.Namespace,
@@ -258,6 +416,46 @@ def _today(
     return result
 
 
+def _block_list_import(arguments: argparse.Namespace, client: Any) -> dict[str, Any]:
+    preview = parse_block_list_export(
+        read_block_list_text(arguments.path),
+        timezone_name=arguments.timezone,
+        enabled=arguments.enable,
+    )
+    applied = 0
+    if arguments.apply and preview.rules:
+        response = client.request("begin_rule_import")
+        import_id = response["import_id"]
+        try:
+            for offset in range(0, len(preview.rules), 200):
+                client.request(
+                    "import_rule_chunk",
+                    import_id=import_id,
+                    rules=[
+                        rule.to_dict()
+                        for rule in preview.rules[offset : offset + 200]
+                    ],
+                )
+            client.request("commit_rule_import", import_id=import_id)
+            applied = len(preview.rules)
+        except Exception:
+            try:
+                client.request("cancel_rule_import", import_id=import_id)
+            except Exception:
+                pass
+            raise
+    return {
+        "accepted_blocks": preview.accepted_blocks,
+        "accepted_websites": preview.accepted_websites,
+        "duplicates": preview.duplicates,
+        "issues": [
+            {"path": issue.path, "text": issue.text, "reason": issue.reason}
+            for issue in preview.issues
+        ],
+        "applied": applied,
+    }
+
+
 def _execute(
     arguments: argparse.Namespace,
     client: Any,
@@ -266,6 +464,19 @@ def _execute(
     now: Callable[[], datetime],
 ) -> Any:
     command = arguments.command
+    if command == "import-block-list":
+        return _block_list_import(arguments, client)
+    if command == "actions":
+        if arguments.operation == "list":
+            return client.request("list_scheduled_actions")
+        fields = _scheduled_action(arguments, now)
+        if arguments.operation == "remove":
+            return client.request("delete_scheduled_action", **fields)
+        if arguments.operation in {"enable", "disable"}:
+            return client.request("set_scheduled_action_enabled", **fields)
+        return client.request("put_scheduled_action", action=fields)
+    if command == "notifications":
+        return _notification_command(arguments.operation)
     if command == "status":
         return client.request("status")
     if command == "rules":
@@ -278,6 +489,12 @@ def _execute(
         return client.request("start_focus", rule_id=_rule_id(arguments.rule_id), minutes=arguments.minutes)
     if command == "stats":
         result = client.request("list_denial_stats")
+        if arguments.export_path:
+            website = client.request("list_website_stats")
+            atomic_write_text(
+                arguments.export_path,
+                statistics_export_text(result, website, now()),
+            )
         if arguments.clear:
             client.request("clear_denial_stats")
         return result

@@ -32,6 +32,12 @@ Version 1.3 adds these functions:
 - A public socket-only command-line client.
 - A multi-user policy research record.
 
+The current feature cycle also adds separately persisted scheduled workstation
+actions (lock, log out, and shut down), GNOME notification suppression with
+state restoration, advanced rule-boundary warnings, statistics export, and an
+optional Ayatana system tray client. Scheduled actions remain separate from
+normal blocking rules because shutdown can cause data loss.
+
 Locks and statistics stay outside portable policy exports. The root service remains the policy authority.
 
 ### Protected-user network controls
@@ -195,11 +201,8 @@ Open **Distraction Blocker** from the Ubuntu application menu. You can also run 
 
 The installer also adds the public client at `/usr/local/bin/distraction-blocker`.
 
-### Command-line client
-
-The client uses the same owner-checked Unix socket as the GUI. It never reads protected files.
-
 Run a command:
+
 
 ```bash
 distraction-blocker status
@@ -208,7 +211,35 @@ distraction-blocker managed-lists
 distraction-blocker today
 distraction-blocker focus RULE_ID 30
 distraction-blocker stats
+distraction-blocker stats --export ~/distraction-statistics.json
+distraction-blocker actions list
+distraction-blocker actions add --kind lock --at "2026-01-01 22:00"
+distraction-blocker actions disable ACTION_ID
+distraction-blocker notifications block
+distraction-blocker import-block-list ~/Downloads/focus.blocklist.json
+distraction-blocker import-block-list \
+  ~/Downloads/focus.blocklist.json --timezone Europe/London --apply
 ```
+
+The Block List command first previews accepted exact hostnames and every
+unsupported entry. Imported rules are disabled by default; `--apply` stages
+the complete import and commits it atomically through the root service, while
+`--enable` explicitly enables them.
+
+Scheduled actions accept one-time timestamps or weekly local-time windows.
+Use `actions enable ACTION_ID` or `actions disable ACTION_ID` to pause one
+without deleting it; `actions remove ACTION_ID` deletes one. In addition to
+lock, logout, and shutdown, `--kind notifications` blocks GNOME banners and
+lock-screen notifications for the scheduled window and restores the prior
+values when the window ends. Shutdown actions require the explicit
+`--confirm-shutdown` option.
+
+The optional **Distraction Blocker Tray** launcher provides quick access to the
+GUI, per-rule controls, scheduled-action controls, and notification controls.
+The installer also registers it for desktop-session autostart. It requires
+Ubuntu's `gir1.2-ayatanaappindicator3-0.1` package in addition to
+`python3-gi`.
+
 
 Rule commands are `enable`, `disable`, and `delete`.
 

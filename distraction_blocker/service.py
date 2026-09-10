@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import hmac
 import os
+import pwd
 import re
 import stat
 import subprocess
@@ -15,6 +17,11 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Iterable
 
+from .actions import (
+    ACTION_KINDS,
+    ScheduledAction,
+    ScheduledActionsState,
+)
 from .canonical import format_utc
 from .control import ControlError, ControlState, RuleLock
 from .model import (
@@ -35,6 +42,37 @@ def _authorization_now() -> float:
     # CLOCK_BOOTTIME prevents a short grant from surviving a long suspend.
     return time.clock_gettime(time.CLOCK_BOOTTIME)
 
+def execute_scheduled_action(action: ScheduledAction, owner_uid: int) -> None:
+    """Execute one validated action without invoking a shell."""
+    commands = {
+        "lock": ["/usr/bin/loginctl", "lock-sessions"],
+        "logout": ["/usr/bin/loginctl", "terminate-user", str(owner_uid)],
+        "shutdown": ["/usr/bin/systemctl", "poweroff"],
+    }
+    subprocess.run(commands[action.kind], check=True, timeout=30)
+def execute_notification_action(
+    action: ScheduledAction, owner_uid: int, block: bool
+) -> None:
+    """Run the desktop notification CLI as the configured desktop user."""
+    try:
+        username = pwd.getpwuid(owner_uid).pw_name
+    except KeyError as error:
+        raise OSError("scheduled notification owner does not exist") from error
+    subprocess.run(
+        [
+            "/usr/sbin/runuser",
+            "-u",
+            username,
+            "--",
+            "/usr/local/bin/distraction-blocker",
+            "notifications",
+            "block" if block else "unblock",
+        ],
+        check=True,
+        timeout=30,
+    )
+
+
 
 class BlockerService:
     """Policy authority and the only place that expands managed-list targets."""
@@ -48,8 +86,19 @@ class BlockerService:
     _MAX_AUTHORIZATIONS = 32
     _FRICTION_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     _MAX_NATIVE_IMPORT_BYTES = 8 * 1024 * 1024
-
-    def __init__(self, store, clock, hosts, applications, denial_buffer=None, *, network=None):
+    def __init__(
+        self,
+        store,
+        clock,
+        hosts,
+        applications,
+        denial_buffer=None,
+        *,
+        network=None,
+        action_runner=execute_scheduled_action,
+        notification_runner=execute_notification_action,
+        owner_uid: int = 0,
+    ):
         self.store = store
         self.clock = clock
         self.hosts = hosts
@@ -64,14 +113,17 @@ class BlockerService:
         # Breadcrumb: FakeApplications in the tests has no denial_buffer
         # attribute until this call, so the fallback read above must stay.
         applications.set_denial_buffer(self.denial_buffer)
-        # Breadcrumb: the network enforcer is an explicit opt-in. ``None``
-        # (or ``available`` False) means network controls are unavailable,
-        # never silently unenforced; the service then performs no network
-        # side effects at all and refuses to persist network targets.
         self.network = network
+        self.action_runner = action_runner
+        self.notification_runner = notification_runner
+        self.owner_uid = owner_uid
         self._active_network: frozenset[str] = frozenset()
         self.policy: Policy | None = None
         self.controls = ControlState.empty()
+        self.actions = ScheduledActionsState.empty()
+        self._action_retry_after: dict[str, float] = {}
+        self._active_notification_actions: set[str] = set()
+        self._action_retry_attempts: dict[str, int] = {}
         self._statistics = StatisticsState.empty()
         self._website_statistics = WebsiteDenialState.empty()
         self._website_usage = WebsiteUsageState.empty()
@@ -90,6 +142,7 @@ class BlockerService:
         # crash cannot create an unreviewed policy or bypass signed storage.
         self._challenges: dict[str, dict[str, Any]] = {}
         self._grants: dict[tuple[int, str], float] = {}
+        self._staged_rules: dict[str, dict[str, Any]] = {}
         self._staged_lists: dict[str, dict[str, Any]] = {}
         self._staged_native: dict[str, dict[str, Any]] = {}
 
@@ -188,6 +241,124 @@ class BlockerService:
             # Statistics are observational. A bad stats file cannot degrade
             # policy health or change a fanotify decision.
             self._statistics = StatisticsState.empty()
+
+    def _load_scheduled_actions(self) -> None:
+        loader = getattr(self.store, "load_scheduled_actions", None)
+        if loader is None:
+            self.actions = ScheduledActionsState.empty()
+            return
+        try:
+            loaded = loader()
+            self.actions = (
+                loaded
+                if isinstance(loaded, ScheduledActionsState)
+                else ScheduledActionsState.from_dict(loaded)
+            )
+        except Exception as error:
+            raise StorageError("scheduled actions are invalid") from error
+
+    def _save_scheduled_actions(self, state: ScheduledActionsState) -> None:
+        saver = getattr(self.store, "save_scheduled_actions", None)
+        if saver is None:
+            raise StorageError("scheduled actions storage is unavailable")
+        saver(state)
+        self.actions = state
+    def _run_scheduled_actions(self) -> None:
+        if not bool(getattr(self.clock, "trusted", True)):
+            return
+        now = self._now()
+        monotonic_now = time.monotonic()
+        updated = self.actions
+        changed = False
+        for action in self.actions.items:
+            if self._action_retry_after.get(action.id, 0.0) > monotonic_now:
+                continue
+            occurrence = action.occurrence_at(now)
+            if (
+                action.kind == "notifications"
+                and action.schedule.kind == "one_time"
+                and action.schedule.end_utc is not None
+                and now >= action.schedule.end_utc
+            ):
+                occurrence = None
+            if action.kind == "notifications":
+                if occurrence is None:
+                    if action.id not in self._active_notification_actions:
+                        self._action_retry_after.pop(action.id, None)
+                        self._action_retry_attempts.pop(action.id, None)
+                        continue
+                    if len(self._active_notification_actions) > 1:
+                        self._active_notification_actions.discard(action.id)
+                        self._action_retry_after.pop(action.id, None)
+                        self._action_retry_attempts.pop(action.id, None)
+                        continue
+                    try:
+                        self.notification_runner(action, self.owner_uid, False)
+                    except (OSError, subprocess.SubprocessError) as error:
+                        attempt = self._action_retry_attempts.get(action.id, 0) + 1
+                        self._action_retry_attempts[action.id] = attempt
+                        delay = min(300.0, 5.0 * (2 ** min(attempt - 1, 6)))
+                        self._action_retry_after[action.id] = monotonic_now + delay
+                        print(
+                            f"distraction-blocker: scheduled notifications restore failed; "
+                            f"retrying in {int(delay)} seconds: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+                    self._active_notification_actions.discard(action.id)
+                    self._action_retry_after.pop(action.id, None)
+                    self._action_retry_attempts.pop(action.id, None)
+                    continue
+                if action.id in self._active_notification_actions:
+                    continue
+                runner = lambda: self.notification_runner(
+                    action, self.owner_uid, True
+                )
+            else:
+                if occurrence is None:
+                    self._action_retry_after.pop(action.id, None)
+                    self._action_retry_attempts.pop(action.id, None)
+                    continue
+                runner = lambda: self.action_runner(action, self.owner_uid)
+            try:
+                runner()
+            except (OSError, subprocess.SubprocessError) as error:
+                attempt = self._action_retry_attempts.get(action.id, 0) + 1
+                self._action_retry_attempts[action.id] = attempt
+                delay = min(300.0, 5.0 * (2 ** min(attempt - 1, 6)))
+                self._action_retry_after[action.id] = monotonic_now + delay
+                print(
+                    f"distraction-blocker: scheduled {action.kind} failed; "
+                    f"retrying in {int(delay)} seconds: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            self._action_retry_after.pop(action.id, None)
+            self._action_retry_attempts.pop(action.id, None)
+            if action.kind == "notifications":
+                self._active_notification_actions.add(action.id)
+            updated = updated.replace(
+                ScheduledAction(
+                    action.id,
+                    action.kind,
+                    action.enabled,
+                    action.schedule,
+                    action.revision,
+                    occurrence,
+                )
+            )
+            changed = True
+        if changed:
+            try:
+                self._save_scheduled_actions(updated)
+            except Exception as error:
+                print(
+                    f"distraction-blocker: scheduled actions persist failed: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def _load_website_statistics(self) -> None:
         try:
@@ -407,7 +578,6 @@ class BlockerService:
         except Exception:
             self._healthy = False
             raise
-
     def start(self) -> None:
         if self._started:
             return
@@ -422,6 +592,7 @@ class BlockerService:
             self.policy = Policy.from_dict(self.policy)
         if not isinstance(self.controls, ControlState):
             self.controls = ControlState.from_dict(self.controls)
+        self._load_scheduled_actions()
         # Breadcrumb: usage staleness resolves per-rule time zones, so the
         # load must wait until the policy (and its rules) is in memory.
         self._load_website_usage()
@@ -450,6 +621,7 @@ class BlockerService:
         # Breadcrumb: only this main-thread tick drains and aggregates events.
         self._drain_statistics()
         self._persist_statistics()
+        self._run_scheduled_actions()
         if not self.healthy:
             raise RuntimeError("enforcement is unhealthy")
         clock_trusted = bool(getattr(self.clock, "trusted", True))
@@ -469,6 +641,23 @@ class BlockerService:
         if self._started:
             self._drain_statistics()
             self._persist_statistics(force=True)
+        for action_id in tuple(self._active_notification_actions):
+            action = next(
+                (item for item in self.actions.items if item.id == action_id),
+                None,
+            )
+            if action is None:
+                continue
+            try:
+                self.notification_runner(action, self.owner_uid, False)
+            except (OSError, subprocess.SubprocessError) as error:
+                print(
+                    f"distraction-blocker: scheduled notifications restore failed "
+                    f"during shutdown: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        self._active_notification_actions.clear()
         close_applications = getattr(self.applications, "close", None)
         if close_applications is not None:
             try:
@@ -832,7 +1021,7 @@ class BlockerService:
     def _expire_staged(self) -> None:
         staged_now = time.monotonic()
         authorization_now = _authorization_now()
-        for collection in (self._staged_lists, self._staged_native):
+        for collection in (self._staged_rules, self._staged_lists, self._staged_native):
             for token, value in list(collection.items()):
                 if value["expires"] <= staged_now:
                     del collection[token]
@@ -999,7 +1188,7 @@ class BlockerService:
 
 
     def _staged_count(self) -> int:
-        return len(self._staged_lists) + len(self._staged_native)
+        return len(self._staged_rules) + len(self._staged_lists) + len(self._staged_native)
 
     def _stage(self, collection: dict[str, dict[str, Any]], uid: int, token: str) -> dict[str, Any] | None:
         if not isinstance(token, str):
@@ -1373,6 +1562,10 @@ class BlockerService:
         "import_list_chunk": ((frozenset({"command", "import_id", "domains"}),), "import_id and domains are required", "_cmd_import_list_chunk"),
         "commit_list_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_commit_list_import"),
         "cancel_list_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_cancel_list_import"),
+        "begin_rule_import": ((frozenset({"command"}),), "unknown command field", "_cmd_begin_rule_import"),
+        "import_rule_chunk": ((frozenset({"command", "import_id", "rules"}),), "import_id and rules are required", "_cmd_import_rule_chunk"),
+        "commit_rule_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_commit_rule_import"),
+        "cancel_rule_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_cancel_rule_import"),
         "delete_managed_list": ((frozenset({"command", "list_id"}),), "list_id is required", "_cmd_delete_managed_list"),
         "begin_native_import": ((frozenset({"command"}),), "unknown command field", "_cmd_begin_native_import"),
         "native_import_chunk": ((frozenset({"command", "import_id", "text"}),), "import_id and text are required", "_cmd_native_import_chunk"),
@@ -1385,11 +1578,103 @@ class BlockerService:
         "clear_clock_latch": ((frozenset({"command"}),), "unknown command field", "_cmd_clear_clock_latch"),
         # Breadcrumb: website statistics are observational, so reporting and
         # listing stay available even when enforcement is unhealthy.
+        "list_scheduled_actions": ((frozenset({"command"}),), "unknown command field", "_cmd_list_scheduled_actions"),
+        "put_scheduled_action": ((frozenset({"command", "action"}),), "action is required", "_cmd_put_scheduled_action"),
+        "delete_scheduled_action": ((frozenset({"command", "action_id"}),), "action_id is required", "_cmd_delete_scheduled_action"),
+        "set_scheduled_action_enabled": ((frozenset({"command", "action_id", "enabled"}),), "action_id and enabled are required", "_cmd_set_scheduled_action_enabled"),
         "list_website_stats": ((frozenset({"command"}),), "unknown command field", "_cmd_list_website_stats"),
+
         "report_website_denials": ((frozenset({"command", "entries"}),), "entries is required", "_cmd_report_website_denials"),
         "report_website_usage": ((frozenset({"command", "entries"}),), "entries is required", "_cmd_report_website_usage"),
 
     }
+    def _cmd_list_scheduled_actions(
+        self, uid: int, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._ok([item.to_dict() for item in self.actions.items])
+
+    def _cmd_put_scheduled_action(
+        self, uid: int, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            candidate = ScheduledAction.from_dict(request["action"])
+        except ValidationError as error:
+            return self._error(error.code, error.message)
+        current = next(
+            (item for item in self.actions.items if item.id == candidate.id),
+            None,
+        )
+        candidate = ScheduledAction(
+            candidate.id,
+            candidate.kind,
+            candidate.enabled,
+            candidate.schedule,
+            0 if current is None else current.revision + 1,
+            None,
+        )
+        try:
+            self._save_scheduled_actions(self.actions.replace(candidate))
+        except (OSError, StorageError, ValueError) as error:
+            return self._error("storage", str(error))
+        return self._ok(candidate.to_dict())
+
+    def _cmd_delete_scheduled_action(
+        self, uid: int, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        action_id = request["action_id"]
+        if not isinstance(action_id, str):
+            return self._error("bad_request", "action_id is required")
+        current = next(
+            (item for item in self.actions.items if item.id == action_id),
+            None,
+        )
+        try:
+            updated = self.actions.without(action_id)
+        except KeyError:
+            return self._error("not_found", "scheduled action was not found")
+        if (
+            current is not None
+            and current.kind == "notifications"
+            and action_id in self._active_notification_actions
+            and len(self._active_notification_actions) == 1
+        ):
+            try:
+                self.notification_runner(current, self.owner_uid, False)
+            except (OSError, subprocess.SubprocessError) as error:
+                return self._error("storage", f"could not restore notifications: {error}")
+        try:
+            self._save_scheduled_actions(updated)
+        except (OSError, StorageError) as error:
+            return self._error("storage", str(error))
+        self._active_notification_actions.discard(action_id)
+        return self._ok({"deleted": action_id})
+    def _cmd_set_scheduled_action_enabled(
+        self, uid: int, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        action_id = request["action_id"]
+        enabled = request["enabled"]
+        if not isinstance(action_id, str) or not isinstance(enabled, bool):
+            return self._error("bad_request", "action_id and enabled are required")
+        current = next(
+            (item for item in self.actions.items if item.id == action_id),
+            None,
+        )
+        if current is None:
+            return self._error("not_found", "scheduled action was not found")
+        updated = ScheduledAction(
+            current.id,
+            current.kind,
+            enabled,
+            current.schedule,
+            current.revision + 1,
+            current.last_fired_utc,
+        )
+        try:
+            self._save_scheduled_actions(self.actions.replace(updated))
+        except (OSError, StorageError, ValueError) as error:
+            return self._error("storage", str(error))
+        return self._ok(updated.to_dict())
+
     def _cmd_list_rules(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         # Breadcrumb: the same projection is returned and size-checked by
         # _save, so an accepted policy always fits the RPC response frame.
@@ -1399,7 +1684,7 @@ class BlockerService:
     # validation, exactly as the previous if-chain ordered it.
     _UNHEALTHY_COMMANDS = frozenset({
         "put_rule", "delete_rule", "set_enabled", "replace_rules",
-        "commit_list_import", "commit_native_import",
+        "commit_rule_import", "commit_list_import", "commit_native_import",
         "delete_managed_list", "set_rule_lock", "start_focus",
     })
 
@@ -1689,6 +1974,63 @@ class BlockerService:
             return self._error("not_found", "staged list was not found")
         del self._staged_lists[request["import_id"]]
         return self._ok({"cancelled": True})
+    def _cmd_begin_rule_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        if self._staged_count() >= self._MAX_STAGED:
+            return self._error("busy", "too many staged imports")
+        token = str(uuid.uuid4())
+        self._staged_rules[token] = {
+            "owner": uid,
+            "expires": time.monotonic() + self._STAGE_SECONDS,
+            "rules": [],
+            "bytes": 0,
+        }
+        return self._ok({"import_id": token, "expires_in": self._STAGE_SECONDS})
+
+    def _cmd_import_rule_chunk(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        stage = self._stage(self._staged_rules, uid, request.get("import_id"))
+        raw_rules = request.get("rules")
+        if stage is None:
+            return self._error("not_found", "staged rule import was not found")
+        if not isinstance(raw_rules, list) or not raw_rules or len(raw_rules) > self._CHUNK_SIZE:
+            return self._error("bad_request", "rule chunks need 1 to 200 rules")
+        normalized: list[dict[str, Any]] = []
+        try:
+            for raw_rule in raw_rules:
+                normalized.append(Rule.from_dict(raw_rule).to_dict())
+        except ValidationError as error:
+            return self._error(error.code, error.message)
+        size = stage["bytes"] + len(
+            json.dumps(normalized, separators=(",", ":")).encode("utf-8")
+        )
+        if size > self._MAX_LIST_IMPORT_BYTES:
+            return self._error("too_large", "rule import is too large")
+        stage["rules"].extend(normalized)
+        stage["bytes"] = size
+        return self._ok({"import_id": request["import_id"], "received": len(stage["rules"])})
+
+    def _cmd_commit_rule_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        stage = self._stage(self._staged_rules, uid, request.get("import_id"))
+        if stage is None:
+            return self._error("not_found", "staged rule import was not found")
+        if self.policy is None:
+            return self._error("not_ready", "service is not ready")
+        try:
+            result = self._replace_rules(
+                uid,
+                [rule.to_dict() for rule in self.policy.rules] + stage["rules"],
+            )
+        except ValidationError as error:
+            return self._error(error.code, error.message)
+        if result.get("ok"):
+            del self._staged_rules[request["import_id"]]
+        return result
+
+    def _cmd_cancel_rule_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        stage = self._stage(self._staged_rules, uid, request.get("import_id"))
+        if stage is None:
+            return self._error("not_found", "staged rule import was not found")
+        del self._staged_rules[request["import_id"]]
+        return self._ok({"cancelled": True})
 
     # The field-set half of the original compound guard lives in _COMMANDS;
     # the list_id type check below completes it with the same message.
@@ -1940,7 +2282,13 @@ def main(argv=None) -> int:
     # so an absent marker means no network side effects, never silent bypass.
     network = NetworkEnforcer(owner_uid, data_dir=args.data_dir)
     service = BlockerService(
-        store, clock, hosts, applications, denial_buffer, network=network
+        store,
+        clock,
+        hosts,
+        applications,
+        denial_buffer,
+        network=network,
+        owner_uid=owner_uid,
     )
     state["service"] = service
     service.start()

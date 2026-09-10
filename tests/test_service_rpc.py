@@ -1282,6 +1282,47 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "authorization_required")
 
 
+    def test_rule_import_stages_until_atomic_commit(self):
+        existing = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Existing",
+            "enabled": False,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        imported = Rule.from_dict({
+            "id": "22345678-1234-5678-1234-567812345678",
+            "name": "Imported",
+            "enabled": False,
+            "targets": [{"kind": "website", "value": "example.net"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        store = FakeStore(Policy(0, (existing,)))
+        service = BlockerService(store, FakeClock(), FakeHosts(), FakeApplications())
+        service.start()
+        begun = service.dispatch(1000, {"command": "begin_rule_import"})
+        import_id = begun["result"]["import_id"]
+        self.assertEqual(
+            service.dispatch(
+                1000,
+                {
+                    "command": "import_rule_chunk",
+                    "import_id": import_id,
+                    "rules": [imported.to_dict()],
+                },
+            )["ok"],
+            True,
+        )
+        self.assertEqual(store.policy.rules, (existing,))
+        committed = service.dispatch(
+            1000,
+            {"command": "commit_rule_import", "import_id": import_id},
+        )
+        self.assertTrue(committed["ok"])
+        self.assertEqual(store.policy.rules, (existing, imported))
+
 def closed_weekly_rule(rule_id="12345678-1234-5678-1234-567812345678", **extra):
     """A weekly rule that is CLOSED at the FakeClock default instant."""
     # Breadcrumb: 2026-01-01 is a Thursday, so a Monday-only period keeps

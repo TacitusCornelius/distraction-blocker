@@ -23,6 +23,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         except GtkUnavailableError as error:
             print(str(error), file=sys.stderr)
             return 1
+    if values and values[0] == "tray":
+        from .tray import TrayUnavailableError, run_tray
+
+        try:
+            return run_tray()
+        except TrayUnavailableError as error:
+            print(str(error), file=sys.stderr)
+            return 1
 
     from .cli import main as cli_main
 

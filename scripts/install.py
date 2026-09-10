@@ -45,6 +45,8 @@ STATE = Path("/var/lib/distraction-blocker")
 RUN = Path("/run/distraction-blocker")
 UNIT = Path("/etc/systemd/system/distraction-blocker.service")
 DESKTOP = Path("/usr/share/applications/org.distraction_blocker.App.desktop")
+TRAY_DESKTOP = Path("/usr/share/applications/org.distraction_blocker.Tray.desktop")
+TRAY_AUTOSTART_DESKTOP = Path("/etc/xdg/autostart/org.distraction_blocker.Tray.desktop")
 LEGACY_DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
 CLI_PATH = Path("/usr/local/bin/distraction-blocker")
 PACKAGE_NAME = "distraction_blocker"
@@ -442,8 +444,8 @@ def install_files(
     write_marker: bool,
 ) -> None:
     upgrading = installation_exists()
+    protected = (UNIT, DESKTOP, TRAY_DESKTOP, TRAY_AUTOSTART_DESKTOP, LEGACY_DESKTOP)
     check_cli_collision()
-    protected = (UNIT, DESKTOP, LEGACY_DESKTOP)
     if not upgrading:
         for path in protected:
             if path.exists() or path.is_symlink():
@@ -497,6 +499,12 @@ def install_files(
                 0o755,
             )
             copy_asset(
+                packaging_fd,
+                "tray_entry.py",
+                PREFIX / "tray_entry.py",
+                0o755,
+            )
+            copy_asset(
                 packaging_fd, "cli_entry.py", CLI_PATH, 0o755
             )
             copy_asset(
@@ -526,6 +534,16 @@ def install_files(
                 packaging_fd,
                 "org.distraction_blocker.App.desktop",
                 DESKTOP,
+            )
+            copy_asset(
+                packaging_fd,
+                "org.distraction_blocker.Tray.desktop",
+                TRAY_DESKTOP,
+            )
+            copy_asset(
+                packaging_fd,
+                "org.distraction_blocker.Tray.desktop",
+                TRAY_AUTOSTART_DESKTOP,
             )
             copy_asset(
                 packaging_fd,

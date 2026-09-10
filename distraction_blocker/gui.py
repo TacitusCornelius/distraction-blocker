@@ -46,15 +46,20 @@ from .schedule_view import system_timezone_name as _view_timezone_name
 from .preferences import THEMES, load_theme, save_theme
 from .rpc import Client
 from .transfer import (
+    BlockListImportPreview,
     ImportPreview,
     TransferError,
     atomic_write_text,
+    block_list_preview_text,
     domain_export_text,
     native_export_text,
+    parse_block_list_export,
     parse_domain_text,
+    read_block_list_text,
     read_import_text,
     read_native_text,
     parse_native_export,
+    statistics_export_text,
 )
 UTC = timezone.utc
 
@@ -1510,6 +1515,7 @@ class GuiController:
         self.application, self.client = application, client
         self.snapshot: ServiceSnapshot | None = None
         self._observed_states: dict[str, ObservedRuleState] | None = None
+        self._warning_keys: set[tuple[str, datetime, bool]] = set()
         self._refreshing = False
         self._poll_source: int | None = None
         self.timezone = system_timezone_name()
@@ -1624,6 +1630,13 @@ class GuiController:
         self.overview_button.connect("clicked", lambda _button: self.open_daily_overview())
         transfer_bar.append(self.overview_button)
         self.import_domains_button = Gtk.Button.new_with_mnemonic("_Import domains")
+        self.import_block_list_button = Gtk.Button.new_with_mnemonic(
+            "Import _Block List"
+        )
+        self.import_block_list_button.connect(
+            "clicked", lambda _button: self._choose_block_list_import()
+        )
+        transfer_bar.append(self.import_block_list_button)
         self.import_domains_button.connect(
             "clicked", lambda _button: self._choose_domain_import()
         )
@@ -1684,6 +1697,7 @@ class GuiController:
         if self._poll_source is not None:
             self.GLib.source_remove(self._poll_source)
             self._poll_source = None
+        self.closed = True
         return False
 
     def _set_busy(self, busy: bool) -> None:
@@ -1695,6 +1709,7 @@ class GuiController:
         self.statistics_button.set_sensitive(not busy)
         for widget in (
             self.import_domains_button,
+            self.import_block_list_button,
             self.import_backup_button,
             self.export_domains_button,
             self.export_backup_button,
@@ -1753,6 +1768,9 @@ class GuiController:
                 detect_rule_transitions(self._observed_states, current_states)
             )
         self._observed_states = current_states
+        self._send_advance_notifications(
+            snapshot.rules, now_utc, snapshot.clock_trusted
+        )
         self.snapshot = snapshot
         self._set_busy(False)
         self.notice_label.set_text("")
@@ -1783,6 +1801,42 @@ class GuiController:
         self.import_backup_button.set_sensitive(snapshot.healthy)
         self._render_rules(snapshot)
         return False
+
+    def _send_advance_notifications(
+        self,
+        rules: Sequence[Rule],
+        now_utc: datetime,
+        clock_trusted: bool,
+    ) -> None:
+        """Warn once when a rule boundary is five minutes away."""
+        if not clock_trusted:
+            return
+        horizon = now_utc + timedelta(minutes=5)
+        for rule in rules:
+            change = next_state_change(rule, now_utc, clock_trusted)
+            if change is None or not now_utc < change.at_utc <= horizon:
+                continue
+            key = (rule.id, change.at_utc, change.active_after)
+            if key in self._warning_keys:
+                continue
+            self._warning_keys.add(key)
+            action = "starts" if change.active_after else "ends"
+            seconds = max(1, int((change.at_utc - now_utc).total_seconds()))
+            minutes = max(1, round(seconds / 60))
+            try:
+                notification = self.Gio.Notification.new(
+                    f"Rule {action} in {minutes} minute"
+                    + ("" if minutes == 1 else "s")
+                )
+                notification.set_body(f"{rule.name} {action} soon.")
+                self.application.send_notification(
+                    f"rule-warning-{rule.id}-{change.at_utc.isoformat()}",
+                    notification,
+                )
+            except Exception:
+                continue
+        if len(self._warning_keys) > 1024:
+            self._warning_keys = set(sorted(self._warning_keys)[-256:])
 
     def _send_transition_notifications(
         self, transitions: Sequence[RuleTransition]
@@ -2139,6 +2193,112 @@ class GuiController:
 
         dialog.connect("response", respond)
         dialog.present()
+
+    def _choose_block_list_import(self) -> None:
+        Gtk = self.Gtk
+        chooser = Gtk.FileChooserNative.new(
+            "Import Block List blocklist",
+            self.window,
+            Gtk.FileChooserAction.OPEN,
+            "_Open",
+            "_Cancel",
+        )
+
+        def respond(dialog: object, response: int) -> None:
+            if response != Gtk.ResponseType.ACCEPT:
+                dialog.destroy()
+                return
+            selected = dialog.get_file()
+            path = selected.get_path() if selected is not None else None
+            dialog.destroy()
+            if path is None:
+                self._show_error("Select a Block List export file.")
+                return
+
+            def read_preview() -> BlockListImportPreview:
+                return parse_block_list_export(
+                    read_block_list_text(path),
+                    timezone_name=_view_timezone_name(),
+                    enabled=False,
+                )
+
+            self._run_worker(
+                read_preview,
+                lambda preview: self._confirm_block_list_import(
+                    preview, Path(path).name
+                ),
+                lambda error: self._show_error(str(error)),
+            )
+
+        chooser.connect("response", respond)
+        chooser.show()
+
+    def _confirm_block_list_import(
+        self, preview: BlockListImportPreview, filename: str
+    ) -> None:
+        Gtk = self.Gtk
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"Import Block List blocks from {filename}?",
+            secondary_text=(
+                block_list_preview_text(preview)
+                + "\n\nImported rules are disabled for review."
+            ),
+        )
+        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        import_button = dialog.add_button("_Import", Gtk.ResponseType.ACCEPT)
+        import_button.set_sensitive(bool(preview.rules))
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+
+        def respond(_dialog: object, response: int) -> None:
+            dialog.destroy()
+            if response == Gtk.ResponseType.ACCEPT:
+                self._run_worker(
+                    lambda: self._upload_block_list_rules(preview),
+                    self._block_list_import_done,
+                    lambda error: self._show_error(str(error)),
+                )
+
+        dialog.connect("response", respond)
+        dialog.present()
+    def _upload_block_list_rules(
+        self, preview: BlockListImportPreview
+    ) -> int:
+        if not preview.rules:
+            return 0
+        response = self.client.request("begin_rule_import")
+        import_id = response["import_id"]
+        try:
+            for offset in range(0, len(preview.rules), 200):
+                self.client.request(
+                    "import_rule_chunk",
+                    import_id=import_id,
+                    rules=[
+                        rule.to_dict()
+                        for rule in preview.rules[offset : offset + 200]
+                    ],
+                )
+            self.client.request("commit_rule_import", import_id=import_id)
+        except Exception:
+            try:
+                self.client.request("cancel_rule_import", import_id=import_id)
+            except Exception:
+                pass
+            raise
+        return len(preview.rules)
+
+    def _block_list_import_done(self, count: int) -> None:
+        self.notice_label.set_text(
+            f"Imported {count} disabled Block List rule"
+            + ("" if count == 1 else "s")
+            + ". Review and enable them as needed."
+        )
+        self.notice_label.remove_css_class("error")
+        self.refresh()
+
 
     def _choose_native_import(self) -> None:
         Gtk = self.Gtk
@@ -2606,7 +2766,6 @@ class GuiController:
             show,
             lambda error: self._show_error(self._rpc_error(error)),
         )
-
     def open_denial_statistics(self) -> None:
         DenialStatisticsWindow(
             self.Gtk,
@@ -2614,7 +2773,46 @@ class GuiController:
             self._load_denial_statistics,
             self._clear_denial_statistics,
             self._load_website_usage,
+            self._choose_statistics_export,
         ).present()
+    def _choose_statistics_export(self) -> None:
+        Gtk = self.Gtk
+        chooser = Gtk.FileChooserNative.new(
+            "Export statistics",
+            self.window,
+            Gtk.FileChooserAction.SAVE,
+            "_Export",
+            "_Cancel",
+        )
+        chooser.set_current_name("distraction-blocker-statistics.json")
+
+        def respond(dialog: object, response: int) -> None:
+            if response != Gtk.ResponseType.ACCEPT:
+                dialog.destroy()
+                return
+            selected = dialog.get_file()
+            path = selected.get_path() if selected is not None else None
+            dialog.destroy()
+            if path is None:
+                self._show_error("Select a local export path.")
+                return
+
+            def export() -> str:
+                application = self.client.request("list_denial_stats")
+                website = self.client.request("list_website_stats")
+                content = statistics_export_text(application, website)
+                atomic_write_text(path, content)
+                return path
+
+            self._run_worker(
+                export,
+                lambda _result: self._export_done(Path(path).name),
+                lambda error: self._show_error(str(error)),
+            )
+
+        chooser.connect("response", respond)
+        chooser.show()
+
 
     def _load_denial_statistics(
         self,
@@ -4759,8 +4957,6 @@ class QuickFocusWindow:
 
     def present(self) -> None:
         self.window.present()
-
-
 class DenialStatisticsWindow:
     """Show bounded application-denial statistics from public RPC data."""
 
@@ -4777,6 +4973,7 @@ class DenialStatisticsWindow:
             [Callable[[tuple[WebsiteUsageView, ...] | None, str | None], None]],
             None,
         ] | None = None,
+        export: Callable[[], None] | None = None,
     ):
         self.Gtk = Gtk
         self.load_statistics = load
@@ -4784,6 +4981,7 @@ class DenialStatisticsWindow:
         # Breadcrumb: optional website-usage loader; a small pane is enough
         # for v1 and an absent loader simply hides the pane.
         self.load_usage = load_usage
+        self.export_statistics = export
         self.closed = False
         self.statistics: DenialStatistics | None = None
         self.window = self._build(parent)
@@ -4846,6 +5044,11 @@ class DenialStatisticsWindow:
             "clicked", lambda _button: self._confirm_clear()
         )
         actions.append(self.clear_button)
+        if self.export_statistics is not None:
+            export = Gtk.Button.new_with_mnemonic("_Export")
+            export.set_tooltip_text("Export application and website statistics")
+            export.connect("clicked", lambda _button: self.export_statistics())
+            actions.append(export)
         outer.append(actions)
 
         self.status_label = Gtk.Label(label="Loading denial statistics.")

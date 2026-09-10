@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import pwd
@@ -61,10 +62,11 @@ PREFIX = Path("/usr/lib/distraction-blocker")
 STATE = Path("/var/lib/distraction-blocker")
 RUN = Path("/run/distraction-blocker")
 UNIT = Path("/etc/systemd/system/distraction-blocker.service")
+TRAY_AUTOSTART_DESKTOP = Path("/etc/xdg/autostart/org.distraction_blocker.Tray.desktop")
 DESKTOP = Path("/usr/share/applications/org.distraction_blocker.App.desktop")
+TRAY_DESKTOP = Path("/usr/share/applications/org.distraction_blocker.Tray.desktop")
 LEGACY_DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
 CLI_PATH = Path("/usr/local/bin/distraction-blocker")
-# Breadcrumb: every signed observational file belongs here. A leftover file
 # would keep the state directory alive after uninstall because rmdir only
 # removes an empty directory.
 POLICY_FILES = (
@@ -74,6 +76,7 @@ POLICY_FILES = (
     "statistics.json",
     "website-statistics.json",
     "website-usage.json",
+    "scheduled-actions.json",
 )
 MARKER_NAME = "INSTALLATION"
 MARKER_TEXT = "distraction-blocker\n"
@@ -203,7 +206,63 @@ def network_teardown() -> None:
 def fail(message: str) -> NoReturn:
     print(f"Uninstall refused: {message}", file=sys.stderr)
     raise SystemExit(2)
+def _owner_uid() -> int | None:
+    owner_file = STATE / "owner.uid"
+    if not owner_file.is_file() or owner_file.is_symlink():
+        return None
+    try:
+        return int(owner_file.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return None
 
+def restore_owner_notifications(uid: int | None) -> None:
+    if uid is None:
+        return
+    try:
+        account = pwd.getpwuid(uid)
+    except KeyError:
+        return
+    config_root = Path(account.pw_dir) / ".config"
+    preference_root = config_root / "distraction-blocker"
+    for directory in (config_root, preference_root):
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            fail("refusing to read an unsafe notification preference path")
+    source = preference_root / "notifications.json"
+    if not source.exists():
+        return
+    if source.is_symlink() or not source.is_file():
+        fail("refusing to read an unsafe notification preference path")
+    try:
+        saved = json.loads(source.read_text(encoding="utf-8"))
+        if (
+            set(saved) != {"show_banners", "show_in_lock_screen"}
+            or not isinstance(saved["show_banners"], bool)
+            or not isinstance(saved["show_in_lock_screen"], bool)
+        ):
+            raise ValueError
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        fail("saved notification preferences are invalid")
+    try:
+        for key in ("show-banners", "show-in-lock-screen"):
+            value = "true" if saved[key.replace("-", "_")] else "false"
+            subprocess.run(
+                [
+                    "/usr/sbin/runuser",
+                    "-u",
+                    account.pw_name,
+                    "--",
+                    "/usr/bin/gsettings",
+                    "set",
+                    "org.gnome.desktop.notifications",
+                    key,
+                    value,
+                ],
+                check=True,
+                timeout=30,
+            )
+    except (OSError, subprocess.SubprocessError) as error:
+        fail(f"could not restore notification preferences: {error}")
+    source.unlink()
 
 def run_systemctl(args: list[str]) -> None:
     result = subprocess.run(["/usr/bin/systemctl", *args], check=False)
@@ -285,15 +344,22 @@ def main() -> int:
 
     try:
         require_installation()
+        owner_uid = _owner_uid()
         # Breadcrumb for reviewers: use systemctl as an argument list, never through a shell.
         if not UNIT.is_file() or UNIT.is_symlink():
             fail("the service unit is missing or unsafe")
         run_systemctl(["disable", "--now", "distraction-blocker.service"])
+        restore_owner_notifications(owner_uid)
         clear_hosts()
         network_teardown()
         remove_cli()
-
-        for path in (UNIT, DESKTOP, LEGACY_DESKTOP):
+        for path in (
+            UNIT,
+            DESKTOP,
+            TRAY_DESKTOP,
+            TRAY_AUTOSTART_DESKTOP,
+            LEGACY_DESKTOP,
+        ):
             if path.is_symlink():
                 fail(f"refusing to remove a symlink at {path}")
             if path.is_file():

@@ -12,6 +12,7 @@ import secrets
 import tempfile
 from typing import Any
 
+from .actions import ScheduledActionsState
 from .canonical import CanonicalError, format_utc, parse_utc
 from .control import ControlState
 from .model import POLICY_SCHEMA_VERSION, Policy, ValidationError
@@ -39,6 +40,7 @@ class ProtectedStore:
     STATISTICS_NAME = "statistics.json"
     WEBSITE_STATISTICS_NAME = "website-statistics.json"
     WEBSITE_USAGE_NAME = "website-usage.json"
+    ACTIONS_NAME = "scheduled-actions.json"
     MAX_POLICY_BYTES = 16 * 1024 * 1024
     MAX_STATISTICS_BYTES = 1024 * 1024
 
@@ -75,6 +77,9 @@ class ProtectedStore:
             raise StorageError("storage path is not a directory")
         os.chmod(self.directory, 0o700)
         self._key = self._load_or_create_key()
+    @property
+    def actions_path(self) -> Path:
+        return self.directory / self.ACTIONS_NAME
 
     def _load_or_create_key(self) -> bytes:
         path = self.directory / self.KEY_NAME
@@ -165,20 +170,31 @@ class ProtectedStore:
         self._atomic_write(self.primary_path, content)
 
     def _statistics_envelope(self, state) -> bytes:
-        if not isinstance(state, (StatisticsState, WebsiteDenialState, WebsiteUsageState)):
-            raise StorageError("statistics state has an invalid type")
+        if not isinstance(
+            state,
+            (
+                StatisticsState,
+                WebsiteDenialState,
+                WebsiteUsageState,
+                ScheduledActionsState,
+            ),
+        ):
+            raise StorageError("signed state has an invalid type")
         unsigned = {"version": 1, "payload": state.to_dict()}
         signature = hmac.new(self._require_key(), self._canonical(unsigned), hashlib.sha256).hexdigest()
         return self._canonical({**unsigned, "hmac": signature})
 
-    def _save_signed_state(self, path: Path, state: StatisticsState | WebsiteDenialState | WebsiteUsageState, name: str) -> None:
-        """Atomically save one signed statistics state; ``name`` labels errors."""
+    def _save_signed_state(
+        self,
+        path: Path,
+        state: StatisticsState | WebsiteDenialState | WebsiteUsageState | ScheduledActionsState,
+        name: str,
+    ) -> None:
+        """Atomically save one signed state; ``name`` labels errors."""
         self.initialize()
         content = self._statistics_envelope(state)
         if len(content) > self.MAX_STATISTICS_BYTES:
             raise StorageError(f"{name} file is too large")
-        # Breadcrumb: statistics files have no backup. Observational data
-        # must never rewrite policy backups.
         self._atomic_write(path, content)
 
     def _load_signed_state(self, path: Path, empty, from_payload, name: str):
@@ -215,7 +231,9 @@ class ProtectedStore:
 
     def save_website_statistics(self, state: WebsiteDenialState) -> None:
         """Atomically save website denials into their own signed file."""
-        self._save_signed_state(self.website_statistics_path, state, "website statistics")
+        self._save_signed_state(
+            self.website_statistics_path, state, "website statistics"
+        )
 
     def load_website_statistics(self) -> WebsiteDenialState:
         """Load signed website statistics, or an empty state when absent."""
@@ -237,6 +255,21 @@ class ProtectedStore:
             WebsiteUsageState.empty,
             WebsiteUsageState.from_dict,
             "website usage",
+        )
+
+    def save_scheduled_actions(self, state: ScheduledActionsState) -> None:
+        """Atomically save independently scheduled workstation actions."""
+        self._save_signed_state(
+            self.actions_path, state, "scheduled actions"
+        )
+
+    def load_scheduled_actions(self) -> ScheduledActionsState:
+        """Load signed scheduled actions, or return an empty state."""
+        return self._load_signed_state(
+            self.actions_path,
+            ScheduledActionsState.empty,
+            ScheduledActionsState.from_dict,
+            "scheduled actions",
         )
 
 

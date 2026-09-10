@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -412,6 +413,37 @@ class UninstallManifestTests(unittest.TestCase):
             for subdir, name in install.LEGACY_OWNER_NATIVE_MANIFESTS:
                 self.assertFalse((home / subdir / name).exists())
             self.assertTrue(bystander.exists())
+    def test_uninstall_restores_saved_notification_state_before_removal(self):
+        from scripts import uninstall
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            source = home / ".config/distraction-blocker/notifications.json"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                json.dumps({"show_banners": True, "show_in_lock_screen": False}),
+                encoding="utf-8",
+            )
+            account = type(
+                "Account",
+                (),
+                {"pw_dir": str(home), "pw_name": "owner"},
+            )()
+            calls = []
+            with (
+                patch.object(uninstall.pwd, "getpwuid", return_value=account),
+                patch.object(
+                    uninstall.subprocess,
+                    "run",
+                    side_effect=lambda command, **_kwargs: calls.append(command),
+                ),
+            ):
+                uninstall.restore_owner_notifications(1000)
+            self.assertFalse(source.exists())
+            self.assertEqual(calls[0][-2:], ["show-banners", "true"])
+            self.assertEqual(calls[1][-2:], ["show-in-lock-screen", "false"])
+
 
     def test_uninstall_reloads_systemd_after_unit_removal(self):
         from scripts import uninstall

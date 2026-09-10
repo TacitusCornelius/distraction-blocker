@@ -70,20 +70,15 @@ The GUI can search rule names and targets. It can filter rules by all, active, i
 
 ## Local Block List export
 
-The file at `/home/tacitus/Documents/blocklists/qwit-starter-blocklist.txt` contains Block List JSON data. It is not a plain domain list.
+The Block List importer accepts the JSON block mapping used by `.blocklist.json`
+exports. It strictly parses the JSON and never repairs truncated or malformed
+files.
 
-The inspected file lacks its final outer `}` character. A strict parser must refuse it. The application must not repair malformed input without an explicit user action.
-
-A temporary in-memory inspection found:
-
-- 13 blocks.
-- 153 website entries.
-- 118 exact hostname candidates.
-- 35 wildcard or URL-path entries.
-- 10 Windows executable or window-title entries.
-- 1 scheduled block.
-
-A future Block List importer can accept exact hostnames. It must report every unsupported entry.
+The importer creates disabled Distraction Blocker rules from exact hostnames
+and representable weekly schedules. The import time zone is explicit because
+Block List exports do not carry an IANA time-zone name. Every wildcard,
+URL-path, exception, application, unsupported lock/break setting, and
+unrepresentable schedule period is reported in the preview.
 
 The current service cannot reproduce these Block List features:
 
@@ -94,6 +89,10 @@ The current service cannot reproduce these Block List features:
 - Windows application identifiers.
 - Window-title rules.
 - Allowances, breaks, and delay locks.
+
+The importer intentionally leaves those entries out rather than weakening the
+Distraction Blocker policy model.
+
 
 ## Version 1.2
 
@@ -262,18 +261,20 @@ SafeSearch therefore remains explicitly limited to the owned local resolver
 path. The existing known-DoH, common-proxy, and common-VPN controls are
 best-effort bypass reduction, not a solution for arbitrary encrypted paths.
 
-## Other Block List features
+## Current feature cycle
 
-These features remain possible but have lower priority:
+The following lower-priority Block List features are now implemented:
 
-- Lock, log out, or shut down the workstation on a schedule.
-- Block notifications and advanced warning notifications.
-- System tray controls.
-- Statistics export.
+- Lock, log out, or shut down the workstation on a separately persisted schedule.
+- GNOME notification suppression with restoration of the prior state.
+- Advanced five-minute rule-boundary warning notifications while the GUI runs.
+- Deterministic application and website statistics export.
+- Optional system tray controls through Ayatana AppIndicator.
 
-Scheduled shutdown can cause data loss. It must remain separate from normal blocking rules.
-
-GTK 4 does not provide a cross-desktop system tray API. A tray feature can require an additional Ubuntu package.
+The tray launcher requires Ubuntu's
+`gir1.2-ayatanaappindicator3-0.1` package because GTK 4 does not provide a
+cross-desktop system tray API. Scheduled shutdown remains separate from normal
+blocking rules because it can cause data loss.
 
 ## Sources
 
