@@ -17,6 +17,19 @@
       { "id": "off", "enabled": false,
         "targets": [{ "kind": "url_path", "value": "example.com/off" }] }
     ],
+    "network": [
+      { "id": "net-only", "enabled": true,
+        "targets": [
+          { "kind": "network", "value": "whole_internet" },
+          { "kind": "network", "value": "alternate_dns" },
+          { "kind": "network", "value": "safe_search" }
+        ] },
+      { "id": "net-mixed", "enabled": true,
+        "targets": [
+          { "kind": "network", "value": "safe_search" },
+          { "kind": "url_path", "value": "example.com/net" }
+        ] }
+    ],
     "empty": []
   },
   "cases": [
@@ -57,6 +70,12 @@
     { "policy": "mixed", "url": "https://www.youtube-nocookie.com/@ExampleHandle",
       "expect": { "rule_id": "yt-channel" } },
     { "policy": "mixed", "url": "https://m.youtube.com/@otherhandle",
+      "expect": null },
+    { "policy": "network", "url": "https://example.com/anything",
+      "expect": null },
+    { "policy": "network", "url": "https://example.com/net",
+      "expect": { "rule_id": "net-mixed" } },
+    { "policy": "network", "url": "https://example.com/net/extra",
       "expect": null }
   ]
 }

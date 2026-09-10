@@ -166,10 +166,12 @@ class ModelTests(unittest.TestCase):
         base = {"revision": 1, "rules": [], "managed_lists": []}
         with self.assertRaises(ValidationError):
             Policy.from_dict(base)
-        with self.assertRaises(ValidationError):
-            Policy.from_dict({"schema_version": 2, **base})
-        with self.assertRaises(ValidationError):
-            Policy(1, (), (), 2)
+        for version in (POLICY_SCHEMA_VERSION - 1, POLICY_SCHEMA_VERSION + 1):
+            with self.subTest(version=version):
+                with self.assertRaises(ValidationError):
+                    Policy.from_dict({"schema_version": version, **base})
+                with self.assertRaises(ValidationError):
+                    Policy(1, (), (), version)
 
 
 
@@ -230,6 +232,31 @@ class UrlTargetTests(unittest.TestCase):
             "managed_lists": [],
         })
         self.assertEqual(Policy.from_dict(policy.to_dict()), policy)
+    def test_policy_round_trips_url_exceptions_and_rejects_network(self):
+        rule = {
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "URL",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "exceptions": [
+                {"kind": "url_path", "value": "example.com/allowed"},
+                {"kind": "youtube_video", "value": "dQw4w9WgXcQ"},
+            ],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        }
+        policy = Policy.from_dict({
+            "schema_version": POLICY_SCHEMA_VERSION,
+            "revision": 1,
+            "rules": [rule],
+            "managed_lists": [],
+        })
+        self.assertEqual(Policy.from_dict(policy.to_dict()), policy)
+        with self.assertRaises(ValidationError):
+            Rule.from_dict({
+                **rule,
+                "exceptions": [{"kind": "network", "value": "vpn"}],
+            })
 
 
 class YoutubeTargetTests(unittest.TestCase):
@@ -256,6 +283,70 @@ class YoutubeTargetTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValidationError):
                     Target.from_dict({"kind": kind, "value": value})
+
+
+
+
+class NetworkTargetTests(unittest.TestCase):
+    # Breadcrumb: a network target carries a fixed control name from the
+    # closed NETWORK_CONTROLS set, never raw firewall input.
+
+    def test_network_control_values_round_trip(self):
+        for value in ("whole_internet", "alternate_dns", "safe_search", "doh", "proxy", "vpn"):
+            with self.subTest(value=value):
+                target = Target.from_dict({"kind": "network", "value": value})
+                self.assertEqual(target.to_dict(), {"kind": "network", "value": value})
+                self.assertEqual(Target.from_dict(target.to_dict()), target)
+
+    def test_network_target_rejects_unknown_and_raw_values(self):
+        bad = (
+            "whole-internet",
+            "dns",
+            "safe_search extra",
+            "ip6tables -A OUTPUT",
+            "1.2.3.4",
+            "",
+        )
+        for value in bad:
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    Target.from_dict({"kind": "network", "value": value})
+        # Breadcrumb: a non-string cannot masquerade as a control name.
+        with self.assertRaises(ValidationError):
+            Target.from_dict({"kind": "network", "value": 53})
+
+    def test_network_targets_round_trip_through_policy(self):
+        policy = Policy.from_dict({
+            "schema_version": POLICY_SCHEMA_VERSION,
+            "revision": 1,
+            "rules": [{
+                "id": "12345678-1234-5678-9234-567812345678",
+                "name": "Network",
+                "enabled": True,
+                "targets": [
+                    {"kind": "network", "value": "safe_search"},
+                    {"kind": "network", "value": "alternate_dns"},
+                    {"kind": "website", "value": "example.test"},
+                ],
+                "schedule": {"kind": "indefinite"},
+                "revision": 0,
+            }],
+            "managed_lists": [],
+        })
+        self.assertEqual(Policy.from_dict(policy.to_dict()), policy)
+
+    def test_network_targets_refuse_allowance(self):
+        # Breadcrumb: network controls have no URL-level start events the
+        # extension can count, so a budget cannot apply to them.
+        with self.assertRaisesRegex(
+            ValidationError, "URL-level targets"
+        ):
+            Rule.from_dict(
+                allowance_rule_dict(
+                    targets=[{"kind": "network", "value": "safe_search"}],
+                    allowance_starts=5,
+                )
+            )
 
 
 

@@ -12,6 +12,7 @@ from distraction_blocker.control import ControlState
 from distraction_blocker.model import POLICY_SCHEMA_VERSION, ManagedList, Policy, Rule
 from distraction_blocker.rpc import Client, RpcServer, response_fits
 from distraction_blocker.service import BlockerService
+from distraction_blocker.storage import StorageError
 from distraction_blocker.transfer import native_export_text
 from distraction_blocker.statistics import (
     DenialBuffer,
@@ -81,18 +82,6 @@ class FakeStore:
         self.website_usage = state
         return None
 
-    def initialize(self):
-        return None
-
-    def load_statistics(self):
-        return self.statistics
-
-    def save_statistics(self, state):
-        if self.fail_statistics:
-            raise OSError("statistics storage unavailable")
-        self.statistics = state
-        self.statistics_saves.append(state)
-        return None
 
     def load(self):
         return type(
@@ -141,7 +130,134 @@ class FakeApplications:
         self.rule_ids_provider = provider
 
 
+class FakeNetwork:
+    available = True
+    healthy = True
+
+    def __init__(self):
+        self.controls = frozenset()
+        self.fail = False
+
+    def reconcile(self, controls):
+        if self.fail:
+            self.healthy = False
+            raise OSError("network apply failed")
+        self.controls = frozenset(controls)
+
+
 class ServiceTests(unittest.TestCase):
+    def test_network_strengthening_precedes_save_and_failed_weakening_keeps_policy(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Network", "enabled": True,
+            "targets": [{"kind": "network", "value": "alternate_dns"}],
+            "schedule": {"kind": "indefinite"}, "revision": 0,
+        })
+        store, network = FakeStore(Policy(0, (rule,))), FakeNetwork()
+        service = BlockerService(store, FakeClock(), FakeHosts(), FakeApplications(), network=network)
+        service.start()
+        replacement = {**rule.to_dict(), "targets": [
+            *rule.to_dict()["targets"], {"kind": "network", "value": "safe_search"}
+        ]}
+
+        def failed_save(*_args):
+            self.assertEqual(network.controls, {"alternate_dns", "safe_search"})
+            raise OSError("policy disk failure")
+
+        with patch.object(store, "save", side_effect=failed_save):
+            with self.assertRaises(OSError):
+                service.dispatch(1000, {"command": "put_rule", "rule": replacement})
+        self.assertEqual(store.policy.rules, (rule,))
+        self.assertEqual(service.policy.rules, (rule,))
+        service.tick()
+        self.assertEqual(network.controls, {"alternate_dns"})
+        store.fail_policy = True
+        with self.assertRaises(OSError):
+            service.dispatch(1000, {"command": "set_enabled", "rule_id": rule.id, "enabled": False})
+        self.assertTrue(store.policy.rules[0].enabled)
+        self.assertEqual(network.controls, {"alternate_dns"})
+        store.fail_policy = False
+        network.fail = True
+        with self.assertRaises(StorageError):
+            service.dispatch(1000, {"command": "put_rule", "rule": replacement})
+        self.assertEqual(store.policy.rules, (rule,))
+        self.assertFalse(service.dispatch(1000, {"command": "status"})["result"]["healthy"])
+
+    def test_network_opt_in_is_required_even_for_inactive_rules(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Unavailable", "enabled": False,
+            "targets": [{"kind": "network", "value": "whole_internet"}],
+            "schedule": {"kind": "indefinite"}, "revision": 0,
+        })
+        store = FakeStore(Policy(0, ()))
+        service = BlockerService(store, FakeClock(), FakeHosts(), FakeApplications())
+        service.start()
+        response = service.dispatch(1000, {"command": "put_rule", "rule": rule.to_dict()})
+        self.assertEqual(response["error"]["code"], "network_unavailable")
+        self.assertEqual(store.policy.rules, ())
+        inactive_persisted = Rule.from_dict({
+            **rule.to_dict(),
+            "enabled": True,
+            "schedule": {
+                "kind": "one_time",
+                "start_utc": "2026-01-02T00:00:00Z",
+                "end_utc": "2026-01-03T00:00:00Z",
+            },
+        })
+        deferred = BlockerService(
+            FakeStore(Policy(0, (inactive_persisted,))),
+            FakeClock(),
+            FakeHosts(),
+            FakeApplications(),
+        )
+        with self.assertRaises(StorageError):
+            deferred.start()
+        active = Rule.from_dict({**rule.to_dict(), "enabled": True})
+        broken = BlockerService(FakeStore(Policy(0, (active,))), FakeClock(), FakeHosts(), FakeApplications())
+        with self.assertRaises(StorageError):
+            broken.start()
+        self.assertFalse(broken.applications.started)
+    def test_adding_url_exception_is_a_policy_weakening(self):
+        old = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Website",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        new = Rule.from_dict({
+            **old.to_dict(),
+            "exceptions": [
+                {"kind": "url_path", "value": "example.com/allowed"},
+            ],
+        })
+        self.assertTrue(BlockerService._weakened_change(old, new))
+        self.assertFalse(BlockerService._weakened_change(new, old))
+
+
+    def test_network_rule_lock_rejects_disable_and_native_removal(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Locked network", "enabled": True,
+            "targets": [{"kind": "network", "value": "whole_internet"}],
+            "schedule": {"kind": "indefinite"}, "revision": 0,
+        })
+        store = FakeStore(Policy(0, (rule,)))
+        service = BlockerService(store, FakeClock(), FakeHosts(), FakeApplications(), network=FakeNetwork())
+        service.start()
+        locked = service.dispatch(1000, {
+            "command": "set_rule_lock", "rule_id": rule.id,
+            "lock": {"kind": "timed", "until_utc": "2026-01-02T00:00:00Z"},
+        })
+        self.assertTrue(locked["ok"], locked)
+        disabled = service.dispatch(1000, {"command": "set_enabled", "rule_id": rule.id, "enabled": False})
+        self.assertFalse(disabled["ok"])
+        removed = service.dispatch(1000, {"command": "replace_rules", "rules": []})
+        self.assertFalse(removed["ok"])
+        self.assertEqual(store.policy.rules, (rule,))
+
     def test_start_order_and_strict_fields(self):
         raw = {"schema_version": POLICY_SCHEMA_VERSION, "revision": 0, "rules": [], "managed_lists": []}
         service = BlockerService(FakeStore(Policy.from_dict(raw)), FakeClock(), FakeHosts(), FakeApplications())
@@ -766,7 +882,7 @@ class ServiceTests(unittest.TestCase):
         service.start()
         self.assertEqual(service.hosts.values, set(managed.domains))
         status = service.dispatch(1000, {"command": "status"})
-        self.assertEqual(status["result"]["active_counts"], {"website": 2, "application": 0})
+        self.assertEqual(status["result"]["active_counts"], {"website": 2, "application": 0, "network": 0})
         self.assertNotIn("active_targets", status["result"])
         listed = service.dispatch(1000, {"command": "list_managed_lists"})
         self.assertNotIn("domains", listed["result"][0])

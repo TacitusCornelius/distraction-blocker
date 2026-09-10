@@ -34,6 +34,77 @@ Version 1.3 adds these functions:
 
 Locks and statistics stay outside portable policy exports. The root service remains the policy authority.
 
+### Protected-user network controls
+
+The optional network controls apply only to outbound sockets owned by the
+configured protected desktop UID. They are not machine-wide and do not control
+root, system daemons, containers, or virtual machines.
+
+The supported controls are:
+
+- **Whole internet:** drops the protected UID's non-loopback IPv4 and IPv6
+  output.
+- **Alternate DNS:** denies non-local DNS and DNS-over-TLS ports 53 and 853.
+- **SafeSearch:** redirects the protected UID's local DNS port 53 traffic to an
+  owned resolver and applies documented Google, Bing, and YouTube mappings.
+- **Known DoH endpoints:** denies protected-UID TCP and UDP port 443 traffic
+  to the installed static catalog of documented Cloudflare, Google, and Quad9
+  public resolver addresses.
+- **Common proxy endpoints:** denies protected-UID TCP and UDP traffic to the
+  common proxy listener ports 1080, 3128, 8000, 8080, 8118, 8888, 9050, and
+  9150.
+- **Common VPN endpoints:** denies protected-UID TCP and UDP traffic to common
+  VPN transport ports 500, 1194, 1701, 1723, 4500, and 51820, plus GRE and
+  ESP packets.
+
+The proxy and VPN controls are transport catalogs, not proxy or VPN
+identification. They do not inspect payloads, detect arbitrary ports, or
+prevent a local proxy/VPN process from tunnelling under another identity.
+Common listener ports and VPN transports can be shared with unrelated
+services, so enabling them may cause collateral blocking.
+
+SafeSearch is a resolver-path control. It can enforce the documented mappings
+when the protected user's DNS reaches the owned local resolver, but it cannot
+distinguish DNS carried inside arbitrary HTTPS, a proxy, or a VPN tunnel from
+ordinary traffic at the nftables layer. No exhaustive SafeSearch guarantee is
+made for those paths.
+
+Known DoH enforcement is address-based. It does not inspect hostnames, SNI,
+HTTP paths, or encrypted payloads. Because resolver addresses can be shared
+with ordinary HTTPS, enabling it can block unrelated traffic to those
+addresses. The catalog is release-fresh only; provider address changes are
+covered after a catalog update and package release.
+
+SafeSearch does not modify `/etc/resolv.conf` or the global
+`systemd-resolved` configuration. Arbitrary DoH endpoints, DoH on other ports,
+arbitrary proxies, VPN tunnels, cached answers, and traffic owned by other
+UIDs remain outside this scope. These controls are best-effort network policy,
+not a guarantee against an administrator or a process using another identity.
+
+Network controls require both explicit installer flags:
+
+```bash
+sudo python3 scripts/install.py --confirm --owner-uid 1000 \
+  --enable-network-controls --accept-network-risk
+```
+
+The installer never installs packages automatically. It requires working
+`nftables`, `dnsmasq` 2.86 or newer, and `systemd-resolved`. Installation
+creates an early-boot protected-user fence and keeps unrelated nftables tables
+and resolver files untouched.
+
+If the service cannot start, recover the owned network state from the VM or
+host console:
+
+```bash
+sudo python3 scripts/recover_network.py --confirm
+```
+
+Recovery removes only the owned nftables table and SafeSearch resolver,
+disables the boot fence, and removes the network opt-in marker after cleanup
+succeeds. The signed policy is preserved.
+
+
 
 ## Version 1.2
 
@@ -234,9 +305,12 @@ A friction lock shows random text. Select **Authorize**, then type that text exa
 
 A password lock stores only a root-owned scrypt hash. Select **Authorize**, then enter the hidden password.
 
-Friction and password authorization permit one weakening change for 60 seconds. The grant is memory-only and single-use.
+Version 4 backups include the protected-user DoH target in addition to the
+network target rules, managed-list metadata, and managed-list domains. Native
+backup files have an 8 MiB limit.
 
-Failed password attempts add a persisted delay. The delay increases to a maximum of 64 seconds.
+Native backups exclude locks, password hashes, attempt state, denial
+statistics, the HMAC key, policy signature, clock state, and socket data.
 
 Root remains outside the lock boundary and can recover protected state.
 
@@ -256,39 +330,48 @@ The service stores at most 256 paths. A bounded queue reports events that it mus
 
 Select **Clear statistics** only when you no longer need this observational data.
 
-### Daily overview and notifications
-
-Select **Daily overview** to see today's enabled intervals in the system time zone.
-
-While the GUI runs, it checks the service every 15 seconds. It sends a desktop notification when it observes a rule start or end.
-
-Notification failure does not change enforcement.
-
-### Export domains
-
-Select **Export domains** to export all rule domains. Select **Export** on one rule to export only that rule.
-
-The output uses UTF-8. It contains one normalized domain on each line in alphabetical order.
-
-### Native backup
-
-Select **Export backup** to write the complete policy to a versioned JSON file.
-
-Select **Import backup** to replace inactive policy state from that file. The service validates the complete file before one signed update.
-
-The service refuses a native import that removes or weakens an active rule or active managed list.
-
-Version 2 backups include rules, managed-list metadata, and managed-list domains. Native backup files have an 8 MiB limit.
-
-Native backups exclude locks, password hashes, attempt state, denial statistics, the HMAC key, policy signature, clock state, and socket data.
-
 ### Duplicate, search, and filter
 
-Select **Duplicate** to create a disabled copy of a rule. The copy gets a new identity and the name suffix `copy`.
+Select **Duplicate** to create a disabled copy of a rule. The copy gets a
+new identity and the name suffix `copy`.
 
 Use the search box to find text in rule names and targets.
 
-Use the state selector to show all, active, inactive, enabled, or disabled rules.
+Use the state selector to show all, active, inactive, enabled, or disabled
+rules.
+
+## Ubuntu virtual-machine acceptance
+
+WARNING: Run these procedures only in a disposable Ubuntu virtual machine.
+The scripts install a root service and change firewall, resolver, hosts, and
+policy state inside that VM.
+
+Create the test marker. Replace `1000` with the UID of the test desktop user.
+
+```bash
+printf '{"purpose":"distraction-blocker-acceptance","owner_uid":1000}\n' | sudo install -o root -g root -m 0600 /dev/stdin /etc/distraction-blocker-test-vm
+```
+
+Run the existing policy/browser acceptance:
+
+```bash
+sudo python3 scripts/ubuntu_acceptance.py
+```
+
+For the opt-in protected-user firewall and SafeSearch acceptance, use:
+
+```bash
+sudo python3 scripts/network_acceptance.py
+```
+
+The network procedure requires `nftables`, `dnsmasq-base` (version 2.86 or
+newer), and active `systemd-resolved`; it refuses to install packages. It
+checks IPv4/IPv6 output, existing-flow denial, UID scope, DNS and
+SafeSearch transitions, resolver metadata records, drift repair, reboot fence
+behavior, offline recovery, uninstall, and preservation of foreign firewall
+state.
+
+
 
 
 ## Clock recovery
@@ -303,25 +386,6 @@ sudo python3 scripts/recover_clock.py --confirm
 
 The service refuses recovery when wall time does not match its boot-time clock.
 
-## Ubuntu virtual-machine acceptance
-
-WARNING: Run this procedure only in a disposable Ubuntu virtual machine. The script installs a root service, changes time, changes `/etc/hosts`, and restarts the machine.
-
-Create the test marker. Replace `1000` with the UID of the test desktop user.
-
-```bash
-printf '{"purpose":"distraction-blocker-acceptance","owner_uid":1000}\n' | sudo install -o root -g root -m 0600 /dev/stdin /etc/distraction-blocker-test-vm
-```
-
-Run the acceptance script as root:
-
-```bash
-sudo python3 scripts/ubuntu_acceptance.py
-```
-
-The first phase checks direct and managed website blocks, multiple weekly periods, executable blocking, GUI exit, time tampering, policy tampering, and service restart.
-
-The virtual machine then restarts. Run the same command again to check boot persistence and remove the test installation.
 
 ## Remove
 

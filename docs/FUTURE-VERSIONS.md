@@ -202,22 +202,65 @@ The next feature cycle is built:
 
 - Chromium inactive-tab blocking uses a session DNR rule with inactive tab
   IDs. Tab events replace the rule.
-- Policy projections include `schema_version: 1` and `revision`. Firefox,
+- Policy projections include `schema_version: 4` and `revision`. Firefox,
   Chromium, the GUI, and the CLI reject an unsupported projection.
 
 The root service must remain the final policy authority.
 
 ## Privileged network version
 
-These features need a separate security review and explicit installation approval:
+The protected-user firewall and SafeSearch subset is implemented behind
+separate installation approval:
 
-- Whole-internet blocking.
-- Alternate DNS resolver blocking.
-- DNS-over-HTTPS blocking.
-- Proxy and VPN endpoint blocking.
-- Safe-search enforcement.
+- Whole-internet protected-user output blocking.
+- Alternate DNS and DNS-over-TLS port restrictions.
+- Protected-user SafeSearch DNS mappings for Google, Bing, and YouTube.
 
-These controls can break unrelated network access. They require privileged DNS or firewall changes.
+The first narrow encrypted-DNS control is implemented behind the same
+approval:
+
+- Known DoH endpoint blocking for a versioned static catalog of documented
+  Cloudflare, Google, and Quad9 resolver addresses.
+
+The DoH catalog blocks protected-user TCP and UDP port 443 traffic by exact
+destination address. It does not inspect hostnames, SNI, HTTP paths, or
+payloads. A provider address rotation can remain uncovered until a package
+catalog update, and shared resolver addresses can block unrelated HTTPS.
+Arbitrary DoH, alternate ports, unrecognized proxy/VPN transports, and root or
+other-UID traffic remain outside the claim.
+
+The implementation uses one owned nftables table, a dedicated dnsmasq
+instance, an early-boot fence, drift repair, and offline recovery. It does
+not modify the global resolver configuration or unrelated firewall state.
+
+The proxy and VPN endpoint controls are implemented behind the same explicit
+installation approval:
+
+- Common proxy listener port blocking for protected-user TCP and UDP output.
+- Common VPN transport port blocking for protected-user TCP and UDP output.
+- GRE and ESP packet blocking for protected-user output.
+
+These are versioned transport catalogs, not proxy or VPN identification. They
+do not inspect payloads, discover arbitrary ports, or cover local proxy/VPN
+processes, tunnels using ordinary web traffic, root, or other UIDs. Common
+ports and protocols can be shared with unrelated services and may cause
+collateral blocking.
+
+The SafeSearch-over-arbitrary-encrypted-paths review is complete. No network
+implementation is approved under the current architecture:
+
+- Encrypted DNS over arbitrary HTTPS is indistinguishable from ordinary
+  HTTPS using the available UID, address, port, and protocol metadata.
+- A VPN or tunnel hides the inner DNS query and search destination from the
+  host output filter.
+- Blocking all remote HTTPS or all tunnel-capable traffic would either make
+  SafeSearch unusable or cause unacceptable collateral blocking.
+- Browser-level URL rewriting would cover only supported browsers and remains
+  disableable; it cannot establish a protected-user network guarantee.
+
+SafeSearch therefore remains explicitly limited to the owned local resolver
+path. The existing known-DoH, common-proxy, and common-VPN controls are
+best-effort bypass reduction, not a solution for arbitrary encrypted paths.
 
 ## Other Block List features
 

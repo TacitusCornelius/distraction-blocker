@@ -74,6 +74,7 @@ def make_rule(
     name: str = "Focus",
     enabled: bool = True,
     targets: list[dict[str, str]] | None = None,
+    exceptions: list[dict[str, str]] | None = None,
     schedule: dict[str, object] | None = None,
     revision: int = 0,
     allowance_starts: int | None = None,
@@ -91,6 +92,8 @@ def make_rule(
         "schedule": schedule or {"kind": "indefinite"},
         "revision": revision,
     }
+    if exceptions is not None:
+        data["exceptions"] = exceptions
     if allowance_starts is not None:
         data["allowance_starts"] = allowance_starts
     return Rule.from_dict(data)
@@ -364,6 +367,93 @@ class FormConversionTests(unittest.TestCase):
         self.assertEqual(rebuilt["rule"], rule.to_dict())
         self.assertIn("3 URL rules", _target_summary(rule))
 
+    def test_rule_round_trip_keeps_url_exceptions(self) -> None:
+        rule = make_rule(
+            targets=[{"kind": "website", "value": "example.com"}],
+            exceptions=[
+                {"kind": "url_path", "value": "example.com/allowed"},
+                {"kind": "youtube_channel", "value": "@Example.Handle"},
+            ],
+        )
+
+        form = rule_to_form(rule, "UTC")
+        rebuilt = form_to_request(form, id_factory=lambda: UUID(RULE_ID))
+
+        self.assertEqual(
+            form.url_exceptions,
+            (
+                {"kind": "url_path", "value": "example.com/allowed"},
+                {"kind": "youtube_channel", "value": "@Example.Handle"},
+            ),
+        )
+        self.assertEqual(rebuilt["rule"], rule.to_dict())
+
+    def test_network_controls_round_trip_through_form(self) -> None:
+        rule = make_rule(
+            targets=[
+                {"kind": "website", "value": "example.com"},
+                {"kind": "network", "value": "whole_internet"},
+                {"kind": "network", "value": "safe_search"},
+                {"kind": "network", "value": "proxy"},
+                {"kind": "network", "value": "vpn"},
+            ],
+        )
+
+        form = rule_to_form(rule, "UTC")
+        rebuilt = form_to_request(form, id_factory=lambda: UUID(RULE_ID))
+
+        self.assertEqual(
+            form.network_controls, ("whole_internet", "safe_search", "proxy", "vpn")
+        )
+        self.assertEqual(rebuilt["rule"], rule.to_dict())
+        self.assertIn("4 network controls", _target_summary(rule))
+
+    def test_network_control_can_be_the_only_target(self) -> None:
+        form = RuleForm(
+            name="Lock down",
+            websites=(),
+            applications=(),
+            managed_list_ids=(),
+            schedule_kind="indefinite",
+            timezone="UTC",
+            network_controls=("whole_internet",),
+        )
+
+        rule = form_to_request(form, id_factory=lambda: UUID(RULE_ID))["rule"]
+
+        self.assertEqual(
+            rule["targets"], [{"kind": "network", "value": "whole_internet"}]
+        )
+
+    def test_form_rejects_unknown_network_control(self) -> None:
+        form = RuleForm(
+            name="Bad",
+            websites=(),
+            applications=(),
+            managed_list_ids=(),
+            schedule_kind="indefinite",
+            timezone="UTC",
+            network_controls=("deep_packet_inspection",),
+        )
+
+        with self.assertRaisesRegex(FormError, "network control"):
+            form_to_request(form, id_factory=lambda: UUID(RULE_ID))
+
+    def test_allowance_is_rejected_for_network_targets(self) -> None:
+        form = RuleForm(
+            name="No budget",
+            websites=(),
+            applications=(),
+            managed_list_ids=(),
+            schedule_kind="indefinite",
+            timezone="UTC",
+            network_controls=("safe_search",),
+            allowance_starts=2,
+        )
+
+        with self.assertRaisesRegex(FormError, "URL-level targets"):
+            form_to_request(form, id_factory=lambda: UUID(RULE_ID))
+
 
 class StoredRuleEditorTests(unittest.TestCase):
     def test_weekly_and_indefinite_rules_do_not_load_blank_picker_values(self):
@@ -403,6 +493,7 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor.url_targets = []
         editor._render_url_targets = lambda: None
         editor.managed_list_checks = {}
+        editor.network_checks = {}
         editor.schedule_dropdown = Dropdown()
         editor.schedule_stack = Stack()
         editor.allowance_spin = ValueField()
@@ -462,6 +553,7 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor._render_url_targets = lambda: None
 
         editor.managed_list_checks = {}
+        editor.network_checks = {}
         editor.schedule_dropdown = Dropdown()
         editor.schedule_stack = Stack()
         editor.allowance_spin = ValueField()
@@ -519,6 +611,10 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor.error_label = Label()
         editor.url_kind_dropdown = Dropdown(0)
         editor.url_targets = []
+        editor.url_exceptions = []
+        editor.url_exception_check = type(
+            "Check", (), {"get_active": lambda self: False}
+        )()
         editor._render_url_targets = lambda: None
 
         editor.url_entry.set_text("example.com/feed")
@@ -1046,7 +1142,7 @@ class ServiceResultTests(unittest.TestCase):
                 "healthy": True,
                 "clock_trusted": True,
                 "clock_reason": "",
-                "active_counts": {"website": 0, "application": 0},
+                "active_counts": {"website": 0, "application": 0, "network": 0},
             },
             policy_result((make_rule().to_dict(),)),
             (),
@@ -1071,7 +1167,7 @@ class ServiceResultTests(unittest.TestCase):
                 "healthy": True,
                 "clock_trusted": True,
                 "clock_reason": "",
-                "active_counts": {"website": 203, "application": 2},
+                "active_counts": {"website": 203, "application": 2, "network": 3},
             },
             policy_result((rule.to_dict(),), revision=3),
             (),
@@ -1080,25 +1176,38 @@ class ServiceResultTests(unittest.TestCase):
 
         self.assertEqual(snapshot.active_websites, 203)
         self.assertEqual(snapshot.active_applications, 2)
+        self.assertEqual(snapshot.active_network, 3)
         with self.assertRaisesRegex(FormError, "active counts"):
             snapshot_from_results(
                 {
                     "healthy": True,
                     "clock_trusted": True,
                     "clock_reason": "",
-                    "active_counts": {"website": [], "application": 0},
+                    "active_counts": {"website": [], "application": 0, "network": 0},
                 },
                 policy_result(),
                 (),
                 (),
             )
 
-    def test_snapshot_rejects_unknown_policy_schema(self) -> None:
+    def test_snapshot_requires_network_active_count(self) -> None:
+        # Breadcrumb (network seam): a status without the network count is
+        # an older service; the GUI fails closed instead of guessing 0.
         status = {
             "healthy": True,
             "clock_trusted": True,
             "clock_reason": "",
             "active_counts": {"website": 0, "application": 0},
+        }
+        with self.assertRaisesRegex(FormError, "active counts"):
+            snapshot_from_results(status, policy_result(), (), ())
+
+    def test_snapshot_rejects_unknown_policy_schema(self) -> None:
+        status = {
+            "healthy": True,
+            "clock_trusted": True,
+            "clock_reason": "",
+            "active_counts": {"website": 0, "application": 0, "network": 0},
         }
         unsupported = policy_result()
         unsupported["schema_version"] = POLICY_SCHEMA_VERSION + 1
@@ -1311,7 +1420,7 @@ class WebsiteUsageViewTests(unittest.TestCase):
             "healthy": True,
             "clock_trusted": True,
             "clock_reason": "",
-            "active_counts": {"website": 0, "application": 0},
+            "active_counts": {"website": 0, "application": 0, "network": 0},
         }
         item = make_rule().to_dict()
         item["budget_exhausted"] = True

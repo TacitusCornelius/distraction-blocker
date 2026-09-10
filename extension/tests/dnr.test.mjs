@@ -20,6 +20,7 @@ const { compile_dnr, compile_inactive_tab_rule, rule_to_regexp } = await import(
 const conformance = JSON.parse(
   readFileSync(join(root, "core", "conformance.json"), "utf-8"),
 );
+const { compile } = await import(join(root, "core", "engine.js"));
 
 function compiled_regexes(policy_name) {
   return compile_dnr(conformance.policies[policy_name]).map((entry) => ({
@@ -78,3 +79,31 @@ test("inactive-tab rule is absent without target tabs", () => {
   assert.equal(compile_inactive_tab_rule([], 5001), null);
   assert.equal(compile_inactive_tab_rule(undefined, 5001), null);
 });
+test("URL exceptions emit higher-priority allow rules", () => {
+  const entries = compile_dnr([{
+    id: "broad",
+    enabled: true,
+    targets: [{ kind: "url_wildcard", value: "example.com/*" }],
+    exceptions: [{ kind: "url_path", value: "example.com/allowed" }],
+  }]);
+  assert.deepEqual(
+    entries.map((entry) => [entry.rule.action.type, entry.rule.priority]),
+    [["block", 1], ["allow", 2]],
+  );
+  assert.equal(rule_to_regexp(entries[0].rule).test("https://example.com/blocked"), true);
+  assert.equal(rule_to_regexp(entries[1].rule).test("https://example.com/allowed"), true);
+});
+test("YouTube video IDs keep case-sensitive parity with Firefox", () => {
+  const rules = [{
+    id: "video",
+    enabled: true,
+    targets: [{ kind: "youtube_video", value: "dQw4w9WgXcQ" }],
+  }];
+  const dnr = compile_dnr(rules);
+  assert.equal(compile(rules)("https://youtube.com/watch?v=DQW4WWGXcQ"), null);
+  assert.equal(
+    rule_to_regexp(dnr[0].rule).test("https://youtube.com/watch?v=DQW4WWGXcQ"),
+    false,
+  );
+});
+

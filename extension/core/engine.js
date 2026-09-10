@@ -1,18 +1,18 @@
 /**
  * Pure rule compiler for Distraction Blocker URL targets.
- *
- * Input is the `targets` array of service rules; output is a matcher that
- * returns the first matching target description or null. No browser or
- * service APIs appear here, so the matching contract is unit testable with
- * `node --test`.
+ * Input is the `targets` and optional `exceptions` arrays of service rules;
+ * output is a matcher that returns the first matching target description or
+ * null. Exceptions are browser-only allows checked before URL blocks. No
+ * browser or service APIs appear here, so the matching contract is unit
+ * testable with `node --test`.
  *
  * Matching contract (mirrors distraction_blocker.model validation):
  * - url_path:       hostname equal (case-insensitive) AND path exactly equal.
  * - url_wildcard:   hostname equal AND path starts with the stored prefix.
  * - url_keyword:    keyword occurs anywhere in the full lowercase URL.
- * - youtube_video:  video ID equal on any YouTube host (watch, shorts,
- *                   embed, live).
+ * - youtube_video:  video ID equal on any YouTube host (case-sensitive).
  * - youtube_channel: @handle or UC channel ID in the URL path.
+ * - network:        ignored; OS-level enforcer targets, never URLs.
  */
 "use strict";
 
@@ -92,7 +92,22 @@ export function describe_url(raw) {
   );
 }
 
-function matches(target, url) {
+function target_matches(target, url) {
+  if (target.kind === "url_keyword") {
+    return url.href.includes(target.value);
+  }
+  if (target.kind === "youtube_video") {
+    return url.youtube_video !== null && url.youtube_video === target.value;
+  }
+  if (target.kind === "youtube_channel") {
+    return (
+      url.youtube_channel !== null &&
+      url.youtube_channel === target.value.toLowerCase()
+    );
+  }
+  if (target.kind !== "url_path" && target.kind !== "url_wildcard") {
+    return false;
+  }
   const parts = split_target(target.value);
   if (parts === null || parts.host !== url.host) {
     return false;
@@ -106,11 +121,14 @@ function matches(target, url) {
 
 /**
  * Compile service rules into a matcher.
- * `rules` is a list of { id, enabled, targets: [{kind, value}] }.
+ * `rules` is a list of { id, enabled, targets, exceptions } objects.
  */
 export function compile(rules) {
   const active = (rules ?? []).filter(
     (rule) => rule.enabled && Array.isArray(rule.targets),
+  );
+  const exceptions = active.flatMap((rule) =>
+    Array.isArray(rule.exceptions) ? rule.exceptions : []
   );
   /** Return { rule_id, kind, value } for the first match, or null. */
   return function match(raw_url) {
@@ -118,33 +136,12 @@ export function compile(rules) {
     if (url === null) {
       return null;
     }
+    if (exceptions.some((target) => target_matches(target, url))) {
+      return null;
+    }
     for (const rule of active) {
       for (const target of rule.targets) {
-        if (target.kind === "url_keyword") {
-          if (url.href.includes(target.value)) {
-            return { rule_id: rule.id, kind: target.kind, value: target.value };
-          }
-          continue;
-        }
-        if (target.kind === "youtube_video") {
-          if (url.youtube_video !== null && url.youtube_video === target.value) {
-            return { rule_id: rule.id, kind: target.kind, value: target.value };
-          }
-          continue;
-        }
-        if (target.kind === "youtube_channel") {
-          if (
-            url.youtube_channel !== null &&
-            url.youtube_channel === target.value.toLowerCase()
-          ) {
-            return { rule_id: rule.id, kind: target.kind, value: target.value };
-          }
-          continue;
-        }
-        if (target.kind !== "url_path" && target.kind !== "url_wildcard") {
-          continue;
-        }
-        if (matches(target, url)) {
+        if (target_matches(target, url)) {
           return { rule_id: rule.id, kind: target.kind, value: target.value };
         }
       }

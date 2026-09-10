@@ -1,0 +1,18 @@
+# distraction-blocker-network-owned-v1
+# Fence every opted-in boot until signed policy has been reconciled.
+[Unit]
+Description=Distraction Blocker network enforcement boot fence
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target distraction-blocker.service
+RequiresMountsFor=/usr/lib/distraction-blocker /var/lib/distraction-blocker
+ConditionPathExists=/var/lib/distraction-blocker/network.enabled
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0077
+ExecStart=/usr/bin/python3 -I /usr/lib/distraction-blocker/network_entry.py boot-fence
+
+[Install]
+WantedBy=network-pre.target

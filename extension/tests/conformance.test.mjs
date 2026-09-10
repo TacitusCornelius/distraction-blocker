@@ -65,6 +65,17 @@ test("conformance fixtures are complete and well-formed", () => {
     assert.ok("expect" in case_);
   }
 });
+test("URL exceptions allow a path covered by a broader rule", () => {
+  const match = compile([{
+    id: "broad",
+    enabled: true,
+    targets: [{ kind: "url_wildcard", value: "example.com/*" }],
+    exceptions: [{ kind: "url_path", value: "example.com/allowed" }],
+  }]);
+  assert.ok(match("https://example.com/blocked"));
+  assert.equal(match("https://example.com/allowed"), null);
+});
+
 
 // Breadcrumb: Firefox compiles the shared core to classic scripts (MV2
 // persistent background), so its copies intentionally differ from the

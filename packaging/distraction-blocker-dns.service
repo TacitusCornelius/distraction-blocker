@@ -1,0 +1,31 @@
+# distraction-blocker-network-owned-v1
+# Only the protected user's DNS sockets are redirected here.
+[Unit]
+Description=Distraction Blocker SafeSearch DNS resolver
+Wants=systemd-resolved.service
+After=systemd-resolved.service
+BindsTo=distraction-blocker.service
+
+[Service]
+Type=simple
+User=distraction-blocker-dns
+Group=distraction-blocker-dns
+ExecStart=/usr/sbin/dnsmasq -C /etc/distraction-blocker-network.conf --keep-in-foreground --pid-file=
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=

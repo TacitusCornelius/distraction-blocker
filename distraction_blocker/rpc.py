@@ -84,8 +84,11 @@ class RpcServer:
                     response = self.service.dispatch(peer_uid, request)
                 except RpcError as error:
                     response = {"ok": False, "error": {"code": error.code, "message": error.message}}
-                except (OSError, ValueError, TypeError) as error:
-                    response = {"ok": False, "error": {"code": "malformed", "message": str(error)}}
+                except Exception as error:
+                    # A policy mutation may fail after its enforcement-side
+                    # checks (for example while preparing SafeSearch). Keep
+                    # the daemon alive and return one bounded RPC error.
+                    response = {"ok": False, "error": {"code": "service_error", "message": str(error)}}
             if not response_fits(response):
                 response = {
                     "ok": False,

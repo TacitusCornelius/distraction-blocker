@@ -23,6 +23,8 @@ from .categories import starter_categories
 from .model import (
     MAX_POMODORO_CYCLES,
     MAX_WEEKLY_PERIODS,
+    NETWORK_CONTROLS,
+    POLICY_SCHEMA_VERSION,
     ManagedList,
     Policy,
     PolicyProjection,
@@ -235,12 +237,16 @@ class RuleForm:
     pomodoro_work_minutes: int = 25
     pomodoro_break_minutes: int = 5
     pomodoro_cycles: int = 4
-    # Breadcrumb: the editor has no URL fields yet, so these carried values
-    # keep an edit from silently dropping extension-enforced targets.
+    # Breadcrumb: URL targets and exceptions share the same target grammar;
+    # exceptions are browser-only allows that override URL blocking.
     url_targets: tuple[dict[str, str], ...] = ()
+    url_exceptions: tuple[dict[str, str], ...] = ()
     # Breadcrumb: optional daily start budget; None means "no limit" and
     # round-trips through put_rule exactly like the other rule fields.
     allowance_starts: int | None = None
+    # Breadcrumb: checked network controls; values are the exact network
+    # target names and round-trip as kind "network" targets.
+    network_controls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -250,6 +256,9 @@ class ServiceSnapshot:
     clock_reason: str
     active_websites: int
     active_applications: int
+    # Breadcrumb (network seam): count of distinct active network controls
+    # (0..6) across active rules; mirrors list-rules network targets.
+    active_network: int
     rules: tuple[Rule, ...]
     managed_lists: tuple[ManagedListSummary, ...]
     locks: tuple[LockSummary, ...]
@@ -391,6 +400,23 @@ def form_to_rule(
     for entry in form.url_targets:
         if entry:
             targets.append(Target.from_dict(entry))
+    exceptions: list[Target] = []
+    for entry in form.url_exceptions:
+        try:
+            exception = Target.from_dict(entry)
+        except ValidationError as error:
+            raise FormError(error.message) from error
+        if exception.kind not in Target.URL_LIKE_KINDS:
+            raise FormError("Exceptions require URL-level targets.")
+        exceptions.append(exception)
+    for control in form.network_controls:
+        if control not in NETWORK_CONTROLS:
+            raise FormError(
+                f"{control} is not a supported network control."
+            )
+        targets.append(
+            Target.from_dict({"kind": "network", "value": control})
+        )
     if not targets:
         raise FormError("Add at least one target.")
 
@@ -480,6 +506,8 @@ def form_to_rule(
         "schedule": schedule.to_dict(),
         "revision": revision,
     }
+    if exceptions:
+        rule_data["exceptions"] = [target.to_dict() for target in exceptions]
     if form.allowance_starts is not None:
         if (
             isinstance(form.allowance_starts, bool)
@@ -509,15 +537,25 @@ def form_to_request(
 def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
     """Convert a model rule to editor values."""
     form = _rule_to_form_fields(rule, timezone_name)
+    targets = rule.to_dict()["targets"]
     url_targets = tuple(
         {"kind": item["kind"], "value": item["value"]}
-        for item in rule.to_dict()["targets"]
+        for item in targets
         if item["kind"] in Target.URL_LIKE_KINDS
+    )
+    url_exceptions = tuple(
+        {"kind": item.kind, "value": item.value}
+        for item in rule.exceptions
+    )
+    network_controls = tuple(
+        item["value"] for item in targets if item["kind"] == "network"
     )
     return replace(
         form,
         url_targets=url_targets,
+        url_exceptions=url_exceptions,
         allowance_starts=rule.allowance_starts,
+        network_controls=network_controls,
     )
 
 
@@ -1149,17 +1187,20 @@ def snapshot_from_results(
     if set(status) != {"healthy", "clock_trusted", "clock_reason", "active_counts"}:
         raise FormError("The service returned an invalid status.")
     active = status["active_counts"]
-    if not isinstance(active, Mapping) or set(active) != {"website", "application"}:
-        raise FormError("The service returned invalid active counts.")
-    websites, applications = active["website"], active["application"]
     if (
-        not isinstance(websites, int)
-        or isinstance(websites, bool)
-        or websites < 0
-        or not isinstance(applications, int)
-        or isinstance(applications, bool)
-        or applications < 0
+        not isinstance(active, Mapping)
+        or set(active) != {"website", "application", "network"}
     ):
+        raise FormError("The service returned invalid active counts.")
+    websites, applications, network = (
+        active["website"],
+        active["application"],
+        active["network"],
+    )
+    if any(
+        not isinstance(count, int) or isinstance(count, bool) or count < 0
+        for count in (websites, applications, network)
+    ) or network > len(NETWORK_CONTROLS):
         raise FormError("The service returned invalid active counts.")
     if not isinstance(status["healthy"], bool) or not isinstance(status["clock_trusted"], bool):
         raise FormError("The service returned an invalid status.")
@@ -1188,6 +1229,7 @@ def snapshot_from_results(
         status["clock_reason"],
         websites,
         applications,
+        network,
         tuple(Rule.from_dict(item) for item in clean_rule_items),
         managed_list_summaries_from_results(list_items),
         lock_summaries_from_results(lock_items),
@@ -1452,6 +1494,11 @@ def _target_summary(rule: Rule) -> str:
         )
     if url_targets:
         parts.append(f"{url_targets} URL rule" + ("s" if url_targets != 1 else ""))
+    networks = sum(item["kind"] == "network" for item in targets)
+    if networks:
+        parts.append(
+            f"{networks} network control" + ("s" if networks != 1 else "")
+        )
     return ", ".join(parts)
 
 
@@ -1727,7 +1774,8 @@ class GuiController:
             self.clock_label.add_css_class("error")
         self.active_label.set_text(
             f"Active targets: {snapshot.active_websites} websites, "
-            f"{snapshot.active_applications} applications."
+            f"{snapshot.active_applications} applications, "
+            f"{snapshot.active_network} network controls."
         )
         self.add_button.set_sensitive(snapshot.healthy)
         self.focus_button.set_sensitive(snapshot.healthy and bool(snapshot.rules))
@@ -3533,6 +3581,7 @@ class RuleEditor:
         )
         self.application_paths: list[str] = []
         self.url_targets: list[dict[str, str]] = []
+        self.url_exceptions: list[dict[str, str]] = []
         self.weekly_rows: list[WeeklyPeriodRow] = []
         local_now = datetime.now(ZoneInfo(timezone_name))
         self.default_one_start, self.default_one_end = default_one_time_window(local_now)
@@ -3646,10 +3695,19 @@ class RuleEditor:
         url_label.set_hexpand(True)
         url_row.append(url_label)
         self.url_kind_dropdown = Gtk.DropDown.new_from_strings(
-            ("Exact path", "Wildcard path", "Keyword")
+            (
+                "Exact path",
+                "Wildcard path",
+                "Keyword",
+                "YouTube video",
+                "YouTube channel",
+            )
         )
-        self.url_kind_dropdown.set_selected(0)
-        url_row.append(self.url_kind_dropdown)
+        self.url_exception_check = Gtk.CheckButton(label="Add as exception")
+        self.url_exception_check.set_tooltip_text(
+            "Allow this URL when another URL target matches it."
+        )
+        url_row.append(self.url_exception_check)
         outer.append(url_row)
         self.url_entry = Gtk.Entry()
         self.url_entry.set_hexpand(True)
@@ -3696,6 +3754,31 @@ class RuleEditor:
             empty_lists.set_wrap(True)
             empty_lists.add_css_class("dim-label")
             outer.append(empty_lists)
+        network_heading = Gtk.Label(label="Network controls")
+        network_heading.set_xalign(0)
+        outer.append(network_heading)
+        # Breadcrumb (network seam): each checkbox is one network target;
+        # the value stored is the control name, and the service rejects the
+        # rule when network enforcement is not enabled on this host.
+        self.network_checks: dict[str, object] = {}
+        network_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.COMPACT)
+        )
+        for control, label, tooltip in self._NETWORK_OPTIONS:
+            check = Gtk.CheckButton(label=label)
+            check.set_tooltip_text(tooltip)
+            network_box.append(check)
+            self.network_checks[control] = check
+        outer.append(network_box)
+        network_note = Gtk.Label(
+            label="Network controls affect the protected user's own "
+            "connections only. Local proxies, VPNs, and system daemons "
+            "are outside this scope, so the block is not exhaustive."
+        )
+        network_note.set_xalign(0)
+        network_note.set_wrap(True)
+        network_note.add_css_class("dim-label")
+        outer.append(network_note)
 
         # Breadcrumb (allowance seam): 0 in the editor means "no daily
         # limit"; any value from 1 up is stored as allowance_starts and
@@ -3940,6 +4023,50 @@ class RuleEditor:
         "youtube_channel",
     )
 
+    # Breadcrumb (network seam): (control, checkbox label, tooltip); the
+    # control names are the network target values stored in the rule.
+    _NETWORK_OPTIONS = (
+        (
+            "whole_internet",
+            "Whole internet",
+            "Blocks all of the protected user's non-local IPv4 and IPv6 "
+            "connections, including existing ones. Loopback stays open.",
+        ),
+        (
+            "alternate_dns",
+            "Alternate DNS",
+            "Blocks the protected user's remote DNS (TCP/UDP 53) and "
+            "encrypted DNS (TCP/UDP 853). The local system resolver "
+            "stays available.",
+        ),
+        (
+            "safe_search",
+            "Safe search",
+            "Routes the protected user's DNS through a local resolver "
+            "that enforces safe search on Google, Bing, and YouTube. "
+            "Also blocks alternate DNS.",
+        ),
+        (
+            "doh",
+            "Known DoH endpoints",
+            "Blocks TCP/UDP 443 to the documented public resolver "
+            "addresses in the installed catalog. Shared HTTPS addresses "
+            "may block unrelated traffic; arbitrary DoH is not covered.",
+        ),
+        (
+            "proxy",
+            "Common proxy endpoints",
+            "Blocks TCP/UDP traffic to common proxy listener ports. "
+            "Local proxies and arbitrary ports are not covered.",
+        ),
+        (
+            "vpn",
+            "Common VPN endpoints",
+            "Blocks common VPN transport ports plus GRE and ESP. "
+            "VPNs on arbitrary ports or through another identity are not covered.",
+        ),
+    )
+
     def _add_url_target(self) -> None:
         kinds = self._URL_KINDS
         selected = self.url_kind_dropdown.get_selected()
@@ -3954,10 +4081,15 @@ class RuleEditor:
             self.error_label.set_text(error.message)
             return
         entry = target.to_dict()
-        if entry in self.url_targets:
+        target_list = (
+            self.url_exceptions
+            if self.url_exception_check.get_active()
+            else self.url_targets
+        )
+        if entry in target_list:
             self.error_label.set_text("That URL rule is already in the list.")
             return
-        self.url_targets.append(entry)
+        target_list.append(entry)
         self.url_entry.set_text("")
         self.error_label.set_text("")
         self._render_url_targets()
@@ -3976,38 +4108,49 @@ class RuleEditor:
             "youtube_video": "YouTube video",
             "youtube_channel": "YouTube channel",
         }
-        for entry in self.url_targets:
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(
-                orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
-            )
-            for method in (
-                box.set_margin_top,
-                box.set_margin_bottom,
-                box.set_margin_start,
-                box.set_margin_end,
-            ):
-                method(int(Space.COMPACT))
-            label = Gtk.Label(
-                label=f"[{kind_labels[entry['kind']]}] {entry['value']}"
-            )
-            label.set_xalign(0)
-            label.set_ellipsize(3)
-            label.set_hexpand(True)
-            box.append(label)
-            remove = Gtk.Button.new_with_mnemonic("_Remove")
-            remove.set_tooltip_text(f"Remove {entry['value']}")
-            remove.connect(
-                "clicked",
-                lambda _button, item=dict(entry): self._remove_url_target(item),
-            )
-            box.append(remove)
-            row.set_child(box)
-            self.url_list.append(row)
+        for is_exception, entries in (
+            (False, self.url_targets),
+            (True, self.url_exceptions),
+        ):
+            for entry in entries:
+                row = Gtk.ListBoxRow()
+                box = Gtk.Box(
+                    orientation=Gtk.Orientation.HORIZONTAL,
+                    spacing=int(Space.SMALL),
+                )
+                for method in (
+                    box.set_margin_top,
+                    box.set_margin_bottom,
+                    box.set_margin_start,
+                    box.set_margin_end,
+                ):
+                    method(int(Space.COMPACT))
+                prefix = "exception " if is_exception else ""
+                label = Gtk.Label(
+                    label=f"[{prefix}{kind_labels[entry['kind']]}] "
+                    f"{entry['value']}"
+                )
+                label.set_xalign(0)
+                label.set_ellipsize(3)
+                label.set_hexpand(True)
+                box.append(label)
+                remove = Gtk.Button.new_with_mnemonic("_Remove")
+                remove.set_tooltip_text(f"Remove {entry['value']}")
+                remove.connect(
+                    "clicked",
+                    lambda _button, item=dict(entry), exception=is_exception:
+                    self._remove_url_target(item, exception),
+                )
+                box.append(remove)
+                row.set_child(box)
+                self.url_list.append(row)
 
-    def _remove_url_target(self, entry: dict[str, str]) -> None:
-        if entry in self.url_targets:
-            self.url_targets.remove(entry)
+    def _remove_url_target(
+        self, entry: dict[str, str], exception: bool = False
+    ) -> None:
+        target_list = self.url_exceptions if exception else self.url_targets
+        if entry in target_list:
+            target_list.remove(entry)
         self._render_url_targets()
 
     def _choose_domain_import(self) -> None:
@@ -4096,6 +4239,11 @@ class RuleEditor:
                 for list_id, check in self.managed_list_checks.items()
                 if check.get_active()
             ),
+            network_controls=tuple(
+                control
+                for control, check in self.network_checks.items()
+                if check.get_active()
+            ),
             schedule_kind=SCHEDULE_KINDS[selected],
             timezone=self.timezone_name,
             one_time_start=self.one_start.get_text(),
@@ -4106,6 +4254,7 @@ class RuleEditor:
             pomodoro_break_minutes=self.pomodoro_break.get_value_as_int(),
             pomodoro_cycles=self.pomodoro_cycles.get_value_as_int(),
             url_targets=tuple(self.url_targets),
+            url_exceptions=tuple(self.url_exceptions),
             allowance_starts=(
                 None if self.allowance_spin.get_value_as_int() == 0
                 else self.allowance_spin.get_value_as_int()
@@ -4137,11 +4286,13 @@ class RuleEditor:
         self.application_paths = list(form.applications)
         self._render_applications()
         self.url_targets = list(form.url_targets)
-        self._render_url_targets()
+        self.url_exceptions = list(form.url_exceptions)
         for list_id in form.managed_list_ids:
             check = self.managed_list_checks.get(list_id)
             if check is not None:
                 check.set_active(True)
+        for control, check in self.network_checks.items():
+            check.set_active(control in form.network_controls)
         selected = SCHEDULE_KINDS.index(form.schedule_kind)
         self.schedule_dropdown.set_selected(selected)
         self.schedule_stack.set_visible_child_name(form.schedule_kind)

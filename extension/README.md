@@ -25,8 +25,10 @@ URL-level rules that `/etc/hosts` cannot express:
 
 Implemented: the shared policy engine, Firefox and Chromium adapters,
 denial attribution, the native host, installer wiring, and unit checks.
-The two adapters block inactive-tab loads. Policy projections include an
-explicit schema version.
+The two adapters block inactive-tab loads. URL-level exceptions are
+browser-only allows: an exception matching a URL takes precedence over
+URL blocks, while the root service continues enforcing its own targets.
+Policy projections include an explicit schema version.
 
 The desktop application does not trust the extension. Policy flows from
 the root service to the extension. The extension sends observational

@@ -4,7 +4,7 @@
  */
 "use strict";
 
-const POLICY_SCHEMA_VERSION = 1;
+const POLICY_SCHEMA_VERSION = 4;
 
 /** Return the rule list from one valid policy document. */
 function rules_from_policy(value) {

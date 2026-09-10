@@ -50,6 +50,10 @@ const USAGE_KEY = "usage_totals";
 let usage_backup_scheduled = false;
 
 const TOTALS_KEY = "match_totals";
+const POLICY_KEY = "policy_snapshot";
+let attribution_initialized = false;
+let attribution_paused = false;
+let startup_observations = [];
 let totals_backup_scheduled = false;
 let match_enforced = null;
 let match_allowance = null;
@@ -119,6 +123,48 @@ const usage_ready = chrome.storage.session
   })
   .catch(() => {});
 
+function restore_policy_snapshot(stored) {
+  const snapshot = stored && stored[POLICY_KEY];
+  if (!snapshot || !Array.isArray(snapshot.rules)) {
+    return false;
+  }
+  try {
+    const { enforced, allowance } = partition_rules(snapshot.rules);
+    const compiled = compile_dnr(enforced);
+    match_enforced = compile(enforced);
+    match_allowance = compile(allowance);
+    rule_meta.clear();
+    for (const entry of compiled) {
+      rule_meta.set(entry.rule.id, {
+        rule_id: entry.rule_id,
+        value: entry.value,
+        key: usage_key(entry.rule_id, entry.value),
+      });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const attribution_ready = chrome.storage.session
+  .get(POLICY_KEY)
+  .then(async (stored) => {
+    const restored = restore_policy_snapshot(stored);
+    await Promise.all([totals_ready, usage_ready]);
+    attribution_initialized = true;
+    // Requests observed before restoration cannot be attributed safely
+    // unless the persisted policy describes the dynamic DNR rules.
+    if (restored) {
+      drain_startup_observations();
+    } else {
+      startup_observations = [];
+    }
+  })
+  .catch(() => {
+    attribution_initialized = true;
+    startup_observations = [];
+  });
 // Breadcrumb: onInstalled/onStartup/alarm ticks can overlap; serialize
 // refreshes so interleaved getDynamicRules/updateDynamicRules pairs never
 // race on the same DNR rule ids.
@@ -269,6 +315,7 @@ function host_request(message) {
 }
 
 export async function apply_policy(policy) {
+  await attribution_ready;
   let rules;
   try {
     rules = rules_from_policy(policy);
@@ -293,6 +340,7 @@ export async function apply_policy(policy) {
   }
 
   let existing;
+  attribution_paused = true;
   try {
     existing = await chrome.declarativeNetRequest.getDynamicRules();
     await chrome.declarativeNetRequest.updateDynamicRules({
@@ -300,6 +348,8 @@ export async function apply_policy(policy) {
       addRules: compiled.map((entry) => entry.rule),
     });
   } catch (error) {
+    attribution_paused = false;
+    drain_startup_observations();
     // Breadcrumb: local state changes happen only after both DNR calls pass.
     // DNR keeps its old rules when the replacement request is rejected.
     record_state(`DNR policy update failed: ${String(error.message ?? error)}`);
@@ -324,6 +374,11 @@ export async function apply_policy(policy) {
   for (const [dnr_id, meta] of next_rule_meta) {
     rule_meta.set(dnr_id, meta);
   }
+  chrome.storage.session
+    .set({ [POLICY_KEY]: { rules } })
+    .catch(() => {});
+  attribution_paused = false;
+  drain_startup_observations();
   last_error = null;
   record_state(null);
   return true;
@@ -405,7 +460,7 @@ export async function report_matches() {
   record_state(null);
 }
 
-async function report_usage() {
+export async function report_usage() {
   if (usage_totals.size === 0) {
     return;
   }
@@ -415,11 +470,12 @@ async function report_usage() {
     entries,
   });
   if (!(response && response.ok)) {
+    const detail = response?.error
+      ? `${response.error.code}: ${response.error.message}`
+      : "the native messaging host returned no response";
     // Breadcrumb: counters untouched on refusal, so the same delta is
     // retried next cycle; entries past the cap never left the map either.
-    record_state(
-      `Usage report refused: ${response.error.code}: ${response.error.message}`,
-    );
+    record_state(`Usage report refused: ${detail}`);
     return;
   }
   retire_usage(usage_totals, entries);
@@ -450,50 +506,71 @@ chrome.runtime.onStartup.addListener(() => {
 // Breadcrumb: observation only (no "blocking") — DNR enforces. Denial
 // counting here matches Firefox: a scope hit covered by rule_meta is about
 // to be blocked by that DNR rule, so it is one denial.
-// A scope hit with NO DNR coverage was permitted; for main_frame loads
-// under an allowance rule that is one unit of usage. The enforced-matcher
-// guard keeps overlapping policies honest: if any enforced target also
-// matches, DNR blocked this load and it must not count as usage.
+function observe_request(details) {
+  const enforced_hit =
+    match_enforced === null ? null : match_enforced(details.url);
+  if (enforced_hit !== null) {
+    const dnr_id = dnr_id_for(enforced_hit.rule_id, enforced_hit.value);
+    if (dnr_id !== null) {
+      const meta = rule_meta.get(dnr_id);
+      const key = meta?.key ?? usage_key(
+        enforced_hit.rule_id,
+        enforced_hit.value,
+      );
+      const totals = match_totals.get(key) ?? { count: 0, reported: 0 };
+      totals.count = Math.min(COUNTER_MAX, totals.count + 1);
+      match_totals.set(key, totals);
+      schedule_totals_backup();
+      return;
+    }
+  }
+  if (details.type === "main_frame" && match_allowance !== null) {
+    const allowed = match_allowance(details.url);
+    if (allowed !== null) {
+      bump_usage(usage_totals, allowed.rule_id, allowed.value);
+      schedule_usage_backup();
+    }
+  }
+  // Breadcrumb: the session DNR rule performs the block. This listener
+  // records only local status data and never reports it to the service.
+  if (
+    block_inactive &&
+    inactive_tab_ids.has(details.tabId) &&
+    details.url.startsWith("http")
+  ) {
+    const url = details.url.slice(0, 200);
+    bump_bounded(inactive_denials, url);
+    chrome.storage.local.set({ denials: denial_snapshot() }).catch(() => {});
+  }
+}
+
+function drain_startup_observations() {
+  const observations = startup_observations;
+  startup_observations = [];
+  for (const details of observations) {
+    observe_request(details);
+  }
+}
+
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.tabId === -1) {
       return;
     }
-    const enforced_hit =
-      match_enforced === null ? null : match_enforced(details.url);
-    if (enforced_hit !== null) {
-      const dnr_id = dnr_id_for(enforced_hit.rule_id, enforced_hit.value);
-      if (dnr_id !== null) {
-        const meta = rule_meta.get(dnr_id);
-        const key = meta?.key ?? usage_key(
-          enforced_hit.rule_id,
-          enforced_hit.value,
-        );
-        const totals = match_totals.get(key) ?? { count: 0, reported: 0 };
-        totals.count = Math.min(COUNTER_MAX, totals.count + 1);
-        match_totals.set(key, totals);
-        schedule_totals_backup();
-        return;
+    if (!attribution_initialized || attribution_paused) {
+      // The persisted DNR rules can block while the worker rehydrates its
+      // matcher, and a replacement can briefly expose the new rules before
+      // this worker commits their metadata. Keep a bounded event tail.
+      if (startup_observations.length < 256) {
+        startup_observations.push({
+          tabId: details.tabId,
+          type: details.type,
+          url: details.url,
+        });
       }
+      return;
     }
-    if (details.type === "main_frame" && match_allowance !== null) {
-      const allowed = match_allowance(details.url);
-      if (allowed !== null) {
-        bump_usage(usage_totals, allowed.rule_id, allowed.value);
-        schedule_usage_backup();
-      }
-    }
-    // Breadcrumb: the session DNR rule performs the block. This listener
-    // records only local status data and never reports it to the service.
-    if (
-      block_inactive &&
-      inactive_tab_ids.has(details.tabId) &&
-      details.url.startsWith("http")
-    ) {
-      const url = details.url.slice(0, 200);
-      bump_bounded(inactive_denials, url);
-      chrome.storage.local.set({ denials: denial_snapshot() }).catch(() => {});
-    }
+    observe_request(details);
   },
   { urls: ["<all_urls>"] },
 );

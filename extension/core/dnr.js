@@ -13,7 +13,7 @@
  *                    (exactly one trailing star in the stored value).
  * - url_keyword:     keyword occurs anywhere in the full URL
  *                    (case-insensitive).
- * - youtube_video:   video ID equal on any YouTube host form.
+ * - youtube_video:   video ID equal on any YouTube host form (case-sensitive).
  * - youtube_channel: @handle or UC channel reference in the URL path.
  */
 "use strict";
@@ -110,9 +110,14 @@ export function target_pattern(target) {
 }
 
 function case_sensitive(kind) {
-  // Paths are case-sensitive on real servers; keywords and YouTube forms
-  // are compared loosely, exactly like the Firefox matcher.
-  return kind === "url_path" || kind === "url_wildcard";
+  // Paths and YouTube video IDs are case-sensitive on their source
+  // services; keywords and YouTube channel forms are compared loosely,
+  // exactly like the Firefox matcher.
+  return (
+    kind === "url_path" ||
+    kind === "url_wildcard" ||
+    kind === "youtube_video"
+  );
 }
 
 /**
@@ -128,22 +133,35 @@ export function compile_dnr(rules) {
   for (const rule of active) {
     for (const target of rule.targets) {
       const pattern = target_pattern(target);
-      if (pattern === null) {
-        continue;
+      if (pattern !== null) {
+        entries.push({
+          rule_id: rule.id,
+          kind: target.kind,
+          value: target.value,
+          pattern,
+          exception: false,
+        });
       }
-      entries.push({
-        rule_id: rule.id,
-        kind: target.kind,
-        value: target.value,
-        pattern,
-      });
+    }
+    for (const target of Array.isArray(rule.exceptions) ? rule.exceptions : []) {
+      const pattern = target_pattern(target);
+      if (pattern !== null) {
+        entries.push({
+          rule_id: rule.id,
+          kind: target.kind,
+          value: target.value,
+          pattern,
+          exception: true,
+        });
+      }
     }
   }
   entries.sort((a, b) =>
-    a.rule_id < b.rule_id ? -1 :
-    a.rule_id > b.rule_id ? 1 :
-    a.value < b.value ? -1 :
-    a.value > b.value ? 1 : 0,
+    a.exception - b.exception ||
+    (a.rule_id < b.rule_id ? -1 :
+      a.rule_id > b.rule_id ? 1 :
+      a.value < b.value ? -1 :
+      a.value > b.value ? 1 : 0),
   );
   return entries.map((entry, index) => ({
     rule_id: entry.rule_id,
@@ -151,8 +169,8 @@ export function compile_dnr(rules) {
     value: entry.value,
     rule: {
       id: index + 1,
-      priority: 1,
-      action: { type: "block" },
+      priority: entry.exception ? 2 : 1,
+      action: { type: entry.exception ? "allow" : "block" },
       condition: {
         regexFilter: entry.pattern,
         isUrlFilterCaseSensitive: case_sensitive(entry.kind),

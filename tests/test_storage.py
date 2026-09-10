@@ -28,7 +28,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(loaded.controls, controls)
             self.assertEqual(Path(directory, "policy.json").stat().st_mode & 0o777, 0o600)
             envelope = json.loads(Path(directory, "policy.json").read_text())
-            self.assertEqual(envelope["version"], 4)
+            self.assertEqual(envelope["version"], 7)
             self.assertEqual(
                 envelope["payload"]["policy"]["schema_version"],
                 POLICY_SCHEMA_VERSION,
@@ -70,22 +70,23 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(result.controls, ControlState.empty())
             self.assertEqual(result.policy.to_dict()["managed_lists"], [])
             self.assertEqual(result.policy.rules[0].to_dict()["schedule"]["periods"], [{"weekdays": [0, 2], "start": "09:00:00", "end": "17:00:00"}])
-            self.assertEqual(json.loads(Path(directory, "policy.json").read_text())["version"], 4)
+            self.assertEqual(json.loads(Path(directory, "policy.json").read_text())["version"], 7)
 
-    def test_signed_v2_adds_empty_controls_and_migrates_to_v4(self):
+    def test_signed_v2_adds_empty_controls_and_migrates_to_v7(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ProtectedStore(directory, key_source=b"k" * 32)
             store.initialize()
             payload = {"clock_untrusted": True, "high_water_utc": "2026-01-01T00:00:00.000000Z", "policy": Policy(4, ()).to_dict()}
+            payload["policy"].pop("schema_version")
             unsigned = {"version": 2, "payload": payload}
             envelope = {**unsigned, "hmac": hmac.new(b"k" * 32, store._canonical(unsigned), hashlib.sha256).hexdigest()}
             Path(directory, "policy.json").write_bytes(store._canonical(envelope))
             result = store.load()
             self.assertEqual(result.controls, ControlState.empty())
             self.assertTrue(result.clock_untrusted)
-            self.assertEqual(json.loads(Path(directory, "policy.json").read_text())["version"], 4)
+            self.assertEqual(json.loads(Path(directory, "policy.json").read_text())["version"], 7)
 
-    def test_signed_v3_adds_policy_schema_and_migrates_to_v4(self):
+    def test_signed_v3_adds_policy_schema_and_migrates_to_v7(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ProtectedStore(directory, key_source=b"k" * 32)
             store.initialize()
@@ -110,10 +111,67 @@ class StorageTests(unittest.TestCase):
             result = store.load()
             self.assertEqual(result.policy.schema_version, POLICY_SCHEMA_VERSION)
             rewritten = json.loads(Path(directory, "policy.json").read_text())
-            self.assertEqual(rewritten["version"], 4)
+            self.assertEqual(rewritten["version"], 7)
             self.assertEqual(
                 rewritten["payload"]["policy"]["schema_version"],
                 POLICY_SCHEMA_VERSION,
+            )
+
+    def test_signed_v4_legacy_migrates_to_v7(self):
+        # Breadcrumb: v4 envelopes carry a schema 1 policy (pre-network
+        # target kind) with explicit schema_version and controls; the old
+        # signature must verify before the converted v7 form is written.
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            store.initialize()
+            old_policy = Policy(4, ()).to_dict()
+            old_policy["schema_version"] = 1
+            payload = {
+                "clock_untrusted": False,
+                "high_water_utc": None,
+                "policy": old_policy,
+                "controls": ControlState.empty().to_dict(),
+            }
+            unsigned = {"version": 4, "payload": payload}
+            envelope = {
+                **unsigned,
+                "hmac": hmac.new(
+                    b"k" * 32,
+                    store._canonical(unsigned),
+                    hashlib.sha256,
+                ).hexdigest(),
+            }
+            Path(directory, "policy.json").write_bytes(store._canonical(envelope))
+            result = store.load()
+            self.assertEqual(result.policy.schema_version, POLICY_SCHEMA_VERSION)
+            self.assertEqual(result.controls, ControlState.empty())
+            rewritten = json.loads(Path(directory, "policy.json").read_text())
+            self.assertEqual(rewritten["version"], 7)
+
+    def test_network_policy_round_trips_through_signed_storage(self):
+        # Breadcrumb: network targets are root policy data; the signed
+        # envelope must carry them intact across save and load.
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProtectedStore(directory, key_source=b"k" * 32)
+            policy = Policy.from_dict({
+                "schema_version": POLICY_SCHEMA_VERSION,
+                "revision": 1,
+                "rules": [{
+                    "id": "12345678-1234-5678-9234-567812345678",
+                    "name": "Network",
+                    "enabled": True,
+                    "targets": [{"kind": "network", "value": "whole_internet"}],
+                    "schedule": {"kind": "indefinite"},
+                    "revision": 0,
+                }],
+                "managed_lists": [],
+            })
+            store.save(policy, ControlState.empty(), None, False)
+            loaded = store.load()
+            self.assertEqual(loaded.policy, policy)
+            self.assertEqual(
+                loaded.policy.rules[0].targets[0].to_dict(),
+                {"kind": "network", "value": "whole_internet"},
             )
 
 

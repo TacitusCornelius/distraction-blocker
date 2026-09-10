@@ -75,6 +75,7 @@ class CommandImportTests(unittest.TestCase):
                     "active_counts": {
                         "website": 2,
                         "application": 1,
+                        "network": 3,
                     },
                 }
 
@@ -85,6 +86,7 @@ class CommandImportTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(output[0], "Service: healthy")
         self.assertIn("Active websites: 2", output)
+        self.assertIn("Active network controls: 3", output)
         self.assertFalse(any(line.startswith("{") for line in output))
 
     def test_rules_human_output_reads_policy_projection(self) -> None:
@@ -94,7 +96,7 @@ class CommandImportTests(unittest.TestCase):
             def request(self, command, **_fields):
                 self.call = command
                 return {
-                    "schema_version": 1,
+                    "schema_version": 4,
                     "revision": 4,
                     "rules": [{
                         "id": "11111111-1111-4111-8111-111111111111",
@@ -203,7 +205,7 @@ class CommandImportTests(unittest.TestCase):
                         self.call = (command, fields)
                         if command == "list_rules":
                             return {
-                                "schema_version": 1,
+                                "schema_version": 4,
                                 "revision": 0,
                                 "rules": [],
                             }

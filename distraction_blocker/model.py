@@ -30,7 +30,15 @@ MAX_POMODORO_CYCLES = 20
 # Breadcrumb: browser counters use exact JavaScript integers. A larger
 # allowance can never be reached by the extension.
 MAX_ALLOWANCE_STARTS = 2**53 - 1
-POLICY_SCHEMA_VERSION = 1
+# Breadcrumb: schema 4 adds best-effort proxy and VPN endpoint controls to
+# the network target kind. Earlier policies are migrated by storage and
+# transfer before strict current-schema parsing.
+POLICY_SCHEMA_VERSION = 4
+# Breadcrumb: the closed set of network control names a network target may
+# carry. The value is a fixed control name, never raw firewall input.
+NETWORK_CONTROLS = frozenset(
+    {"whole_internet", "alternate_dns", "safe_search", "doh", "proxy", "vpn"}
+)
 
 
 def _error(code: str, message: str) -> None:
@@ -177,6 +185,16 @@ def _youtube_channel(value: Any, label: str) -> str:
         _error("bad_value", f"{label} must be a @handle or a UC channel ID")
     return raw
 
+
+def _network_control(value: Any, label: str) -> str:
+    # Breadcrumb: network targets name a fixed control, not firewall input;
+    # exact membership keeps the value a closed, comparable token.
+    raw = _string(value, label).strip()
+    if raw not in NETWORK_CONTROLS:
+        _error("bad_value", f"{label} is not a supported network control")
+    return raw
+
+
 @dataclass(frozen=True)
 class Target:
     kind: str
@@ -206,6 +224,7 @@ class Target:
             "url_keyword",
             "youtube_video",
             "youtube_channel",
+            "network",
         }:
             _error("bad_value", "target kind is not supported")
         value = obj.get("value")
@@ -225,6 +244,8 @@ class Target:
             value = _youtube_video_id(value, "YouTube video target")
         elif kind == "youtube_channel":
             value = _youtube_channel(value, "YouTube channel target")
+        elif kind == "network":
+            value = _network_control(value, "network target value")
         else:
             value = _string(value, "target value")
             if not os.path.isabs(value):
@@ -409,13 +430,28 @@ class Rule:
     targets: tuple[Target, ...]
     schedule: Schedule
     revision: int
-    # Breadcrumb: the optional daily budget remains part of policy schema 1.
+    # Breadcrumb: the optional daily budget remains part of policy schema 3.
     # Future incompatible shapes must increment POLICY_SCHEMA_VERSION.
     allowance_starts: int | None = None
+    # URL-level exceptions are browser-only allows inside matching rules.
+    exceptions: tuple[Target, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Rule":
-        obj = _object(data, {"id", "name", "enabled", "targets", "schedule", "revision", "allowance_starts"}, "rule")
+        obj = _object(
+            data,
+            {
+                "id",
+                "name",
+                "enabled",
+                "targets",
+                "schedule",
+                "revision",
+                "allowance_starts",
+                "exceptions",
+            },
+            "rule",
+        )
         ident = _uuid(obj.get("id"), "rule id")
         name = _string(obj.get("name"), "rule name", maximum=256)
         if not isinstance(obj.get("enabled"), bool):
@@ -426,6 +462,19 @@ class Rule:
         targets = tuple(Target.from_dict(item) for item in raw_targets)
         if len(set(targets)) != len(targets):
             _error("bad_value", "targets must be unique")
+        raw_exceptions = obj.get("exceptions", [])
+        if not isinstance(raw_exceptions, list):
+            _error("bad_type", "exceptions must be a list")
+        exceptions = tuple(
+            Target.from_dict(item) for item in raw_exceptions
+        )
+        if any(
+            target.kind not in Target.URL_LIKE_KINDS
+            for target in exceptions
+        ):
+            _error("bad_value", "exceptions require URL-level targets")
+        if len(set(exceptions)) != len(exceptions):
+            _error("bad_value", "exceptions must be unique")
         schedule = Schedule.from_dict(obj.get("schedule"))
         revision = _integer(obj.get("revision"), "revision", minimum=0)
         # Breadcrumb: _integer rejects bools, so true/false can never pose
@@ -449,12 +498,32 @@ class Rule:
                 "bad_value",
                 "allowance_starts requires URL-level targets",
             )
-        return cls(ident, name, obj["enabled"], targets, schedule, revision, allowance)
+        return cls(
+            ident,
+            name,
+            obj["enabled"],
+            targets,
+            schedule,
+            revision,
+            allowance,
+            exceptions,
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        data = {"id": self.id, "name": self.name, "enabled": self.enabled, "targets": [target.to_dict() for target in self.targets], "schedule": self.schedule.to_dict(), "revision": self.revision}
+        data = {
+            "id": self.id,
+            "name": self.name,
+            "enabled": self.enabled,
+            "targets": [target.to_dict() for target in self.targets],
+            "schedule": self.schedule.to_dict(),
+            "revision": self.revision,
+        }
         if self.allowance_starts is not None:
             data["allowance_starts"] = self.allowance_starts
+        if self.exceptions:
+            data["exceptions"] = [
+                target.to_dict() for target in self.exceptions
+            ]
         return data
 
     def is_active(self, now_utc: datetime, clock_trusted: bool = True) -> bool:
@@ -594,7 +663,7 @@ class PolicyProjection:
             "revision",
             "budget_exhausted",
         }
-        allowed = required | {"allowance_starts"}
+        allowed = required | {"allowance_starts", "exceptions"}
         normalized: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         for raw_rule in raw_rules:

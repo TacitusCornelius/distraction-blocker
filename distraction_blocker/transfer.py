@@ -13,7 +13,9 @@ from typing import Iterable, Mapping, Any
 from .model import POLICY_SCHEMA_VERSION, ManagedList, Policy, Rule, Target, ValidationError
 
 NATIVE_FORMAT = "distraction-blocker"
-NATIVE_VERSION = 2
+# Version 5 adds best-effort proxy and VPN endpoint controls; earlier
+# portable files are migrated on import when their targets remain supported.
+NATIVE_VERSION = 5
 MAX_DOMAIN_IMPORT_BYTES = 4 * 1024 * 1024
 MAX_NATIVE_IMPORT_BYTES = 8 * 1024 * 1024
 MAX_IMPORT_ENTRIES = 50_000
@@ -182,8 +184,28 @@ def parse_native_export(text: str) -> Policy:
     if value.get("format") != NATIVE_FORMAT:
         raise TransferError("native export format is not supported")
     version = value.get("version")
-    if isinstance(version, bool) or version not in {1, NATIVE_VERSION}:
+    if type(version) is not int or version not in {1, 2, 3, 4, NATIVE_VERSION}:
         raise TransferError("native export version is not supported")
+    raw_rules = value.get("rules")
+    if not isinstance(raw_rules, list):
+        raise TransferError("native rules must be a list")
+    if version < NATIVE_VERSION:
+        for raw_rule in raw_rules:
+            if not isinstance(raw_rule, Mapping) or not isinstance(raw_rule.get("targets"), list):
+                raise TransferError("native rule targets are invalid")
+            for target in raw_rule["targets"]:
+                if not isinstance(target, Mapping) or target.get("kind") != "network":
+                    continue
+                if version < 3 or target.get("value") in {"doh", "proxy", "vpn"}:
+                    raise TransferError(
+                        "network targets require native format v5"
+                        if target.get("value") in {"proxy", "vpn"}
+                        else (
+                            "DoH network targets require native format v4"
+                            if target.get("value") == "doh"
+                            else "network targets require native format v3"
+                        )
+                    )
     expected = {"format", "version", "exported_utc", "rules"} if version == 1 else {"format", "version", "exported_utc", "revision", "rules", "managed_lists"}
     if set(value) != expected:
         raise TransferError("native export fields are invalid")

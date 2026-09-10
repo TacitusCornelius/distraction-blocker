@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import argparse
 import os
-import pwd
 from pathlib import Path
+import pwd
+import stat
 import shutil
 import subprocess
 import sys
@@ -77,6 +78,127 @@ POLICY_FILES = (
 MARKER_NAME = "INSTALLATION"
 MARKER_TEXT = "distraction-blocker\n"
 CLI_MARKER = "# distraction-blocker-owned-wrapper-v1"
+DNS_USER = "distraction-blocker-dns"
+DNS_UNIT = Path("/etc/systemd/system/distraction-blocker-dns.service")
+FENCE_UNIT = Path("/etc/systemd/system/distraction-blocker-network-restore.service")
+SANDBOX_DROPIN_DIR = Path("/etc/systemd/system/distraction-blocker.service.d")
+SANDBOX_DROPIN = SANDBOX_DROPIN_DIR / "network.conf"
+NETWORK_ASSET_MARKER = b"# distraction-blocker-network-owned-v1"
+
+def _open_directory_chain(path: Path) -> int:
+    """Open an absolute directory path without following symlinks."""
+    if not path.is_absolute():
+        fail(f"manifest path is not absolute: {path}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path.parts[0], flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _remove_manifest(path: Path) -> None:
+    try:
+        parent_fd = _open_directory_chain(path.parent)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        fail(f"manifest parent path is unsafe: {path}: {error}")
+    try:
+        try:
+            metadata = os.stat(
+                path.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(metadata.st_mode):
+            fail(f"refusing to remove a symlink at {path}")
+        if not stat.S_ISREG(metadata.st_mode):
+            fail(f"refusing to remove an unsafe manifest path: {path}")
+        os.unlink(path.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+def check_network_asset(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    metadata = path.lstat()
+    if (
+        path.is_symlink() or not path.is_file()
+        or metadata.st_uid != 0 or metadata.st_mode & 0o022
+        or path.read_bytes().splitlines()[:1] != [NETWORK_ASSET_MARKER]
+    ):
+        fail(f"refusing to remove an unowned network asset: {path}")
+
+
+def enforcement_module():
+    """Import the network enforcement module from the source tree."""
+    source_root = Path(__file__).resolve().parent.parent
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    from distraction_blocker import network_enforcement
+
+    return network_enforcement
+
+
+def network_teardown() -> None:
+    """Stop and remove only the network resources this install owned.
+
+    Recovery runs first and cleans the owned firewall table, the dedicated
+    resolver, and its configuration. Any failure aborts the whole
+    uninstall so unrelated resources are never touched by a half-finished
+    cleanup.
+    """
+    module = enforcement_module()
+    marker = Path(module.marker_path(STATE))
+    marker_present = module.is_network_enabled(STATE)
+    has_units = (
+        DNS_UNIT.exists()
+        or FENCE_UNIT.exists()
+        or SANDBOX_DROPIN.exists()
+    )
+    if not marker_present and not has_units:
+        if marker.exists() or marker.is_symlink():
+            fail(f"the network enablement marker is invalid: {marker}")
+        return
+    for path in (DNS_UNIT, FENCE_UNIT, SANDBOX_DROPIN):
+        check_network_asset(path)
+    try:
+        status = module.main(["recover"])
+    except Exception as exc:
+        fail(f"network recovery failed: {exc}; aborting before removal")
+    if status != 0:
+        fail("network recovery failed; aborting before removal")
+    for path in (DNS_UNIT, FENCE_UNIT, SANDBOX_DROPIN):
+        if path.is_file():
+            path.unlink()
+    if SANDBOX_DROPIN_DIR.exists():
+        if SANDBOX_DROPIN_DIR.is_symlink() or not SANDBOX_DROPIN_DIR.is_dir():
+            fail(f"the sandbox drop-in path is unsafe: {SANDBOX_DROPIN_DIR}")
+        if not any(SANDBOX_DROPIN_DIR.iterdir()):
+            SANDBOX_DROPIN_DIR.rmdir()
+    # Breadcrumb: remove only the dedicated resolver account with the
+    # exact attributes the installer gave it.
+    try:
+        account = pwd.getpwnam(DNS_USER)
+    except KeyError:
+        return
+    if (
+        0 < account.pw_uid < 1000
+        and account.pw_shell == "/usr/sbin/nologin"
+        and account.pw_dir == "/nonexistent"
+    ):
+        subprocess.run(["/usr/sbin/userdel", DNS_USER], check=True)
+
 
 def fail(message: str) -> NoReturn:
     print(f"Uninstall refused: {message}", file=sys.stderr)
@@ -126,10 +248,7 @@ def remove_cli() -> None:
 
 def remove_native_manifests() -> None:
     for path in (*NATIVE_MANIFESTS, *LEGACY_NATIVE_MANIFESTS):
-        if path.is_symlink():
-            fail(f"refusing to remove a symlink at {path}")
-        if path.is_file():
-            path.unlink()
+        _remove_manifest(path)
     # Breadcrumb: the installer also placed per-owner copies under the
     # desktop user's home; remove current and legacy names.
     owner_file = STATE / "owner.uid"
@@ -142,11 +261,7 @@ def remove_native_manifests() -> None:
             pass
     for home in homes:
         for subdir, manifest_name in OWNER_NATIVE_MANIFESTS:
-            path = home / subdir / manifest_name
-            if path.is_symlink():
-                fail(f"refusing to remove a symlink at {path}")
-            if path.is_file():
-                path.unlink()
+            _remove_manifest(home / subdir / manifest_name)
 
 
 
@@ -175,6 +290,7 @@ def main() -> int:
             fail("the service unit is missing or unsafe")
         run_systemctl(["disable", "--now", "distraction-blocker.service"])
         clear_hosts()
+        network_teardown()
         remove_cli()
 
         for path in (UNIT, DESKTOP, LEGACY_DESKTOP):

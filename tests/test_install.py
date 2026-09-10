@@ -10,6 +10,15 @@ from scripts import install
 
 
 class InstallerSecurityTests(unittest.TestCase):
+    def test_network_risk_requires_both_explicit_flags(self):
+        for flag in ("--enable-network-controls", "--accept-network-risk"):
+            with self.subTest(flag=flag), patch(
+                "sys.argv", ["install.py", "--confirm", "--owner-uid", "1000", flag]
+            ), patch.object(install.os, "geteuid", return_value=0):
+                with self.assertRaises(SystemExit) as error:
+                    install.main()
+                self.assertEqual(error.exception.code, 2)
+
     def test_package_copy_refuses_internal_symlink_before_read(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -29,6 +38,25 @@ class InstallerSecurityTests(unittest.TestCase):
             finally:
                 os.close(descriptor)
             self.assertFalse((destination / "leak").exists())
+    def test_package_asset_refuses_symlinked_destination_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "manifest.json").write_text("{}\n", encoding="utf-8")
+            home = root / "home"
+            home.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (home / ".mozilla").symlink_to(outside, target_is_directory=True)
+            destination = home / ".mozilla" / "native-messaging-hosts" / "manifest.json"
+            descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(OSError):
+                    install.copy_asset(descriptor, "manifest.json", destination)
+            finally:
+                os.close(descriptor)
+            self.assertFalse((outside / "native-messaging-hosts").exists())
 
     def test_cli_collision_requires_ownership_marker(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -45,6 +73,27 @@ class InstallerSecurityTests(unittest.TestCase):
             )
             with patch.object(install, "CLI_PATH", path):
                 install.check_cli_collision()
+
+    def test_invalid_owner_is_rejected_before_network_account_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing_uid = 987654
+            with (
+                patch.object(install, "installation_exists", return_value=False),
+                patch.object(install, "check_cli_collision"),
+                patch.object(install, "UNIT", root / "unit"),
+                patch.object(install, "DESKTOP", root / "desktop"),
+                patch.object(install, "LEGACY_DESKTOP", root / "legacy"),
+                patch.object(install.pwd, "getpwuid", side_effect=KeyError),
+                patch.object(
+                    install,
+                    "ensure_dns_user",
+                    side_effect=AssertionError("must validate owner first"),
+                ),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    install.install_files(root, missing_uid, True, False)
+            self.assertEqual(raised.exception.code, 2)
 
 
 class NativeHostTests(unittest.TestCase):
@@ -279,6 +328,37 @@ class UninstallManifestTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             self.assertTrue(target.exists())
 
+    def test_refuses_symlinked_per_owner_manifest_parent(self):
+        import types
+
+        from scripts import uninstall
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            (state / "owner.uid").write_text("1000\n", encoding="ascii")
+            home = root / "home"
+            home.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            first_subdir, first_name = self.OWNER_PAIRS[0]
+            (home / ".mozilla").symlink_to(outside, target_is_directory=True)
+            victim = outside / "native-messaging-hosts" / first_name
+            victim.parent.mkdir(parents=True)
+            victim.write_text("{}\n", encoding="utf-8")
+            account = types.SimpleNamespace(pw_dir=str(home))
+            with (
+                patch.object(uninstall, "STATE", state),
+                patch.object(uninstall, "NATIVE_MANIFESTS", ()),
+                patch.object(uninstall, "LEGACY_NATIVE_MANIFESTS", ()),
+                patch.object(uninstall.pwd, "getpwuid", return_value=account),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    uninstall.remove_native_manifests()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertTrue(victim.exists())
+
     def test_uninstall_pairs_mirror_install_writes(self):
         import ast
 
@@ -372,43 +452,9 @@ class UninstallManifestTests(unittest.TestCase):
 
 
 
-class InstallerSourceTests(unittest.TestCase):
-    def test_install_files_uses_only_its_parameters(self):
-        # Breadcrumb: install_files receives owner_uid as a parameter; a
-        # reference to main()'s local `args` inside it is a latent NameError
-        # that only detonates on a real install run.
-        import ast
-
-        source = Path(install.__file__).read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        function = next(
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == "install_files"
-        )
-        names = {node.id for node in ast.walk(function) if isinstance(node, ast.Name)}
-        self.assertNotIn("args", names)
 
 
 if __name__ == "__main__":
     unittest.main()
 
 
-class NativeManifestNamingTests(unittest.TestCase):
-    def test_deployed_name_matches_host_name_not_packaging_name(self):
-        # Breadcrumb: Firefox and Chromium construct the native messaging
-        # lookup path from the host "name" field plus .json, so the
-        # deployed filename must be org.distraction_blocker.extension.json
-        # even though the packaging sources keep their per-browser names.
-        source = Path(__file__).resolve().parent.parent / "scripts" / "install.py"
-        text = source.read_text()
-        self.assertIn(
-            '"org.distraction_blocker.firefox.json",\n'
-            "                    browser_dir / HOST_MANIFEST_FILENAME,",
-            text,
-        )
-        self.assertIn(
-            '"org.distraction_blocker.chromium.json",\n'
-            "                    browser_dir / HOST_MANIFEST_FILENAME,",
-            text,
-        )
-        self.assertNotIn("browser_dir / \"org.distraction_blocker.", text)

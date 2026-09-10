@@ -17,6 +17,7 @@ const REFRESH_MINUTES = 1;
 const INACTIVE_KEY = "inactive-tab";
 
 let match = compile([]);
+let policy_ready = false;
 let last_error = "No policy loaded yet.";
 let last_refresh_ms = 0;
 let block_inactive = false;
@@ -95,6 +96,7 @@ function apply_policy(policy) {
   try {
     rules = rules_from_policy(policy);
   } catch (error) {
+    policy_ready = false;
     record_state(String(error.message ?? error));
     return false;
   }
@@ -104,6 +106,9 @@ function apply_policy(policy) {
   match = compile(enforced);
   match_allowance = compile(allowance);
   prune_usage(pending_usage, rules);
+  // Breadcrumb: Firefox has no persisted DNR equivalent. Once compilation
+  // succeeds, requests can leave the startup fail-closed state.
+  policy_ready = true;
   last_error = null;
   record_state(null);
   return true;
@@ -170,11 +175,12 @@ async function flush_usage() {
     entries,
   });
   if (!(response && response.ok)) {
+    const detail = response?.error
+      ? `${response.error.code}: ${response.error.message}`
+      : "the native messaging host returned no response";
     // Breadcrumb: nothing left the map yet, so the counts are simply
     // retried on the next cycle; record_state keeps them on disk.
-    record_state(
-      `Usage report refused: ${response.error.code}: ${response.error.message}`,
-    );
+    record_state(`Usage report refused: ${detail}`);
     return;
   }
   retire_usage(pending_usage, entries);
@@ -225,6 +231,9 @@ browser.webRequest.onBeforeRequest.addListener(
   async (details) => {
     if (details.tabId === -1 || !details.url.startsWith("http")) {
       return {};
+    }
+    if (!policy_ready) {
+      return { cancel: true };
     }
     const hit = match(details.url);
     if (hit !== null) {

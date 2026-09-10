@@ -32,7 +32,7 @@ class LoadResult:
 
 
 class ProtectedStore:
-    VERSION = 4
+    VERSION = 7
     KEY_NAME = "hmac.key"
     PRIMARY_NAME = "policy.json"
     BACKUP_NAME = "policy.json.bak"
@@ -307,10 +307,17 @@ class ProtectedStore:
     def _migrate_policy(data: Any) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise StorageError("policy is invalid")
+        if "schema_version" in data and (
+            type(data["schema_version"]) is not int
+            or data["schema_version"] not in {1, 2, 3}
+        ):
+            raise StorageError("old policy schema version is invalid")
         migrated = dict(data)
-        # Breadcrumb: envelopes 1 through 3 predate the explicit policy
-        # schema field. A verified old envelope enters schema 1.
-        migrated.setdefault("schema_version", POLICY_SCHEMA_VERSION)
+        # Envelopes 1 through 6 predate the current network-control schema.
+        # Their rule shapes are a strict subset of the current schema, so a
+        # verified old envelope is authenticated and then forced into the
+        # current policy schema version.
+        migrated["schema_version"] = POLICY_SCHEMA_VERSION
         migrated.setdefault("managed_lists", [])
         rules = migrated.get("rules")
         if not isinstance(rules, list):
@@ -339,7 +346,9 @@ class ProtectedStore:
         raw = path.read_bytes()
         envelope = json.loads(raw.decode("utf-8"))
         version, payload = self._verify_envelope(
-            envelope, {1, 2, 3, self.VERSION}, "policy"
+            envelope,
+            {1, 2, 3, 4, 5, self.VERSION},
+            "policy",
         )
         old_fields = {"clock_untrusted", "high_water_utc", "policy"}
         current_fields = old_fields | {"controls"}
@@ -362,8 +371,15 @@ class ProtectedStore:
             if has_controls
             else ControlState.empty()
         )
-        result = LoadResult(policy, controls, self._parse_utc(payload["high_water_utc"]), degraded, payload["clock_untrusted"])
+        result = LoadResult(
+            policy,
+            controls,
+            self._parse_utc(payload["high_water_utc"]),
+            degraded,
+            payload["clock_untrusted"],
+        )
         if version != self.VERSION:
-            # Breadcrumb: verify the old signature first, then write only the converted v4 form.
+            # Breadcrumb: verify the old signature first, then write only the
+            # converted v6 form.
             self.save(policy, controls, result.high_water_utc, result.clock_untrusted)
         return result

@@ -12,7 +12,7 @@ function policy(id, value, revision) {
     ? value
     : [{ kind: "url_path", value }];
   return {
-    schema_version: 1,
+    schema_version: 4,
     revision,
     rules: [{
       id,
@@ -59,7 +59,8 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
               reportRequest = message;
             }
             queueMicrotask(() => onMessage?.(
-              message.command === "report_website_denials"
+              message.command === "report_website_denials" ||
+              message.command === "report_website_usage"
                 ? hostResponse
                 : {
                     ok: false,
@@ -130,8 +131,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
       },
     },
   };
-
-  const { apply_policy, report_matches } = await import("../chromium/background.js");
+  const { apply_policy, report_matches, report_usage } = await import("../chromium/background.js");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(local.inactive_ok, false);
   assert.match(local.inactive_error, /session update rejected/);
@@ -180,7 +180,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   assert.equal(status.denials["old → example.com/blocked"], 2);
   updateFailure = false;
   const overlap = {
-    schema_version: 1,
+    schema_version: 4,
     revision: 3,
     rules: [
       {
@@ -214,7 +214,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   );
 
   const exhausted = {
-    schema_version: 1,
+    schema_version: 4,
     revision: 4,
     rules: [{
       id: "spent",
@@ -260,4 +260,23 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
     local.denials["bulk → bulk-128.example/blocked"],
     1,
   );
+  const allowance = {
+    schema_version: 4,
+    revision: 5,
+    rules: [{
+      id: "usage",
+      enabled: true,
+      allowance_starts: 2,
+      targets: [{ kind: "url_path", value: "usage.example/start" }],
+    }],
+  };
+  assert.equal(await apply_policy(allowance), true);
+  await webRequestListener({
+    tabId: 7,
+    type: "main_frame",
+    url: "https://usage.example/start",
+  });
+  hostResponse = undefined;
+  await report_usage();
+  assert.match(local.last_error, /native messaging host returned no response/);
 });

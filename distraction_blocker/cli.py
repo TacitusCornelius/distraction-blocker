@@ -87,6 +87,7 @@ def _human_lines(command: str, value: Any) -> list[str]:
             f"Clock: {'trusted' if value.get('clock_trusted') else 'not trusted'}",
             f"Active websites: {counts.get('website', 0)}",
             f"Active applications: {counts.get('application', 0)}",
+            f"Active network controls: {counts.get('network', 0)}",
         ]
     if command == "rules" and isinstance(value, dict):
         rules = value["rules"]

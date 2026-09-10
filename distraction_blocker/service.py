@@ -28,7 +28,7 @@ from .model import (
 )
 from .schedule_view import ScheduleViewError, project_daily_schedule, system_timezone_name
 from .statistics import DenialBuffer, StatisticsState, WebsiteDenialState, WebsiteUsageState, validate_report_value
-
+from .storage import StorageError
 
 def _authorization_now() -> float:
     """Return elapsed time that includes Linux system suspend."""
@@ -49,7 +49,7 @@ class BlockerService:
     _FRICTION_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     _MAX_NATIVE_IMPORT_BYTES = 8 * 1024 * 1024
 
-    def __init__(self, store, clock, hosts, applications, denial_buffer=None):
+    def __init__(self, store, clock, hosts, applications, denial_buffer=None, *, network=None):
         self.store = store
         self.clock = clock
         self.hosts = hosts
@@ -64,6 +64,12 @@ class BlockerService:
         # Breadcrumb: FakeApplications in the tests has no denial_buffer
         # attribute until this call, so the fallback read above must stay.
         applications.set_denial_buffer(self.denial_buffer)
+        # Breadcrumb: the network enforcer is an explicit opt-in. ``None``
+        # (or ``available`` False) means network controls are unavailable,
+        # never silently unenforced; the service then performs no network
+        # side effects at all and refuses to persist network targets.
+        self.network = network
+        self._active_network: frozenset[str] = frozenset()
         self.policy: Policy | None = None
         self.controls = ControlState.empty()
         self._statistics = StatisticsState.empty()
@@ -89,8 +95,17 @@ class BlockerService:
 
     @property
     def healthy(self) -> bool:
-        app_health = getattr(self.applications, "healthy", True)
-        return self._healthy and bool(app_health)
+        if not self._healthy:
+            return False
+        if not bool(getattr(self.applications, "healthy", True)):
+            return False
+        network = self.network
+        if network is None or not bool(getattr(network, "available", False)):
+            # Breadcrumb (fail-closed): an unavailable enforcer with an
+            # ACTIVE network policy means the persisted fence may be the
+            # only protection left, so the service must report unhealthy.
+            return not bool(self._active_network)
+        return bool(getattr(network, "healthy", True))
 
     def _now(self) -> datetime:
         now = self.clock.now()
@@ -98,13 +113,16 @@ class BlockerService:
             raise RuntimeError("clock returned an invalid time")
         return now.astimezone(timezone.utc)
 
-    def _active_targets(self, policy: Policy | None = None) -> tuple[set[str], set[str], list[Rule]]:
+    def _active_targets(
+        self, policy: Policy | None = None
+    ) -> tuple[set[str], set[str], frozenset[str], list[Rule]]:
         active: list[Rule] = []
         website: set[str] = set()
         application: set[str] = set()
+        network: set[str] = set()
         selected = policy if policy is not None else self.policy
         if selected is None:
-            return website, application, active
+            return website, application, frozenset(), active
         lists = {item.id: item for item in getattr(selected, "managed_lists", ())}
         now = self._now()
         trusted = bool(getattr(self.clock, "trusted", True))
@@ -123,11 +141,13 @@ class BlockerService:
                     website.add(target.value)
                 elif target.kind == "application":
                     application.add(target.value)
+                elif target.kind == "network":
+                    network.add(target.value)
                 elif target.kind == "managed_list":
                     managed = lists.get(target.value)
                     if managed is not None:
                         website.update(managed.domains)
-        return website, application, active
+        return website, application, frozenset(network), active
 
     def _application_rule_map(
         self, active: Iterable[Rule]
@@ -365,12 +385,28 @@ class BlockerService:
         return self._statistics
 
     def _reconcile(self, policy: Policy | None = None) -> None:
-        websites, applications, active = self._active_targets(policy)
+        websites, applications, network, active = self._active_targets(policy)
         self._publish_application_rule_map(self._application_rule_map(active))
         self.hosts.apply(websites)
         self.applications.set_blocked(applications)
         if not getattr(self.applications, "healthy", True):
             self._healthy = False
+        self._reconcile_network(network)
+
+    def _reconcile_network(self, controls: frozenset[str]) -> None:
+        self._active_network = controls
+        if self.network is None or not self.network.available:
+            if controls:
+                self._healthy = False
+                raise StorageError("active network controls require network enablement")
+            return
+        try:
+            self.network.reconcile(controls)
+            if not self.network.healthy:
+                raise StorageError("network enforcement is unhealthy")
+        except Exception:
+            self._healthy = False
+            raise
 
     def start(self) -> None:
         if self._started:
@@ -389,6 +425,14 @@ class BlockerService:
         # Breadcrumb: usage staleness resolves per-rule time zones, so the
         # load must wait until the policy (and its rules) is in memory.
         self._load_website_usage()
+        try:
+            # Validate the complete persisted policy, not only currently
+            # active targets. A future network rule must never become
+            # impossible to enforce after the service reports healthy.
+            self._assert_network_supported(self.policy)
+        except ValidationError as error:
+            self._healthy = False
+            raise StorageError(error.message) from error
         known_rules = {rule.id for rule in self.policy.rules}
         if any(lock.rule_id not in known_rules for lock in self.controls.locks):
             raise RuntimeError("protected lock refers to an unknown rule")
@@ -407,7 +451,7 @@ class BlockerService:
         self._drain_statistics()
         self._persist_statistics()
         if not self.healthy:
-            raise RuntimeError("application enforcement is unhealthy")
+            raise RuntimeError("enforcement is unhealthy")
         clock_trusted = bool(getattr(self.clock, "trusted", True))
         current = time.monotonic()
         clock_became_untrusted = self._last_clock_trusted and not clock_trusted
@@ -448,6 +492,20 @@ class BlockerService:
         if any(lock.rule_id not in rule_ids for lock in controls.locks):
             raise ControlError("protected lock refers to an unknown rule")
 
+    def _assert_network_supported(self, policy: Policy) -> None:
+        # Breadcrumb: network targets are root-policy data. A service
+        # without an opted-in enforcer must not persist a policy whose
+        # network rules it cannot enforce; presence gates the save even
+        # while a rule's schedule is inactive, because the rule may fire.
+        if self.network is not None and bool(getattr(self.network, "available", False)):
+            return
+        for rule in policy.rules:
+            if any(target.kind == "network" for target in rule.targets):
+                raise ValidationError(
+                    "network_unavailable",
+                    "network enforcement is not enabled",
+                )
+
     def _save(
         self, policy: Policy, controls: ControlState | None = None
     ) -> None:
@@ -458,6 +516,7 @@ class BlockerService:
         policy_data = policy.to_dict()
         policy_data["revision"] = revision + 1
         policy = Policy.from_dict(policy_data)
+        self._assert_network_supported(policy)
         selected_controls = controls if controls is not None else self.controls
         self._validate_control_refs(policy, selected_controls)
         projection = self._policy_projection(policy)
@@ -469,8 +528,24 @@ class BlockerService:
             raise ValidationError(
                 "too_large", "policy is too large for the service protocol"
             )
-        # Breadcrumb for reviewers: persist before exposing a weaker live
-        # policy. A failed signed write must leave enforcement unchanged.
+        # Breadcrumb for reviewers (fail-closed ordering): persist before
+        # exposing a weaker live policy, and install the stronger union of
+        # old and new active network controls BEFORE the signed write. A
+        # failed save or failed union reconcile leaves the old stronger
+        # enforcement in place; it is never removed here.
+        if self.network is not None and bool(getattr(self.network, "available", False)):
+            old_network = self._active_targets()[2]
+            new_network = self._active_targets(policy)[2]
+            if old_network or new_network:
+                try:
+                    self.network.reconcile(frozenset(old_network | new_network))
+                    if not self.network.healthy:
+                        raise StorageError("network enforcement is unhealthy")
+                except Exception as error:
+                    self._healthy = False
+                    raise StorageError(
+                        "network reconcile failed before policy save"
+                    ) from error
         self.store.save(
             policy,
             selected_controls,
@@ -485,6 +560,7 @@ class BlockerService:
         if self.policy is None:
             raise RuntimeError("service is not started")
         self._validate_control_refs(self.policy, controls)
+        self._assert_network_supported(self.policy)
         self.store.save(
             self.policy,
             controls,
@@ -514,9 +590,16 @@ class BlockerService:
     def _weakened_change(old: Rule, new: Rule) -> bool:
         old_targets = {(target.kind, target.value) for target in old.targets}
         new_targets = {(target.kind, target.value) for target in new.targets}
+        old_exceptions = {
+            (target.kind, target.value) for target in old.exceptions
+        }
+        new_exceptions = {
+            (target.kind, target.value) for target in new.exceptions
+        }
         return (
             old.enabled and not new.enabled
             or not old_targets <= new_targets
+            or not new_exceptions <= old_exceptions
             or old.schedule.to_dict() != new.schedule.to_dict()
             or BlockerService._weakened_allowance(old, new)
         )
@@ -1338,8 +1421,8 @@ class BlockerService:
         return getattr(self, handler)(uid, request)
 
     def _cmd_status(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
-        websites, applications, _ = self._active_targets()
-        return self._ok({"healthy": self.healthy, "clock_trusted": bool(getattr(self.clock, "trusted", True)), "clock_reason": str(getattr(self.clock, "reason", "")), "active_counts": {"website": len(websites), "application": len(applications)}})
+        websites, applications, network, _ = self._active_targets()
+        return self._ok({"healthy": self.healthy, "clock_trusted": bool(getattr(self.clock, "trusted", True)), "clock_reason": str(getattr(self.clock, "reason", "")), "active_counts": {"website": len(websites), "application": len(applications), "network": len(network)}})
 
     def _cmd_start_focus(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         return self._start_focus(
@@ -1812,6 +1895,7 @@ def main(argv=None) -> int:
         return 1
     from .clock import TrustedClock
     from .enforcement import FanotifyEnforcer, HostsEnforcer
+    from .network_enforcement import NetworkEnforcer
     from .rpc import RpcServer
     from .storage import ProtectedStore
 
@@ -1851,8 +1935,12 @@ def main(argv=None) -> int:
     hosts = HostsEnforcer(args.hosts)
     denial_buffer = DenialBuffer()
     applications = FanotifyEnforcer(_mounts, denial_buffer)
+    # Breadcrumb: main always wires the real network enforcer. Availability is
+    # an explicit operator opt-in the enforcer reads from its data dir marker,
+    # so an absent marker means no network side effects, never silent bypass.
+    network = NetworkEnforcer(owner_uid, data_dir=args.data_dir)
     service = BlockerService(
-        store, clock, hosts, applications, denial_buffer
+        store, clock, hosts, applications, denial_buffer, network=network
     )
     state["service"] = service
     service.start()
