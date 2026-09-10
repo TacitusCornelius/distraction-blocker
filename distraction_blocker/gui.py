@@ -4530,6 +4530,7 @@ class RuleEditor:
                 check.set_tooltip_text(
                     f"Source: {summary.source}. Version: {summary.version}."
                 )
+                check.connect("toggled", self._target_fields_changed)
                 list_box.append(check)
                 self.managed_list_checks[summary.id] = check
             outer.append(list_box)
@@ -4555,6 +4556,7 @@ class RuleEditor:
             check = Gtk.CheckButton(label=label)
             check.set_tooltip_text(tooltip)
             network_box.append(check)
+            check.connect("toggled", self._target_fields_changed)
             self.network_checks[control] = check
         outer.append(network_box)
         network_note = Gtk.Label(
@@ -4688,6 +4690,11 @@ class RuleEditor:
             "toggled", self._time_allowance_changed
         )
         weekly.append(self.time_allowance_check)
+        self.time_allowance_target_note = Gtk.Label(label="")
+        self.time_allowance_target_note.set_xalign(0)
+        self.time_allowance_target_note.set_wrap(True)
+        self.time_allowance_target_note.add_css_class("dim-label")
+        weekly.append(self.time_allowance_target_note)
         self.time_allowance_daily_spin = Gtk.SpinButton.new_with_range(
             0, MAX_TIME_ALLOWANCE_SECONDS // 60, 1
         )
@@ -4803,6 +4810,41 @@ class RuleEditor:
         self.time_allowance_daily_spin.set_sensitive(enabled)
         for row in self.weekly_rows:
             row.set_allowance_enabled(enabled)
+        self._update_time_allowance_availability()
+
+    def _timed_allowance_targets_eligible(self) -> bool:
+        return bool(self.url_targets) and not (
+            self._website_lines()
+            or self.application_paths
+            or any(check.get_active() for check in self.managed_list_checks.values())
+            or any(check.get_active() for check in self.network_checks.values())
+        )
+
+    def _update_time_allowance_availability(self) -> None:
+        check = getattr(self, "time_allowance_check", None)
+        note = getattr(self, "time_allowance_target_note", None)
+        if check is None or note is None:
+            return
+        eligible = self._timed_allowance_targets_eligible()
+        if not eligible and check.get_active():
+            check.set_active(False)
+            return
+        check.set_sensitive(eligible)
+        if eligible:
+            note.set_text(
+                "Timed allowances apply only to URL-level targets. "
+                "Configure one allowance mode for each weekly period."
+            )
+        else:
+            note.set_text(
+                "Add at least one URL rule and remove website, application, "
+                "managed-list, or network targets to enable timed allowances."
+            )
+    def _target_fields_changed(
+        self, _check: object, _parameter: object | None = None
+    ) -> None:
+        self._update_time_allowance_availability()
+
 
 
     def _add_weekly_period(self, value: WeeklyPeriodForm) -> None:
@@ -4889,6 +4931,7 @@ class RuleEditor:
             box.append(remove)
             row.set_child(box)
             self.application_list.append(row)
+        self._update_time_allowance_availability()
 
     def _remove_application(self, path: str) -> None:
         self.application_paths.remove(path)
@@ -4972,6 +5015,7 @@ class RuleEditor:
         self.url_entry.set_text("")
         self.error_label.set_text("")
         self._render_url_targets()
+        self._update_time_allowance_availability()
 
     def _render_url_targets(self) -> None:
         Gtk = self.Gtk
@@ -5031,6 +5075,7 @@ class RuleEditor:
         if entry in target_list:
             target_list.remove(entry)
         self._render_url_targets()
+        self._update_time_allowance_availability()
 
     def _choose_domain_import(self) -> None:
         Gtk = self.Gtk
@@ -5097,6 +5142,7 @@ class RuleEditor:
 
     def _set_website_lines(self, domains: Sequence[str]) -> None:
         self.website_view.get_buffer().set_text("\n".join(domains))
+        self._update_time_allowance_availability()
 
     def _website_lines(self) -> tuple[str, ...]:
         buffer = self.website_view.get_buffer()
@@ -5231,6 +5277,7 @@ class RuleEditor:
             self.pomodoro_work.set_value(form.pomodoro_work_minutes)
             self.pomodoro_break.set_value(form.pomodoro_break_minutes)
             self.pomodoro_cycles.set_value(form.pomodoro_cycles)
+        self._update_time_allowance_availability()
 
     def present(self) -> None:
         self.window.present()

@@ -1602,6 +1602,20 @@ class WebsiteUsageViewTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(FormError, "URL-level"):
             form_to_rule(form)
+    def test_timed_allowance_rejects_managed_list_targets(self):
+        form = RuleForm(
+            name="Managed allowance",
+            websites=(),
+            applications=(),
+            managed_list_ids=(LIST_ID,),
+            schedule_kind="weekly",
+            timezone="UTC",
+            weekly_periods=(WeeklyPeriodForm((0,), "09:00", "17:00"),),
+            time_allowance_enabled=True,
+            time_allowance_periods=(PeriodAllowanceForm("total", 30),),
+        )
+        with self.assertRaisesRegex(FormError, "URL-level"):
+            form_to_rule(form)
 
     def test_snapshot_collects_exhausted_rule_ids(self):
         status = {
