@@ -5,5 +5,5 @@ Comment=Quickly open Distraction Blocker and control notifications
 Exec=/usr/bin/python3 -I /usr/lib/distraction-blocker/tray_entry.py
 Terminal=false
 StartupNotify=false
-Categories=Utility;Productivity;
+Categories=Utility;
 X-GNOME-Autostart-enabled=true

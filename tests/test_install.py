@@ -84,6 +84,12 @@ class InstallerSecurityTests(unittest.TestCase):
                 patch.object(install, "check_cli_collision"),
                 patch.object(install, "UNIT", root / "unit"),
                 patch.object(install, "DESKTOP", root / "desktop"),
+                patch.object(install, "TRAY_DESKTOP", root / "tray-desktop"),
+                patch.object(
+                    install,
+                    "TRAY_AUTOSTART_DESKTOP",
+                    root / "tray-autostart",
+                ),
                 patch.object(install, "LEGACY_DESKTOP", root / "legacy"),
                 patch.object(install.pwd, "getpwuid", side_effect=KeyError),
                 patch.object(
@@ -458,6 +464,12 @@ class UninstallManifestTests(unittest.TestCase):
                 patch.object(uninstall.os, "geteuid", return_value=0),
                 patch.object(uninstall, "UNIT", unit),
                 patch.object(uninstall, "DESKTOP", root / "desktop"),
+                patch.object(uninstall, "TRAY_DESKTOP", root / "tray-desktop"),
+                patch.object(
+                    uninstall,
+                    "TRAY_AUTOSTART_DESKTOP",
+                    root / "tray-autostart",
+                ),
                 patch.object(uninstall, "LEGACY_DESKTOP", root / "legacy-desktop"),
                 patch.object(uninstall, "PREFIX", root / "prefix"),
                 patch.object(uninstall, "RUN", root / "run"),
