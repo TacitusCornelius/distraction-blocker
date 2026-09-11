@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Distraction Blocker",
-  "version": "1.4.0",
+  "version": "1.7.0",
   "description": "Enforces URL-level rules authored by the Distraction Blocker root service.",
   "icons": {
     "16": "icons/icon16.png",

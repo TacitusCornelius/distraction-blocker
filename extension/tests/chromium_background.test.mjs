@@ -36,11 +36,15 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   let reportRequest;
   let webRequestListener;
   let messageListener;
+  const tab_updates = [];
 
   globalThis.setTimeout = () => ({ unref() {} });
   globalThis.chrome = {
     runtime: {
       lastError: null,
+      getURL(path) {
+        return `chrome-extension://test/${path}`;
+      },
       onInstalled: event(),
       onStartup: event(),
       onMessage: {
@@ -93,6 +97,10 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
     },
     tabs: {
       query() { return Promise.resolve([]); },
+      update(tab_id, details) {
+        tab_updates.push({ tab_id, details });
+        return Promise.resolve();
+      },
       onActivated: event(),
       onCreated: event(),
       onRemoved: event(),
@@ -146,6 +154,14 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
     type: "main_frame",
     url: "https://example.com/blocked",
   });
+  const block_page = new URL(tab_updates[0].details.url);
+  assert.equal(tab_updates[0].tab_id, 7);
+  assert.equal(block_page.pathname, "/blocked.html");
+  assert.equal(block_page.searchParams.get("rule"), "old");
+  assert.equal(
+    block_page.searchParams.get("url"),
+    "https://example.com/blocked",
+  );
   assert.equal(dynamicRules.length, 1);
   const oldRule = structuredClone(dynamicRules[0]);
 

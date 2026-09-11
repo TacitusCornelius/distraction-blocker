@@ -734,6 +734,25 @@ void sync_active_window();
 // Breadcrumb: observation only (no "blocking") — DNR enforces. Denial
 // counting here matches Firefox: a scope hit covered by rule_meta is about
 // to be blocked by that DNR rule, so it is one denial.
+function show_block_page(details, hit = null) {
+  if (details.type !== "main_frame") {
+    return;
+  }
+  const page = new URL(chrome.runtime.getURL("blocked.html"));
+  page.searchParams.set(
+    "rule",
+    hit?.name || hit?.rule_id || "Policy is not ready",
+  );
+  page.searchParams.set("url", details.url);
+  try {
+    Promise.resolve(
+      chrome.tabs.update(details.tabId, { url: page.href }),
+    ).catch(() => {});
+  } catch {
+    // The tab can disappear while a blocked request is being observed.
+  }
+}
+
 function observe_request(details) {
   const enforced_hit =
     match_enforced === null ? null : match_enforced(details.url);
@@ -751,6 +770,7 @@ function observe_request(details) {
       schedule_totals_backup();
       if (details.type === "main_frame") {
         update_allowance_url(details.tabId, null);
+        show_block_page(details, enforced_hit);
       }
       return;
     }
@@ -759,7 +779,9 @@ function observe_request(details) {
     const timed = match_time_allowance === null
       ? null
       : match_time_allowance(details.url);
-    update_allowance_url(details.tabId, details.url);
+    if (timed !== null && !timed_available_rules.has(timed.rule_id)) {
+      show_block_page(details, timed);
+    }
     if (timed === null && match_allowance !== null) {
       const allowed = match_allowance(details.url);
       if (allowed !== null) {
@@ -776,7 +798,9 @@ function observe_request(details) {
     details.url.startsWith("http")
   ) {
     const url = details.url.slice(0, 200);
-    bump_bounded(inactive_denials, url);
+    if (details.type === "main_frame") {
+      show_block_page(details);
+    }
     chrome.storage.local.set({ denials: denial_snapshot() }).catch(() => {});
   }
 }

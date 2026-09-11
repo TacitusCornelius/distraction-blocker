@@ -142,7 +142,15 @@ function compile(rules) {
     for (const rule of active) {
       for (const target of rule.targets) {
         if (target_matches(target, url)) {
-          return { rule_id: rule.id, kind: target.kind, value: target.value };
+          return {
+            rule_id: rule.id,
+            name:
+              typeof rule.name === "string" && rule.name.trim()
+                ? rule.name
+                : rule.id,
+            kind: target.kind,
+            value: target.value,
+          };
         }
       }
     }

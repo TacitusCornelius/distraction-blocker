@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Page blocked — Distraction Blocker</title>
+  <link rel="stylesheet" href="blocked.css">
+</head>
+<body>
+  <main class="card" aria-labelledby="title">
+    <img class="brand" src="icons/icon128.png" alt="Distraction Blocker">
+    <p class="eyebrow">Distraction Blocker</p>
+    <h1 id="title">This page is blocked</h1>
+    <p class="explanation">Distraction Blocker prevented this page from loading.</p>
+    <section class="details" aria-labelledby="rule-label">
+      <h2 id="rule-label">Blocked by rule</h2>
+      <p id="rule-name" class="rule-name">Checking the active rule…</p>
+    </section>
+    <p id="requested" class="requested" hidden></p>
+    <button id="back" type="button">Go back</button>
+  </main>
+  <script src="blocked.js"></script>
+</body>
+</html>

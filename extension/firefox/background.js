@@ -362,13 +362,30 @@ browser.idle?.onStateChanged?.addListener((state) => {
 void sync_active_window();
 
 
+function block_page_url(raw_url, hit = null) {
+  const page = new URL(browser.runtime.getURL("blocked.html"));
+  page.searchParams.set(
+    "rule",
+    hit?.name || hit?.rule_id || "Policy is not ready",
+  );
+  page.searchParams.set("url", raw_url);
+  return page.href;
+}
+
+function block_result(details, hit = null) {
+  if (details.type !== "main_frame") {
+    return { cancel: true };
+  }
+  return { redirectUrl: block_page_url(details.url, hit) };
+}
+
 browser.webRequest.onBeforeRequest.addListener(
   async (details) => {
     if (details.tabId === -1 || !details.url.startsWith("http")) {
       return {};
     }
     if (!policy_ready) {
-      return { cancel: true };
+      return block_result(details);
     }
     const hit = match(details.url);
     if (hit !== null) {
@@ -377,7 +394,7 @@ browser.webRequest.onBeforeRequest.addListener(
       }
       bump_usage(pending_denials, hit.rule_id, hit.value);
       record_state(null);
-      return { cancel: true };
+      return block_result(details, hit);
     }
     const timed = match_time_allowance(details.url);
     if (details.type === "main_frame") {
@@ -388,7 +405,7 @@ browser.webRequest.onBeforeRequest.addListener(
         bump_usage(pending_denials, timed.rule_id, timed.value);
         record_state(null);
       }
-      return { cancel: true };
+      return block_result(details, timed);
     }
     if (details.type === "main_frame" && timed === null) {
       const allowed = match_allowance(details.url);
@@ -401,7 +418,7 @@ browser.webRequest.onBeforeRequest.addListener(
       const url = details.url.slice(0, 200);
       bump_bounded(inactive_denials, url);
       record_state(null);
-      return { cancel: true };
+      return block_result(details);
     }
     return {};
   },
