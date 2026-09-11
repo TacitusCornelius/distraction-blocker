@@ -3,6 +3,12 @@
   "name": "Distraction Blocker",
   "version": "1.4.0",
   "description": "Enforces URL-level rules authored by the Distraction Blocker root service.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "browser_specific_settings": {
     "gecko": {
       "id": "{e4f1a2b3-9c8d-4e5f-a6b7-8c9d0e1f2a3b}",
@@ -22,8 +28,13 @@
     "idle",
     "<all_urls>"
   ],
-  "action": {
+  "browser_action": {
     "default_title": "Distraction Blocker",
-    "default_popup": "status.html"
+    "default_popup": "status.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
   }
 }

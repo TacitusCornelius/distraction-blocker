@@ -46,6 +46,16 @@ class ExtensionCoreSyncTests(unittest.TestCase):
                 versions.add(json.loads(manifest.read_text())["version"])
         self.assertEqual(len(versions), 1, f"manifest versions diverge: {versions}")
 
+    def test_firefox_mv2_uses_browser_action(self):
+        import json
+
+        manifest = json.loads(
+            (self.root / "extension" / "firefox" / "manifest.json").read_text()
+        )
+        self.assertEqual(manifest["manifest_version"], 2)
+        self.assertIn("browser_action", manifest)
+        self.assertNotIn("action", manifest)
+
     def test_chromium_manifest_key_matches_packaged_extension_id(self):
         # Breadcrumb: Chromium derives the extension id from the manifest
         # "key" (SHA-256 over the DER SPKI, first 16 bytes), while the native
@@ -78,6 +88,40 @@ class ExtensionCoreSyncTests(unittest.TestCase):
         extensions = policy.get("allowed_extensions")
         self.assertEqual(extensions, [f"{extension_id}/*"])
 
+
+    def test_adapter_manifests_reference_matching_icon_assets(self):
+        import json
+        import struct
+
+        expected_sizes = {"16", "32", "48", "128"}
+        for target, action_key in (
+            ("firefox", "browser_action"),
+            ("chromium", "action"),
+        ):
+            extension_root = self.root / "extension" / target
+            manifest = json.loads((extension_root / "manifest.json").read_text())
+            self.assertEqual(set(manifest["icons"]), expected_sizes)
+            self.assertEqual(
+                set(manifest[action_key]["default_icon"]), {"16", "32", "48"}
+            )
+            for size in ("16", "32", "48"):
+                self.assertEqual(
+                    manifest[action_key]["default_icon"][size],
+                    manifest["icons"][size],
+                )
+            for size, relative_path in manifest["icons"].items():
+                icon_path = extension_root / relative_path
+                self.assertTrue(icon_path.is_file(), icon_path)
+                with icon_path.open("rb") as icon:
+                    self.assertEqual(icon.read(8), b"\x89PNG\r\n\x1a\n")
+                    icon.read(8)
+                    self.assertEqual(
+                        struct.unpack(">II", icon.read(8)),
+                        (int(size), int(size)),
+                    )
+                    png_bit_depth, png_color_type = icon.read(2)
+                    self.assertIn(png_bit_depth, (8, 16))
+                    self.assertEqual(png_color_type, 6)
 
 if __name__ == "__main__":
     unittest.main()

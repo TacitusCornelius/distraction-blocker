@@ -5,6 +5,12 @@
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyOTL5DAZdFqTyKXv8EF8jKA3QK+OfKgptNDynphbMnIlcImz0Ml9aswf9CJ+iOicSF7RVikgyjA8/GGAgFFE7L1/lz23aQUQ07/gJZ3Ia8E18D8n7oSBMOjzx/fAi3wkVL4MUYqUUnwyp75WlP4AFQ95s8gg1gLEa60f8CtCPJjl87oWvXnqReIaU8283P0cxZJLda2XebCFX8iqGidBGrNVf9Fs37/j8ieQJz1H1IlZklQkflmlwon3RZWxC98WhvgwwRg4KQwmz8BNYuo+Bax5MK99raQXMeAMmP86i5pGSrCJVZwo3rfrZST3D7IGquJxqBt5ydNg96PyWfYMpwIDAQAB",
   "description": "Enforces URL-level rules authored by the Distraction Blocker root service.",
   "minimum_chrome_version": "121.0",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"
@@ -21,6 +27,11 @@
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_title": "Distraction Blocker",
-    "default_popup": "status.html"
+    "default_popup": "status.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
   }
 }
