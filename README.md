@@ -212,6 +212,32 @@ sudo python3 scripts/install.py --confirm --owner-uid 1000
 
 The installer copies root-owned code to `/usr/lib/distraction-blocker`. It installs and starts `distraction-blocker.service`.
 
+### Chrome Web Store extension (Version 1.9)
+
+The Chromium adapter is published separately as an unlisted Chrome Web Store
+item. The root service and native-messaging host are still required; the
+browser extension alone is not a complete installation. Build the Version 1.9
+upload archive from the repository root:
+
+```bash
+python3 extension/build.py
+python3 scripts/package_chromium_extension.py
+```
+
+Upload the generated ZIP from `dist/` through the Chrome Developer Dashboard,
+choose **Unlisted** for link-only distribution, and install the resulting Web
+Store item URL in Chrome. Verify the Dashboard Item ID matches the ID
+documented in `CHROMEWEBSTORE.md` before publishing. The full permission,
+privacy, identity, and update procedure is in `CHROMEWEBSTORE.md`.
+
+The native host is installed with the normal service installer:
+
+```bash
+sudo python3 scripts/install.py --confirm --owner-uid "$(id -u)"
+```
+
+Do not use **Load unpacked** as the production installation method.
+
 
 
 Open **Distraction Blocker** from the Ubuntu application menu. You can also run the installed GUI directly:

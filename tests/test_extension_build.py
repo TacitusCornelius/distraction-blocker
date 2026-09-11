@@ -123,5 +123,29 @@ class ExtensionCoreSyncTests(unittest.TestCase):
                     self.assertIn(png_bit_depth, (8, 16))
                     self.assertEqual(png_color_type, 6)
 
+    def test_webstore_archive_omits_development_key(self):
+        import json
+        import tempfile
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "extension.zip"
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(self.root / "scripts" / "package_chromium_extension.py"),
+                    "--output",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(self.root),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with zipfile.ZipFile(output) as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+        self.assertEqual(manifest["version"], "1.9.0")
+        self.assertNotIn("key", manifest)
+
 if __name__ == "__main__":
     unittest.main()
