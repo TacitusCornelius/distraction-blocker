@@ -34,6 +34,10 @@ test("both adapters ship the same branded block page resources", () => {
     assert.match(page, /src="icons\/icon128\.png"/);
     assert.match(page, /Distraction Blocker prevented this page from loading/);
   }
+  const firefox_manifest = JSON.parse(
+    readFileSync(join(firefox, "manifest.json"), "utf8"),
+  );
+  assert.ok(firefox_manifest.web_accessible_resources?.includes("blocked.html"));
 });
 
 test("block page displays rule name and requested URL as text", () => {

@@ -28,6 +28,9 @@
     "idle",
     "<all_urls>"
   ],
+  "web_accessible_resources": [
+    "blocked.html"
+  ],
   "browser_action": {
     "default_title": "Distraction Blocker",
     "default_popup": "status.html",
