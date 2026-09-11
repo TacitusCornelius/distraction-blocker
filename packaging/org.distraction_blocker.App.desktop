@@ -4,5 +4,6 @@ Name=Distraction Blocker
 Comment=Manage website and application block schedules
 Exec=/usr/bin/env GSK_RENDERER=cairo /usr/bin/python3 -I /usr/lib/distraction-blocker/gui_entry.py gui
 Terminal=false
+Icon=org.distraction_blocker
 StartupNotify=true
 Categories=Utility;

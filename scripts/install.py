@@ -47,6 +47,12 @@ UNIT = Path("/etc/systemd/system/distraction-blocker.service")
 DESKTOP = Path("/usr/share/applications/org.distraction_blocker.App.desktop")
 TRAY_DESKTOP = Path("/usr/share/applications/org.distraction_blocker.Tray.desktop")
 TRAY_AUTOSTART_DESKTOP = Path("/etc/xdg/autostart/org.distraction_blocker.Tray.desktop")
+ICON_DIR = Path("/usr/share/icons/hicolor/scalable/apps")
+SYMBOLIC_ICON_DIR = Path("/usr/share/icons/hicolor/symbolic/apps")
+APP_ICON = ICON_DIR / "org.distraction_blocker.svg"
+SYMBOLIC_ICON = SYMBOLIC_ICON_DIR / "org.distraction_blocker-symbolic.svg"
+ICON_THEME_DIR = Path("/usr/share/icons/hicolor")
+ICON_CACHE_UPDATER = Path("/usr/bin/gtk-update-icon-cache")
 LEGACY_DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
 CLI_PATH = Path("/usr/local/bin/distraction-blocker")
 PACKAGE_NAME = "distraction_blocker"
@@ -60,6 +66,7 @@ SANDBOX_DROPIN_DIR = Path("/etc/systemd/system/distraction-blocker.service.d")
 SANDBOX_DROPIN = SANDBOX_DROPIN_DIR / "network.conf"
 DNSMASQ_MINIMUM_VERSION = (2, 86)
 NETWORK_ASSET_MARKER = "# distraction-blocker-network-owned-v1"
+ICON_ASSET_MARKER = "<!-- distraction-blocker-owned-v1 -->"
 
 
 def check_network_asset(path: Path) -> None:
@@ -72,6 +79,35 @@ def check_network_asset(path: Path) -> None:
         or path.read_bytes().splitlines()[:1] != [NETWORK_ASSET_MARKER.encode()]
     ):
         fail(f"refusing to replace an unowned network asset: {path}")
+
+def check_icon_asset(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    metadata = path.lstat()
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+        or ICON_ASSET_MARKER.encode() not in path.read_bytes().splitlines()[:2]
+    ):
+        fail(f"refusing to replace an unowned icon asset: {path}")
+
+
+def refresh_icon_cache() -> None:
+    if not ICON_CACHE_UPDATER.is_file() or not ICON_THEME_DIR.is_dir():
+        return
+    result = subprocess.run(
+        [
+            str(ICON_CACHE_UPDATER),
+            "--force",
+            "--ignore-theme-index",
+            str(ICON_THEME_DIR),
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        fail("the GTK icon cache could not be refreshed")
 
 def fail(message: str) -> NoReturn:
     print(f"Install refused: {message}", file=sys.stderr)
@@ -483,6 +519,8 @@ def install_files(
         LEGACY_DESKTOP.exists() and not LEGACY_DESKTOP.is_file()
     ):
         fail(f"the old desktop path is unsafe: {LEGACY_DESKTOP}")
+    check_icon_asset(APP_ICON)
+    check_icon_asset(SYMBOLIC_ICON)
     try:
         account = pwd.getpwuid(owner_uid)
     except KeyError:
@@ -575,6 +613,17 @@ def install_files(
                 "org.distraction_blocker.Tray.desktop",
                 TRAY_AUTOSTART_DESKTOP,
             )
+            copy_asset(
+                packaging_fd,
+                "org.distraction_blocker.svg",
+                APP_ICON,
+            )
+            copy_asset(
+                packaging_fd,
+                "org.distraction_blocker-symbolic.svg",
+                SYMBOLIC_ICON,
+            )
+            refresh_icon_cache()
             copy_asset(
                 packaging_fd,
                 "host_entry.py",

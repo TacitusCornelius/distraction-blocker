@@ -66,6 +66,11 @@ TRAY_AUTOSTART_DESKTOP = Path("/etc/xdg/autostart/org.distraction_blocker.Tray.d
 DESKTOP = Path("/usr/share/applications/org.distraction_blocker.App.desktop")
 TRAY_DESKTOP = Path("/usr/share/applications/org.distraction_blocker.Tray.desktop")
 LEGACY_DESKTOP = Path("/usr/share/applications/distraction-blocker.desktop")
+APP_ICON = Path("/usr/share/icons/hicolor/scalable/apps/org.distraction_blocker.svg")
+SYMBOLIC_ICON = Path(
+    "/usr/share/icons/hicolor/symbolic/apps/org.distraction_blocker-symbolic.svg"
+)
+ICON_ASSET_MARKER = b"<!-- distraction-blocker-owned-v1 -->"
 CLI_PATH = Path("/usr/local/bin/distraction-blocker")
 # would keep the state directory alive after uninstall because rmdir only
 # removes an empty directory.
@@ -309,6 +314,26 @@ def remove_cli() -> None:
     CLI_PATH.unlink()
 
 
+def remove_owned_icon(path: Path) -> None:
+    if path.is_symlink():
+        fail(f"refusing to remove a symlink at {path}")
+    if not path.exists():
+        return
+    metadata = path.lstat()
+    try:
+        owned = (
+            path.is_file()
+            and metadata.st_uid == 0
+            and not metadata.st_mode & 0o022
+            and ICON_ASSET_MARKER in path.read_bytes().splitlines()[:2]
+        )
+    except (OSError, UnicodeError):
+        owned = False
+    if not owned:
+        fail(f"refusing to remove an unrelated icon asset: {path}")
+    path.unlink()
+
+
 def remove_native_manifests() -> None:
     for path in (*NATIVE_MANIFESTS, *LEGACY_NATIVE_MANIFESTS):
         _remove_manifest(path)
@@ -357,6 +382,8 @@ def main() -> int:
         clear_hosts()
         network_teardown()
         remove_cli()
+        remove_owned_icon(APP_ICON)
+        remove_owned_icon(SYMBOLIC_ICON)
         for path in (
             UNIT,
             DESKTOP,

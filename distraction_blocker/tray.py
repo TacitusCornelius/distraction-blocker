@@ -50,7 +50,9 @@ def run_tray(
     """Run the tray menu until the user selects Quit."""
     Gtk, AppIndicator = _load_modules()
     indicator = AppIndicator.Indicator.new(
-        "distraction-blocker", "preferences-system-privacy", AppIndicator.IndicatorStatus.ACTIVE
+        "distraction-blocker",
+        "org.distraction_blocker-symbolic",
+        AppIndicator.IndicatorStatus.ACTIVE,
     )
     menu = Gtk.Menu()
     status_item = Gtk.MenuItem(label="Service: loading")

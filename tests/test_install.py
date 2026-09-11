@@ -555,6 +555,8 @@ class UninstallManifestTests(unittest.TestCase):
                     root / "tray-autostart",
                 ),
                 patch.object(uninstall, "LEGACY_DESKTOP", root / "legacy-desktop"),
+                patch.object(uninstall, "APP_ICON", root / "app-icon"),
+                patch.object(uninstall, "SYMBOLIC_ICON", root / "symbolic-icon"),
                 patch.object(uninstall, "PREFIX", root / "prefix"),
                 patch.object(uninstall, "RUN", root / "run"),
                 patch.object(uninstall, "STATE", root / "state"),

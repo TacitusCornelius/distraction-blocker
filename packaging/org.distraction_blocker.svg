@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- distraction-blocker-owned-v1 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Distraction Blocker</title>
+  <desc id="desc">A blue shield containing a white pause mark.</desc>
+  <path fill="#172554" d="M64 8 112 25v34c0 29-18 48-48 61C34 107 16 88 16 59V25L64 8Z"/>
+  <path fill="#3B82F6" d="M64 17 103 31v28c0 23-13 39-39 51C38 98 25 82 25 59V31l39-14Z"/>
+  <path fill="#EFF6FF" d="M49 42h11v43H49zM68 42h11v43H68z"/>
+  <path fill="#BFDBFE" d="M49 42h11v5H49zM68 42h11v5H68z"/>
+</svg>
