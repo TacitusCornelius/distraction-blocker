@@ -72,26 +72,19 @@ The GUI can search rule names and targets. It can filter rules by all, active, i
 
 The Block List importer accepts the JSON block mapping used by `.blocklist.json`
 exports. It strictly parses the JSON and never repairs truncated or malformed
-files.
+files. Its current compatibility contract is defined in
+[Version 1.5](#version-15--block-list-import-fidelity) below.
 
-The importer creates disabled Distraction Blocker rules from exact hostnames
-and representable weekly schedules. The import time zone is explicit because
-Block List exports do not carry an IANA time-zone name. Every wildcard,
-URL-path, exception, application, unsupported lock/break setting, and
-unrepresentable schedule period is reported in the preview.
+The importer creates disabled Distraction Blocker rules from representable
+targets and weekly schedules. The import time zone is explicit because Cold
+Turkey exports do not carry an IANA time-zone name. Unsupported or ambiguous
+URL forms, user targeting, window-title rules, unmapped applications, lock and
+break settings, and unrepresentable schedule periods remain visible as
+categorized preview issues rather than being silently discarded.
 
-The current service cannot reproduce these Block List features:
-
-- URL-path rules.
-- Wildcard URL rules.
-- Whole-internet rules.
-- Website exceptions.
-- Windows application identifiers.
-- Window-title rules.
-- Allowances, breaks, and delay locks.
-
-The importer intentionally leaves those entries out rather than weakening the
-Distraction Blocker policy model.
+The importer never infers Linux paths, user scope, or lock strength. Whole
+internet imports require the separately installed network controls, and
+application or lock/break mappings require explicit user-supplied files.
 
 
 ## Version 1.2
@@ -383,6 +376,167 @@ These contracts define the Version 1.4 behavior. Any change to target scope,
 overlap handling, break scope, clock behavior, or allowance accounting requires
 updating this contract before source changes.
 
+
+## Version 1.5 — Block List import fidelity
+
+Version 1.5 expands Block List migration without silently weakening the
+imported policy. The importer remains capability-based and loss-aware: every
+source entry ends in exactly one of these outcomes:
+
+- an equivalent Distraction Blocker target or rule;
+- an explicit unsupported issue; or
+- an explicit user-supplied mapping.
+
+No parser path may silently discard a source setting.
+
+### Import contract
+
+`BlockListIssue` and the preview contract gain stable issue categories:
+
+- `format`;
+- `target`;
+- `schedule`;
+- `lock`;
+- `break`;
+- `application`;
+- `user_scope`; and
+- `policy_capability`.
+
+Each issue retains the source JSON path and source text. The CLI preview
+reports accepted, transformed, unsupported, and duplicate counts. `--apply`
+validates and stages the complete import atomically. Imported rules remain
+disabled unless `--enable` is supplied.
+
+The importer reuses `Target.from_dict` and `Rule` validation; it does not
+introduce a parallel target schema. The compatibility matrix is:
+
+| Block List entry | Automatic result |
+| --- | --- |
+| Exact hostname | `website` target |
+| Exact `host/path` | `url_path` target |
+| Importer's bounded trailing-star form | `url_wildcard` target |
+| Recognized keyword form | `url_keyword` target |
+| Recognized YouTube video or channel form | Existing YouTube target kind |
+| URL exceptions | `Rule.exceptions`, only when every exception is URL-level |
+| Canonical whole-internet entry | Closed `network` target value `whole_internet`, subject to capability check |
+| Any other wildcard, path, exception, application, lock, break, user, or unknown form | Explicit issue retaining its source path and text |
+
+The canonical whole-internet entry is recognized only as the closed `network`
+target value `whole_internet`. The preview marks it as requiring separately
+installed network controls, and application is refused with a specific
+`policy_capability` issue when the protected-user network opt-in is
+unavailable. An arbitrary wildcard is never translated into whole-internet
+blocking.
+
+### Exact schedules and assisted migration
+
+Schedule conversion remains exact. Continuous schedules and representable
+weekly periods continue to require an explicit IANA time zone. New parser
+branches and fixtures are added only for verified Block List schedule
+encodings. A source period may be split only when the resulting weekly
+periods are provably equivalent; otherwise the source path is retained as an
+unrepresentable-schedule issue rather than shortening, extending, or guessing
+the period.
+
+Settings that cannot be inferred safely use a second, explicitly assisted
+migration phase. A user-provided mapping file maps Block List application
+identifiers to absolute Linux executable paths. Missing, invalid, duplicate,
+or conflicting mappings remain preview issues. Linux paths, user scope, and
+lock strength are never inferred from names. Lock and break settings enter
+the review flow and map only to an existing equivalent lock or allowance
+contract.
+
+Block List user targeting remains outside automatic import while the
+one-owner policy boundary and unresolved multi-user decisions remain in force.
+The preview states that such entries were not imported and links to
+[`MULTI-USER-RESEARCH.md`](MULTI-USER-RESEARCH.md). The compatibility examples
+and the [official Block List user guide](https://)
+remain part of this contract.
+
+## Version 1.6 — Local DNS hostname backend
+
+Version 1.6 defines an opt-in local DNS backend for protected-user hostname
+enforcement. `local_dns` is a new closed network-control token, not an
+arbitrary firewall or resolver-configuration input. It uses the existing
+installer risk acknowledgement and is not required for existing `/etc/hosts`
+operation.
+
+### Resolver ownership and semantics
+
+The dedicated resolver is generalized rather than duplicated. It reuses
+`NetworkEnforcer`'s owned `dnsmasq` unit, resolver-configuration ownership
+marker, loopback listeners (`127.0.0.54` and `::1` on port `1053`), upstream
+`127.0.0.53`, SafeSearch mappings, resolver health probes, drift repair, and
+fail-closed fence behavior.
+
+The resolver projection has these exact semantics:
+
+- Active exact `website` targets and expanded managed-list domains are locally
+  authoritative and return the same deterministic sink result for A and AAAA
+  lookups.
+- Non-blocked names forward through the trusted systemd-resolved stub.
+- SafeSearch source names continue to return only their enforced A records;
+  unfiltered AAAA, SVCB, and HTTPS answers are not exposed.
+- URL paths, keywords, browser exceptions, and application paths remain
+  outside DNS and continue through their existing enforcement layers.
+
+Selecting `local_dns` contributes both loopback port-53 redirection to the
+owned resolver and non-local TCP/UDP port-53 and 853 restrictions. Known-DoH,
+proxy, and VPN controls remain additive and independently selectable.
+Arbitrary encrypted DNS and tunnels remain outside the guarantee.
+
+### Reconciliation, rollback, and product integration
+
+The service reconciliation boundary supplies the active website and
+managed-list projection to the resolver before installing a new redirect. It
+generates the complete owned configuration atomically, validates it with the
+installed `dnsmasq`, restarts only the owned unit after a changed
+configuration, and health-probes blocked, allowed, SafeSearch, A, AAAA, SVCB,
+and HTTPS behavior before reporting healthy. A generation or health failure
+leaves the stronger existing state in place or installs the protected-user
+whole-internet fence; it never exposes a partially generated blocklist.
+
+`/etc/hosts` remains the default backend and rollback path until disposable-VM
+acceptance proves parity for exact-hostname blocks, managed-list updates,
+schedule transitions, resolver cache and TTL behavior, service restart,
+boot-fence recovery, and uninstall. The implementation does not modify
+`/etc/resolv.conf`, global `systemd-resolved` configuration, foreign nftables
+tables, or foreign resolver assets.
+
+When the backend is enabled, the GUI, CLI status and validation, native policy
+schema migration, installer dependency checks, packaging ownership markers,
+uninstall/recovery, and network acceptance documentation are updated as one
+clean cutover. Network targets remain rejected unless the network opt-in is
+available; owned assets are removed only after successful recovery.
+
+**Protected-UID boundary:** enforcement is for the configured protected UID.
+Root, other UIDs, applications that bypass the configured resolver path,
+cached answers, arbitrary DoH, proxies, VPNs, and direct-address traffic are
+not covered. This contract promises neither machine-wide DNS enforcement nor
+exhaustive SafeSearch.
+
+## Dependency and release order
+
+The two tracks share a strict release order:
+
+1. Land Block List URL-target mappings only after the existing model, service
+   projection, native-messaging/browser adapters, and both browser conformance
+   suites remain on one schema contract. The extension's existing
+   `url_path`, `url_wildcard`, `url_keyword`, YouTube, and exception support is
+   the reusable implementation seam.
+2. Land whole-internet import recognition only after the `whole_internet`
+   network target can be capability-checked through the service and the
+   installer's explicit network opt-in. Import must not create a policy the
+   host cannot enforce.
+3. Land the local DNS backend only after the existing SafeSearch resolver and
+   nftables ownership/recovery contract. Keep `/etc/hosts` through the full
+   disposable-VM matrix; only after it passes may local DNS become the
+   recommended backend for large managed lists.
+
+Timed elapsed allowances remain browser-only. They are not attached to DNS or
+mixed-target rules unless a later contract defines a trustworthy DNS usage
+signal. Multi-user private-policy work remains blocked on the written
+decisions in [`MULTI-USER-RESEARCH.md`](MULTI-USER-RESEARCH.md).
 
 ## Sources
 

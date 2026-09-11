@@ -1573,6 +1573,58 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(committed["ok"])
         self.assertEqual(store.policy.rules, (existing, imported))
 
+    def test_rule_import_commits_explicit_review_lock_atomically(self):
+        existing = Rule.from_dict({
+            "id": "32345678-1234-5678-1234-567812345678",
+            "name": "Existing",
+            "enabled": False,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        imported = Rule.from_dict({
+            "id": "42345678-1234-5678-1234-567812345678",
+            "name": "Reviewed",
+            "enabled": False,
+            "targets": [{"kind": "website", "value": "example.net"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        service = BlockerService(
+            FakeStore(Policy(0, (existing,))),
+            FakeClock(),
+            FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        begun = service.dispatch(1000, {
+            "command": "begin_rule_import",
+            "locks": [{
+                "rule_id": imported.id,
+                "kind": "delay",
+                "wait_seconds": 60,
+                "break_seconds": 120,
+            }],
+        })
+        import_id = begun["result"]["import_id"]
+        self.assertTrue(service.dispatch(
+            1000,
+            {
+                "command": "import_rule_chunk",
+                "import_id": import_id,
+                "rules": [imported.to_dict()],
+            },
+        )["ok"])
+        committed = service.dispatch(
+            1000,
+            {"command": "commit_rule_import", "import_id": import_id},
+        )
+        self.assertTrue(committed["ok"])
+        self.assertEqual(service.controls.lock_for(imported.id).kind, "delay")
+        self.assertEqual(
+            service.controls.lock_for(imported.id).break_seconds, 120
+        )
+
 def closed_weekly_rule(rule_id="12345678-1234-5678-1234-567812345678", **extra):
     """A weekly rule that is CLOSED at the FakeClock default instant."""
     # Breadcrumb: 2026-01-01 is a Thursday, so a Monday-only period keeps

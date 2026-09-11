@@ -1174,7 +1174,12 @@ class BlockerService:
             result.update(self._referencing_rule_ids(old_list.id))
         return result
 
-    def _replace_rules(self, uid: int, raw_rules: Any) -> dict[str, Any]:
+    def _replace_rules(
+        self,
+        uid: int,
+        raw_rules: Any,
+        imported_locks: Any = (),
+    ) -> dict[str, Any]:
         if not isinstance(raw_rules, list):
             raise ValidationError("bad_type", "rules must be a list")
         if self.policy is None:
@@ -1192,13 +1197,40 @@ class BlockerService:
             return reason
         grant_ids = self._replacement_grant_ids(imported)
         remaining_ids = {rule.id for rule in imported.rules}
+        old_ids = {rule.id for rule in self.policy.rules}
         controls = self.controls.with_locks([
             lock for lock in self.controls.locks
             if lock.rule_id in remaining_ids
         ])
+        if imported_locks:
+            if not isinstance(imported_locks, list):
+                raise ValidationError("bad_type", "import locks must be a list")
+            imported_lock_values: list[RuleLock] = []
+            for raw_lock in imported_locks:
+                try:
+                    lock = RuleLock.from_dict(raw_lock)
+                except (ControlError, TypeError, ValueError) as error:
+                    raise ValidationError("bad_value", str(error)) from error
+                if lock.rule_id not in remaining_ids or lock.rule_id in old_ids:
+                    raise ValidationError(
+                        "bad_value",
+                        "import lock must refer to a new imported rule",
+                    )
+                imported_lock_values.append(lock)
+            if len({
+                lock.rule_id for lock in imported_lock_values
+            }) != len(imported_lock_values):
+                raise ValidationError(
+                    "bad_value", "import locks must have unique rule IDs"
+                )
+            controls = controls.with_locks([
+                *controls.locks,
+                *imported_lock_values,
+            ])
         self._finalize_weakening(imported, uid, grant_ids, controls)
         return self._ok({
             "imported": len(imported.rules),
+            "locks": len(imported_locks) if isinstance(imported_locks, list) else 0,
             "policy_revision": self.policy.revision,
         })
     def _expire_staged(self) -> None:
@@ -1755,7 +1787,6 @@ class BlockerService:
                 schedule_active=rule_id in self._schedule_active_rule_ids(now, trusted),
             )
         )
-
     # Command dispatch table. Each entry maps a command name to the allowed
     # request field sets, the exact bad_request message used when the fields
     # do not match, and the handler owning the command body.
@@ -1787,7 +1818,7 @@ class BlockerService:
         "import_list_chunk": ((frozenset({"command", "import_id", "domains"}),), "import_id and domains are required", "_cmd_import_list_chunk"),
         "commit_list_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_commit_list_import"),
         "cancel_list_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_cancel_list_import"),
-        "begin_rule_import": ((frozenset({"command"}),), "unknown command field", "_cmd_begin_rule_import"),
+        "begin_rule_import": ((frozenset({"command"}), frozenset({"command", "locks"})), "unknown command field", "_cmd_begin_rule_import"),
         "import_rule_chunk": ((frozenset({"command", "import_id", "rules"}),), "import_id and rules are required", "_cmd_import_rule_chunk"),
         "commit_rule_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_commit_rule_import"),
         "cancel_rule_import": ((frozenset({"command", "import_id"}),), "import_id is required", "_cmd_cancel_rule_import"),
@@ -2066,7 +2097,21 @@ class BlockerService:
 
     def _cmd_status(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         websites, applications, network, _ = self._active_targets()
-        return self._ok({"healthy": self.healthy, "clock_trusted": bool(getattr(self.clock, "trusted", True)), "clock_reason": str(getattr(self.clock, "reason", "")), "active_counts": {"website": len(websites), "application": len(applications), "network": len(network)}})
+        network_available = (
+            self.network is not None
+            and bool(getattr(self.network, "available", False))
+        )
+        return self._ok({
+            "healthy": self.healthy,
+            "clock_trusted": bool(getattr(self.clock, "trusted", True)),
+            "clock_reason": str(getattr(self.clock, "reason", "")),
+            "network_available": network_available,
+            "active_counts": {
+                "website": len(websites),
+                "application": len(applications),
+                "network": len(network),
+            },
+        })
 
     def _cmd_start_focus(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         return self._start_focus(
@@ -2492,14 +2537,20 @@ class BlockerService:
         if not isinstance(domains, list) or not domains or len(domains) > self._CHUNK_SIZE:
             return self._error("bad_request", "list chunks need 1 to 200 domains")
         try:
-            candidate = ManagedList.from_dict({**stage["metadata"], "domains": stage["domains"] + domains})
+            candidate = ManagedList.from_dict({
+                **stage["metadata"],
+                "domains": stage["domains"] + domains,
+            })
             size = sum(len(domain.encode("utf-8")) for domain in candidate.domains)
             if size > self._MAX_LIST_IMPORT_BYTES:
                 return self._error("too_large", "list import is too large")
             stage["domains"] = list(candidate.domains)
         except ValidationError as error:
             return self._error(error.code, error.message)
-        return self._ok({"import_id": request["import_id"], "received": len(stage["domains"])})
+        return self._ok({
+            "import_id": request["import_id"],
+            "received": len(stage["domains"]),
+        })
 
     def _cmd_commit_list_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         return self._commit_list(uid, request.get("import_id"))
@@ -2510,18 +2561,22 @@ class BlockerService:
             return self._error("not_found", "staged list was not found")
         del self._staged_lists[request["import_id"]]
         return self._ok({"cancelled": True})
+
     def _cmd_begin_rule_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         if self._staged_count() >= self._MAX_STAGED:
             return self._error("busy", "too many staged imports")
+        locks = request.get("locks", [])
+        if not isinstance(locks, list):
+            return self._error("bad_request", "import locks must be a list")
         token = str(uuid.uuid4())
         self._staged_rules[token] = {
             "owner": uid,
             "expires": time.monotonic() + self._STAGE_SECONDS,
             "rules": [],
-            "bytes": 0,
+            "locks": locks,
+            "bytes": len(json.dumps(locks, separators=(",", ":")).encode("utf-8")),
         }
         return self._ok({"import_id": token, "expires_in": self._STAGE_SECONDS})
-
     def _cmd_import_rule_chunk(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         stage = self._stage(self._staged_rules, uid, request.get("import_id"))
         raw_rules = request.get("rules")
@@ -2542,7 +2597,10 @@ class BlockerService:
             return self._error("too_large", "rule import is too large")
         stage["rules"].extend(normalized)
         stage["bytes"] = size
-        return self._ok({"import_id": request["import_id"], "received": len(stage["rules"])})
+        return self._ok({
+            "import_id": request["import_id"],
+            "received": len(stage["rules"]),
+        })
 
     def _cmd_commit_rule_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
         stage = self._stage(self._staged_rules, uid, request.get("import_id"))
@@ -2554,6 +2612,7 @@ class BlockerService:
             result = self._replace_rules(
                 uid,
                 [rule.to_dict() for rule in self.policy.rules] + stage["rules"],
+                stage.get("locks", []),
             )
         except ValidationError as error:
             return self._error(error.code, error.message)

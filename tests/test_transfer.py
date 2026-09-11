@@ -7,7 +7,7 @@ import stat
 import tempfile
 import unittest
 
-from distraction_blocker.model import ManagedList, Policy, Rule
+from distraction_blocker.model import ManagedList, Policy, Rule, Target
 from distraction_blocker.transfer import (
     TransferError,
     atomic_write_text,
@@ -15,8 +15,10 @@ from distraction_blocker.transfer import (
     native_export_text,
     parse_domain_text,
     parse_native_export,
+    parse_target_list_text,
     read_import_text,
     read_native_text,
+    target_list_export_text,
 )
 
 RULE_ID = "12345678-1234-5678-1234-567812345678"
@@ -106,6 +108,60 @@ class ExportTests(unittest.TestCase):
         policy = Policy(0, (rule,))
         text = native_export_text(policy, datetime(2026, 8, 13, 12, tzinfo=timezone.utc))
         self.assertEqual(parse_native_export(text), policy)
+
+    def test_typed_target_export_round_trips_order_and_managed_snapshot(self):
+        targets = (
+            Target("website", "example.com"),
+            Target("url_wildcard", "example.com/private/*"),
+            Target("managed_list", LIST_ID),
+        )
+        text = target_list_export_text("targets", targets, (make_list(),))
+        preview = parse_target_list_text(text, expected_scope="targets")
+        self.assertEqual(preview.targets, targets)
+        self.assertEqual(preview.managed_lists, (make_list(),))
+        self.assertEqual(json.loads(text)["scope"], "targets")
+
+    def test_typed_exception_export_rejects_non_url_targets(self):
+        with self.assertRaisesRegex(TransferError, "URL-level"):
+            target_list_export_text(
+                "exceptions", (Target("website", "example.com"),)
+            )
+    def test_typed_target_export_requires_managed_snapshots(self):
+        with self.assertRaisesRegex(TransferError, "snapshots"):
+            target_list_export_text(
+                "targets", (Target("managed_list", LIST_ID),)
+            )
+    def test_typed_application_export_round_trips_paths(self):
+        targets = (
+            Target.from_dict(
+                {"kind": "application", "value": "/usr/bin/true"}
+            ),
+        )
+        preview = parse_target_list_text(
+            target_list_export_text("applications", targets),
+            expected_scope="applications",
+        )
+        self.assertEqual(preview.targets, targets)
+    def test_typed_target_export_canonicalizes_direct_targets(self):
+        preview = parse_target_list_text(
+            target_list_export_text(
+                "targets",
+                (Target("website", "EXAMPLE.COM"),),
+            )
+        )
+        self.assertEqual(preview.targets, (Target("website", "example.com"),))
+
+    def test_typed_target_parser_rejects_non_string_scope(self):
+        with self.assertRaisesRegex(TransferError, "scope is invalid"):
+            parse_target_list_text(json.dumps({
+                "format": "distraction-blocker-target-list",
+                "version": 1,
+                "scope": [],
+                "items": [],
+            }))
+
+
+
 
     def test_native_round_trip_keeps_network_targets(self):
         rule = Rule.from_dict({

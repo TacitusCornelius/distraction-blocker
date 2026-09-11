@@ -50,6 +50,7 @@ from .rpc import Client
 from .transfer import (
     BlockListImportPreview,
     ImportPreview,
+    TargetListPreview,
     TransferError,
     atomic_write_text,
     block_list_preview_text,
@@ -57,11 +58,14 @@ from .transfer import (
     native_export_text,
     parse_block_list_export,
     parse_domain_text,
+    parse_target_list_text,
     read_block_list_text,
     read_import_text,
     read_native_text,
+    read_target_list_text,
     parse_native_export,
     statistics_export_text,
+    target_list_export_text,
 )
 UTC = timezone.utc
 
@@ -273,8 +277,9 @@ class RuleForm:
     pomodoro_work_minutes: int = 25
     pomodoro_break_minutes: int = 5
     pomodoro_cycles: int = 4
-    # Breadcrumb: URL targets and exceptions share the same target grammar;
-    # exceptions are browser-only allows that override URL blocking.
+    # The editor presents website and URL targets in one pane while retaining
+    # their exact model kinds for service and browser enforcement.
+    target_entries: tuple[dict[str, str], ...] = ()
     url_targets: tuple[dict[str, str], ...] = ()
     url_exceptions: tuple[dict[str, str], ...] = ()
     # Breadcrumb: optional daily start budget; None means "no limit" and
@@ -504,29 +509,39 @@ def form_to_rule(
     if not name:
         raise FormError("Enter a rule name.")
     targets: list[Target] = []
-    for domain in form.websites:
-        if domain.strip():
+    if form.target_entries:
+        for entry in form.target_entries:
             try:
-                targets.append(Target.from_dict({"kind": "website", "value": domain.strip()}))
+                targets.append(Target.from_dict(entry))
             except ValidationError as error:
-                # Breadcrumb: the most common confusion is pasting a URL
-                # here; point the user at the URL rules section.
-                raise FormError(
-                    f"{domain.strip()} was rejected: websites accept bare"
-                    " hostnames only. Use the URL rules section for paths,"
-                    " wildcards, keywords, or YouTube targets."
-                ) from error
+                raise FormError(error.message) from error
+    else:
+        for domain in form.websites:
+            if domain.strip():
+                try:
+                    targets.append(Target.from_dict({
+                        "kind": "website", "value": domain.strip()
+                    }))
+                except ValidationError as error:
+                    raise FormError(
+                        f"{domain.strip()} was rejected: websites accept bare"
+                        " hostnames only."
+                    ) from error
+        for list_id in form.managed_list_ids:
+            if list_id.strip():
+                targets.append(
+                    Target.from_dict({
+                        "kind": "managed_list", "value": list_id.strip()
+                    })
+                )
+        for entry in form.url_targets:
+            if entry:
+                targets.append(Target.from_dict(entry))
     for path in form.applications:
         if path.strip():
-            targets.append(Target.from_dict({"kind": "application", "value": path.strip()}))
-    for list_id in form.managed_list_ids:
-        if list_id.strip():
-            targets.append(
-                Target.from_dict({"kind": "managed_list", "value": list_id.strip()})
-            )
-    for entry in form.url_targets:
-        if entry:
-            targets.append(Target.from_dict(entry))
+            targets.append(Target.from_dict({
+                "kind": "application", "value": path.strip()
+            }))
     exceptions: list[Target] = []
     for entry in form.url_exceptions:
         try:
@@ -694,9 +709,15 @@ def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
     network_controls = tuple(
         item["value"] for item in targets if item["kind"] == "network"
     )
+    target_entries = tuple(
+        {"kind": item["kind"], "value": item["value"]}
+        for item in targets
+        if item["kind"] not in {"application", "network"}
+    )
     time_allowance = rule.time_allowance
     return replace(
         form,
+        target_entries=target_entries,
         url_targets=url_targets,
         url_exceptions=url_exceptions,
         allowance_starts=rule.allowance_starts,
@@ -1461,8 +1482,21 @@ def snapshot_from_results(
     lock_items: Sequence[Mapping[str, object]],
 ) -> ServiceSnapshot:
     """Convert strict RPC results to GUI data."""
-    if set(status) != {"healthy", "clock_trusted", "clock_reason", "active_counts"}:
+    if set(status) not in (
+        {"healthy", "clock_trusted", "clock_reason", "active_counts"},
+        {
+            "healthy",
+            "clock_trusted",
+            "clock_reason",
+            "network_available",
+            "active_counts",
+        },
+    ):
         raise FormError("The service returned an invalid status.")
+    if "network_available" in status and not isinstance(
+        status["network_available"], bool
+    ):
+        raise FormError("The service returned an invalid network capability.")
     active = status["active_counts"]
     if (
         not isinstance(active, Mapping)
@@ -1479,7 +1513,9 @@ def snapshot_from_results(
         for count in (websites, applications, network)
     ) or network > len(NETWORK_CONTROLS):
         raise FormError("The service returned invalid active counts.")
-    if not isinstance(status["healthy"], bool) or not isinstance(status["clock_trusted"], bool):
+    if not isinstance(status["healthy"], bool) or not isinstance(
+        status["clock_trusted"], bool
+    ):
         raise FormError("The service returned an invalid status.")
     if not isinstance(status["clock_reason"], str):
         raise FormError("The service returned an invalid clock reason.")
@@ -2927,6 +2963,20 @@ class GuiController:
                 raise FormError("The service returned an incomplete managed list.")
             managed_lists.append(managed_list_from_domains(summary, domains))
         return tuple(managed_lists)
+    def _upload_managed_list_snapshots(
+        self,
+        managed_lists: Sequence[ManagedList],
+        completed: Callable[[str | None], None],
+    ) -> None:
+        def upload() -> None:
+            for managed_list in managed_lists:
+                self._upload_list(managed_list)
+
+        self._run_worker(
+            upload,
+            lambda _result: completed(None),
+            lambda error: completed(self._rpc_error(error)),
+        )
 
     def _export_done(self, filename: str) -> None:
         self.notice_label.set_text(f"Exported {filename}.")
@@ -3354,6 +3404,8 @@ class GuiController:
             () if self.snapshot is None else self.snapshot.managed_lists,
             self._save_form,
             initial_domains,
+            self._read_managed_lists,
+            self._upload_managed_list_snapshots,
         ).present()
 
     def open_rule_lock(
@@ -4352,8 +4404,16 @@ class RuleEditor:
             [RuleForm, Rule | None, Callable[[str | None], None]], None
         ],
         initial_domains: Sequence[str] = (),
+        read_managed_lists: Callable[
+            [Sequence[ManagedListSummary]], Sequence[ManagedList]
+        ] | None = None,
+        upload_managed_lists: Callable[
+            [Sequence[ManagedList], Callable[[str | None], None]], None
+        ] | None = None,
     ):
         self.Gtk, self.GLib = modules.Gtk, modules.GLib
+        self.read_managed_lists = read_managed_lists
+        self.upload_managed_lists = upload_managed_lists
         self.notifications_enabled_check: object | None = None
         self.notification_checks: dict[str, object] = {}
         if existing is not None:
@@ -4366,6 +4426,7 @@ class RuleEditor:
             tuple(managed_lists),
             save,
         )
+        self.target_entries: list[dict[str, str]] = []
         self.application_paths: list[str] = []
         self.url_targets: list[dict[str, str]] = []
         self.url_exceptions: list[dict[str, str]] = []
@@ -4440,89 +4501,27 @@ class RuleEditor:
         target_row = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
         )
-        target_heading = Gtk.Label(label="Targets")
+        target_heading = Gtk.Label(label="Block Targets")
         target_heading.add_css_class("heading")
         target_heading.set_xalign(0)
         target_heading.set_hexpand(True)
         target_row.append(target_heading)
-        import_button = Gtk.Button.new_with_mnemonic("_Import domains")
-        import_button.connect("clicked", lambda _button: self._choose_domain_import())
-        target_row.append(import_button)
-        outer.append(target_row)
-        self.website_view = Gtk.TextView()
-        self.website_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        website_scroller = Gtk.ScrolledWindow()
-        website_scroller.set_min_content_height(84)
-        website_scroller.set_child(self.website_view)
-        outer.append(
-            self._label_for("_Websites, one domain per line", self.website_view)
-        )
-        outer.append(website_scroller)
 
-        app_row = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
-        )
-        app_label = Gtk.Label(label="Applications")
-        app_label.set_xalign(0)
-        app_label.set_hexpand(True)
-        app_row.append(app_label)
-        choose = Gtk.Button.new_with_mnemonic("_Select executable")
-        choose.connect("clicked", lambda _button: self._choose_application())
-        app_row.append(choose)
-        outer.append(app_row)
-        self.application_list = Gtk.ListBox()
-        self.application_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        outer.append(self.application_list)
-
-        url_row = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
-        )
-        url_label = Gtk.Label(label="URL rules")
-        url_label.set_xalign(0)
-        url_label.set_hexpand(True)
-        url_row.append(url_label)
-        self.url_kind_dropdown = Gtk.DropDown.new_from_strings(
-            (
-                "Exact path",
-                "Wildcard path",
-                "Keyword",
-                "YouTube video",
-                "YouTube channel",
-            )
-        )
-        self.url_exception_check = Gtk.CheckButton(label="Add as exception")
-        self.url_exception_check.set_tooltip_text(
-            "Allow this URL when another URL target matches it."
-        )
-        url_row.append(self.url_exception_check)
-        outer.append(url_row)
-        self.url_entry = Gtk.Entry()
-        self.url_entry.set_hexpand(True)
-        self.url_entry.set_placeholder_text("example.com/path or keyword")
-        # Breadcrumb: Enter in this field adds the URL rule; submitting the
-        # whole form from here surprised testers.
-        self.url_entry.connect(
-            "activate", lambda _entry: self._add_url_target()
-        )
-        outer.append(self.url_entry)
-        self.url_add_button = Gtk.Button.new_with_mnemonic("Add _URL rule")
-        self.url_add_button.connect(
-            "clicked", lambda _button: self._add_url_target()
-        )
-        outer.append(self.url_add_button)
-        self.url_list = Gtk.ListBox()
-        self.url_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.url_list.add_css_class("boxed-list")
-        outer.append(self.url_list)
-
-        list_label = Gtk.Label(label="Managed lists")
-        list_label.set_xalign(0)
-        outer.append(list_label)
         self.managed_list_checks: dict[str, object] = {}
+        managed_button = Gtk.MenuButton()
+        managed_button.set_label("Add managed list")
+        managed_button.set_tooltip_text(
+            "Attach an existing managed list to this rule."
+        )
+        managed_popover = Gtk.Popover()
+        managed_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.COMPACT)
+        )
+        managed_box.set_margin_top(int(Space.SMALL))
+        managed_box.set_margin_bottom(int(Space.SMALL))
+        managed_box.set_margin_start(int(Space.SMALL))
+        managed_box.set_margin_end(int(Space.SMALL))
         if self.managed_lists:
-            list_box = Gtk.Box(
-                orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.COMPACT)
-            )
             for summary in self.managed_lists:
                 check = Gtk.CheckButton(
                     label=f"{summary.name} ({summary.domain_count} domains)"
@@ -4530,18 +4529,181 @@ class RuleEditor:
                 check.set_tooltip_text(
                     f"Source: {summary.source}. Version: {summary.version}."
                 )
-                check.connect("toggled", self._target_fields_changed)
-                list_box.append(check)
+                check.connect("toggled", self._managed_list_toggled)
+                managed_box.append(check)
                 self.managed_list_checks[summary.id] = check
-            outer.append(list_box)
         else:
             empty_lists = Gtk.Label(
                 label="Create or install a managed list from the main window."
             )
-            empty_lists.set_xalign(0)
             empty_lists.set_wrap(True)
+            empty_lists.set_xalign(0)
             empty_lists.add_css_class("dim-label")
-            outer.append(empty_lists)
+            managed_box.append(empty_lists)
+        managed_popover.set_child(managed_box)
+        managed_button.set_popover(managed_popover)
+        target_row.append(managed_button)
+
+        import_domains = Gtk.Button.new_with_mnemonic("Import _domains")
+        import_domains.connect(
+            "clicked", lambda _button: self._choose_domain_import()
+        )
+        target_row.append(import_domains)
+        import_json = Gtk.Button.new_with_mnemonic("Import _JSON")
+        import_json.connect(
+            "clicked",
+            lambda _button: self._choose_target_list_import(False),
+        )
+        target_row.append(import_json)
+        export_json = Gtk.Button.new_with_mnemonic("E_xport JSON")
+        export_json.connect(
+            "clicked", lambda _button: self._choose_target_export(False)
+        )
+        target_row.append(export_json)
+        outer.append(target_row)
+
+        self.target_kind_dropdown = Gtk.DropDown.new_from_strings(
+            (
+                "Auto-detect",
+                "Website",
+                "Exact path",
+                "Wildcard path",
+                "Keyword",
+                "YouTube video",
+                "YouTube channel",
+            )
+        )
+        self.target_entry = Gtk.Entry()
+        self.target_entry.set_hexpand(True)
+        self.target_entry.set_placeholder_text(
+            "example.com, example.com/path, or keyword"
+        )
+        self.target_entry.connect(
+            "activate", lambda _entry: self._add_target(False)
+        )
+        target_input = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
+        )
+        target_input.append(self.target_kind_dropdown)
+        target_input.append(self.target_entry)
+        add_target = Gtk.Button.new_with_mnemonic("Add _target")
+        add_target.connect(
+            "clicked", lambda _button: self._add_target(False)
+        )
+        target_input.append(add_target)
+        outer.append(target_input)
+        target_scroller = Gtk.ScrolledWindow()
+        target_scroller.set_min_content_height(120)
+        self.target_list = Gtk.ListBox()
+        self.target_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.target_list.add_css_class("boxed-list")
+        target_scroller.set_child(self.target_list)
+        outer.append(target_scroller)
+
+        exception_heading = Gtk.Label(label="Block Exceptions")
+        exception_heading.add_css_class("heading")
+        exception_heading.set_xalign(0)
+        outer.append(exception_heading)
+        exception_note = Gtk.Label(
+            label=(
+                "Browser exceptions only. These do not override website, "
+                "application, or network enforcement."
+            )
+        )
+        exception_note.set_xalign(0)
+        exception_note.set_wrap(True)
+        exception_note.add_css_class("dim-label")
+        outer.append(exception_note)
+        self.exception_kind_dropdown = Gtk.DropDown.new_from_strings(
+            (
+                "Auto-detect",
+                "Exact path",
+                "Wildcard path",
+                "Keyword",
+                "YouTube video",
+                "YouTube channel",
+            )
+        )
+        self.exception_entry = Gtk.Entry()
+        self.exception_entry.set_hexpand(True)
+        self.exception_entry.set_placeholder_text(
+            "example.com/allowed or keyword"
+        )
+        self.exception_entry.connect(
+            "activate", lambda _entry: self._add_target(True)
+        )
+        exception_input = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
+        )
+        exception_input.append(self.exception_kind_dropdown)
+        exception_input.append(self.exception_entry)
+        add_exception = Gtk.Button.new_with_mnemonic("Add e_xception")
+        add_exception.connect(
+            "clicked", lambda _button: self._add_target(True)
+        )
+        exception_input.append(add_exception)
+        outer.append(exception_input)
+        exception_actions = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
+        )
+        import_exception_json = Gtk.Button.new_with_mnemonic(
+            "Import _URL list"
+        )
+        import_exception_json.connect(
+            "clicked",
+            lambda _button: self._choose_target_list_import(True),
+        )
+        exception_actions.append(import_exception_json)
+        export_exception_json = Gtk.Button.new_with_mnemonic(
+            "E_xport JSON"
+        )
+        export_exception_json.connect(
+            "clicked", lambda _button: self._choose_target_export(True)
+        )
+        exception_actions.append(export_exception_json)
+        outer.append(exception_actions)
+        exception_scroller = Gtk.ScrolledWindow()
+        exception_scroller.set_min_content_height(100)
+        self.exception_list = Gtk.ListBox()
+        self.exception_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.exception_list.add_css_class("boxed-list")
+        exception_scroller.set_child(self.exception_list)
+        outer.append(exception_scroller)
+
+        app_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
+        )
+        app_label = Gtk.Label(label="Application Blocks")
+        app_label.set_xalign(0)
+        app_label.set_hexpand(True)
+        app_row.append(app_label)
+        choose = Gtk.Button.new_with_mnemonic("_Select executable")
+        choose.connect("clicked", lambda _button: self._choose_application())
+        app_row.append(choose)
+        import_app_json = Gtk.Button.new_with_mnemonic("Import _JSON")
+        import_app_json.connect(
+            "clicked", lambda _button: self._choose_application_import()
+        )
+        app_row.append(import_app_json)
+        export_app_json = Gtk.Button.new_with_mnemonic("E_xport JSON")
+        export_app_json.connect(
+            "clicked", lambda _button: self._choose_application_export()
+        )
+        app_row.append(export_app_json)
+        outer.append(app_row)
+        application_scroller = Gtk.ScrolledWindow()
+        application_scroller.set_min_content_height(80)
+        self.application_list = Gtk.ListBox()
+        self.application_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.application_list.add_css_class("boxed-list")
+        application_scroller.set_child(self.application_list)
+        outer.append(application_scroller)
+
+        # Compatibility aliases keep the pure URL-entry helper usable by
+        # callers that construct an editor without GTK widget setup.
+        self.url_entry = self.target_entry
+        self.url_kind_dropdown = self.target_kind_dropdown
+        self._render_targets()
         network_heading = Gtk.Label(label="Network controls")
         network_heading.set_xalign(0)
         outer.append(network_heading)
@@ -4812,12 +4974,28 @@ class RuleEditor:
             row.set_allowance_enabled(enabled)
         self._update_time_allowance_availability()
 
+    def _block_target_entries(self) -> tuple[dict[str, str], ...]:
+        if hasattr(self, "target_entries"):
+            return tuple(self.target_entries)
+        return tuple(
+            [
+                {"kind": "website", "value": domain}
+                for domain in self._website_lines()
+            ]
+            + list(self.url_targets)
+            + [
+                {"kind": "managed_list", "value": list_id}
+                for list_id, check in self.managed_list_checks.items()
+                if check.get_active()
+            ]
+        )
+
     def _timed_allowance_targets_eligible(self) -> bool:
-        return bool(self.url_targets) and not (
-            self._website_lines()
-            or self.application_paths
-            or any(check.get_active() for check in self.managed_list_checks.values())
-            or any(check.get_active() for check in self.network_checks.values())
+        entries = self._block_target_entries()
+        return bool(entries) and all(
+            entry.get("kind") in Target.URL_LIKE_KINDS for entry in entries
+        ) and not self.application_paths and not any(
+            check.get_active() for check in self.network_checks.values()
         )
 
     def _update_time_allowance_availability(self) -> None:
@@ -4989,93 +5167,198 @@ class RuleEditor:
         ),
     )
 
-    def _add_url_target(self) -> None:
-        kinds = self._URL_KINDS
-        selected = self.url_kind_dropdown.get_selected()
+    def _managed_list_toggled(self, check: object) -> None:
+        list_id = next(
+            (
+                identifier
+                for identifier, candidate in self.managed_list_checks.items()
+                if candidate is check
+            ),
+            None,
+        )
+        if list_id is None:
+            return
+        entry = {"kind": "managed_list", "value": list_id}
+        present = entry in self.target_entries
+        if check.get_active() and not present:
+            self.target_entries.append(entry)
+        elif not check.get_active() and present:
+            self.target_entries.remove(entry)
+        self._render_targets()
+        self._update_time_allowance_availability()
+
+    @staticmethod
+    def _classify_target(value: str, exception: bool) -> tuple[str, str]:
+        lowered = value.lower()
+        for prefix, kind in (
+            ("youtube-video:", "youtube_video"),
+            ("youtube-channel:", "youtube_channel"),
+        ):
+            if lowered.startswith(prefix):
+                return kind, value[len(prefix):].strip()
+        if "*" in value:
+            return "url_wildcard", value
+        if "/" in value:
+            return "url_path", value
+        if not exception:
+            try:
+                website = Target.from_dict(
+                    {"kind": "website", "value": value}
+                )
+            except ValidationError:
+                pass
+            else:
+                return website.kind, website.value
+        return "url_keyword", value
+
+    def _add_target(self, exception: bool) -> None:
+        if exception:
+            dropdown = self.exception_kind_dropdown
+            entry_widget = self.exception_entry
+            kinds = ("auto", *self._URL_KINDS)
+            target_list = self.url_exceptions
+        else:
+            dropdown = getattr(self, "target_kind_dropdown", None)
+            entry_widget = getattr(self, "target_entry", None)
+            kinds = ("auto", "website", *self._URL_KINDS)
+            target_list = getattr(self, "target_entries", self.url_targets)
+            if dropdown is None:
+                dropdown = self.url_kind_dropdown
+                entry_widget = self.url_entry
+                kinds = self._URL_KINDS
+        selected = dropdown.get_selected()
         kind = kinds[selected] if selected < len(kinds) else kinds[0]
-        value = self.url_entry.get_text().strip()
+        value = entry_widget.get_text().strip()
+        if kind == "auto":
+            kind, value = self._classify_target(value, exception)
         if not value:
-            self.error_label.set_text("Enter a URL rule first.")
+            self.error_label.set_text("Enter a target first.")
             return
         try:
             target = Target.from_dict({"kind": kind, "value": value})
         except ValidationError as error:
             self.error_label.set_text(error.message)
             return
-        entry = target.to_dict()
-        target_list = (
-            self.url_exceptions
-            if self.url_exception_check.get_active()
-            else self.url_targets
-        )
-        if entry in target_list:
-            self.error_label.set_text("That URL rule is already in the list.")
+        normalized = target.to_dict()
+        if normalized in target_list:
+            self.error_label.set_text("That target is already in the list.")
             return
-        target_list.append(entry)
-        self.url_entry.set_text("")
+        target_list.append(normalized)
+        entry_widget.set_text("")
         self.error_label.set_text("")
-        self._render_url_targets()
+        self._render_targets()
         self._update_time_allowance_availability()
 
-    def _render_url_targets(self) -> None:
-        Gtk = self.Gtk
-        child = self.url_list.get_first_child()
+    def _add_url_target(self) -> None:
+        check = getattr(self, "url_exception_check", None)
+        self._add_target(bool(check is not None and check.get_active()))
+
+    @staticmethod
+    def _clear_list(widget: object) -> None:
+        child = widget.get_first_child()
         while child is not None:
             next_child = child.get_next_sibling()
-            self.url_list.remove(child)
+            widget.remove(child)
             child = next_child
+
+    def _render_list(
+        self,
+        widget: object,
+        entries: Sequence[dict[str, str]],
+        *,
+        exception: bool = False,
+    ) -> None:
+        Gtk = self.Gtk
+        self._clear_list(widget)
         kind_labels = {
-            "url_path": "path",
-            "url_wildcard": "wildcard",
-            "url_keyword": "keyword",
+            "website": "Website",
+            "managed_list": "Managed list",
+            "network": "Network",
+            "url_path": "Path",
+            "url_wildcard": "Wildcard",
+            "url_keyword": "Keyword",
             "youtube_video": "YouTube video",
             "youtube_channel": "YouTube channel",
         }
-        for is_exception, entries in (
-            (False, self.url_targets),
-            (True, self.url_exceptions),
-        ):
-            for entry in entries:
-                row = Gtk.ListBoxRow()
-                box = Gtk.Box(
-                    orientation=Gtk.Orientation.HORIZONTAL,
-                    spacing=int(Space.SMALL),
-                )
-                for method in (
-                    box.set_margin_top,
-                    box.set_margin_bottom,
-                    box.set_margin_start,
-                    box.set_margin_end,
-                ):
-                    method(int(Space.COMPACT))
-                prefix = "exception " if is_exception else ""
-                label = Gtk.Label(
-                    label=f"[{prefix}{kind_labels[entry['kind']]}] "
-                    f"{entry['value']}"
-                )
-                label.set_xalign(0)
-                label.set_ellipsize(3)
-                label.set_hexpand(True)
-                box.append(label)
-                remove = Gtk.Button.new_with_mnemonic("_Remove")
-                remove.set_tooltip_text(f"Remove {entry['value']}")
-                remove.connect(
-                    "clicked",
-                    lambda _button, item=dict(entry), exception=is_exception:
-                    self._remove_url_target(item, exception),
-                )
-                box.append(remove)
-                row.set_child(box)
-                self.url_list.append(row)
+        managed_names = {
+            summary.id: summary.name for summary in self.managed_lists
+        }
+        for entry in entries:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL,
+                spacing=int(Space.SMALL),
+            )
+            for method in (
+                box.set_margin_top,
+                box.set_margin_bottom,
+                box.set_margin_start,
+                box.set_margin_end,
+            ):
+                method(int(Space.COMPACT))
+            value = entry["value"]
+            if entry["kind"] == "managed_list":
+                value = f"{managed_names.get(value, value)} ({value})"
+            prefix = "Exception: " if exception else ""
+            label = Gtk.Label(
+                label=f"{prefix}[{kind_labels.get(entry['kind'], entry['kind'])}] "
+                f"{value}"
+            )
+            label.set_xalign(0)
+            label.set_ellipsize(3)
+            label.set_hexpand(True)
+            box.append(label)
+            remove = Gtk.Button.new_with_mnemonic("_Remove")
+            remove.set_tooltip_text(f"Remove {entry['value']}")
+            remove.connect(
+                "clicked",
+                lambda _button, item=dict(entry), is_exception=exception:
+                self._remove_target(item, is_exception),
+            )
+            box.append(remove)
+            row.set_child(box)
+            widget.append(row)
+
+    def _render_targets(self) -> None:
+        if hasattr(self, "target_list"):
+            self._render_list(self.target_list, self.target_entries)
+            self._render_list(
+                self.exception_list, self.url_exceptions, exception=True
+            )
+            self._render_applications()
+            return
+        self._render_url_targets()
+
+    def _render_url_targets(self) -> None:
+        if hasattr(self, "target_list"):
+            self._render_targets()
+            return
+        self._render_list(self.url_list, self.url_targets)
+
+    def _remove_target(
+        self, entry: dict[str, str], exception: bool = False
+    ) -> None:
+        target_list = self.url_exceptions if exception else self.target_entries
+        if entry in target_list:
+            target_list.remove(entry)
+        if not exception and entry.get("kind") == "managed_list":
+            check = self.managed_list_checks.get(entry["value"])
+            if check is not None and check.get_active():
+                check.set_active(False)
+        self._render_targets()
+        self._update_time_allowance_availability()
 
     def _remove_url_target(
         self, entry: dict[str, str], exception: bool = False
     ) -> None:
-        target_list = self.url_exceptions if exception else self.url_targets
-        if entry in target_list:
-            target_list.remove(entry)
-        self._render_url_targets()
-        self._update_time_allowance_availability()
+        if not hasattr(self, "target_entries"):
+            target_list = self.url_exceptions if exception else self.url_targets
+            if entry in target_list:
+                target_list.remove(entry)
+            self._render_url_targets()
+            self._update_time_allowance_availability()
+            return
+        self._remove_target(entry, exception)
 
     def _choose_domain_import(self) -> None:
         Gtk = self.Gtk
@@ -5133,18 +5416,344 @@ class RuleEditor:
             dialog.destroy()
             if response != Gtk.ResponseType.ACCEPT:
                 return
-            combined = tuple(
-                dict.fromkeys((*self._website_lines(), *preview.domains))
+            self._set_website_lines(
+                (*self._website_lines(), *preview.domains)
             )
-            self._set_website_lines(combined)
         dialog.connect("response", respond)
         dialog.present()
 
+    def _choose_target_list_import(self, exception: bool) -> None:
+        Gtk = self.Gtk
+        chooser = Gtk.FileChooserNative.new(
+            "Import URL list" if exception else "Import target list",
+            self.window,
+            Gtk.FileChooserAction.OPEN,
+            "_Open",
+            "_Cancel",
+        )
+
+        def respond(dialog: object, response: int) -> None:
+            if response != Gtk.ResponseType.ACCEPT:
+                dialog.destroy()
+                return
+            selected = dialog.get_file()
+            path = selected.get_path() if selected is not None else None
+            dialog.destroy()
+            if path is None:
+                self.error_label.set_text("Select a local JSON file.")
+                return
+
+            def read_preview() -> TargetListPreview:
+                preview = parse_target_list_text(
+                    read_target_list_text(path),
+                    expected_scope="exceptions" if exception else "targets",
+                )
+                if not preview.targets:
+                    raise TransferError("The target list contains no entries.")
+                return preview
+
+            self._run_worker(
+                read_preview,
+                lambda preview: self._confirm_target_list_import(
+                    preview, Path(path).name, exception
+                ),
+            )
+        chooser.connect("response", respond)
+        chooser.show()
+
+    @staticmethod
+    def _missing_managed_snapshots(
+        preview: TargetListPreview,
+        available_ids: set[str],
+    ) -> tuple[ManagedList, ...]:
+        return tuple(
+            managed
+            for managed in preview.managed_lists
+            if managed.id not in available_ids
+        )
+
+    def _confirm_target_list_import(
+        self,
+        preview: TargetListPreview,
+        filename: str,
+        exception: bool,
+    ) -> None:
+        Gtk = self.Gtk
+        available_ids = {summary.id for summary in self.managed_lists}
+        missing_snapshots = (
+            self._missing_managed_snapshots(preview, available_ids)
+            if not exception
+            else ()
+        )
+        secondary = (
+            f"{len(preview.targets)} typed entries will be added. "
+            "Existing entries are kept."
+        )
+        if missing_snapshots:
+            secondary += (
+                f" {len(missing_snapshots)} managed-list snapshot(s) "
+                "will also be installed."
+            )
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"Add entries from {filename}?",
+            secondary_text=secondary,
+        )
+        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("_Add", Gtk.ResponseType.ACCEPT)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+
+        def append_targets() -> None:
+            target_list = (
+                self.url_exceptions if exception else self.target_entries
+            )
+            for target in preview.targets:
+                entry = target.to_dict()
+                if entry not in target_list:
+                    target_list.append(entry)
+            self._render_targets()
+            self._update_time_allowance_availability()
+
+        def respond(_dialog: object, response: int) -> None:
+            dialog.destroy()
+            if response != Gtk.ResponseType.ACCEPT:
+                return
+            if not missing_snapshots:
+                append_targets()
+                return
+            upload = getattr(self, "upload_managed_lists", None)
+            if upload is None:
+                self.error_label.set_text(
+                    "Managed-list snapshots cannot be installed here."
+                )
+                return
+            self.error_label.set_text("Installing managed-list snapshots.")
+            upload(
+                missing_snapshots,
+                lambda error: (
+                    self.error_label.set_text(error)
+                    if error is not None
+                    else append_targets()
+                ),
+            )
+        dialog.connect("response", respond)
+        dialog.present()
+
+    def _choose_target_export(self, exception: bool) -> None:
+        Gtk = self.Gtk
+        chooser = Gtk.FileChooserNative.new(
+            "Export exceptions" if exception else "Export block targets",
+            self.window,
+            Gtk.FileChooserAction.SAVE,
+            "_Save",
+            "_Cancel",
+        )
+        chooser.set_current_name(
+            "exceptions.json" if exception else "targets.json"
+        )
+
+        def respond(dialog: object, response: int) -> None:
+            if response != Gtk.ResponseType.ACCEPT:
+                dialog.destroy()
+                return
+            selected = dialog.get_file()
+            path = selected.get_path() if selected is not None else None
+            dialog.destroy()
+            if path is None:
+                self.error_label.set_text("Select a local export path.")
+                return
+            entries = self.url_exceptions if exception else self.target_entries
+            try:
+                targets = tuple(Target.from_dict(entry) for entry in entries)
+            except ValidationError as error:
+                self.error_label.set_text(error.message)
+                return
+            selected_ids = {
+                target.value for target in targets if target.kind == "managed_list"
+            }
+            summaries = tuple(
+                summary
+                for summary in self.managed_lists
+                if summary.id in selected_ids
+            )
+            if selected_ids and self.read_managed_lists is None:
+                self.error_label.set_text(
+                    "Managed-list contents are unavailable for export."
+                )
+                return
+            if selected_ids:
+                self._run_worker(
+                    lambda: self.read_managed_lists(summaries),
+                    lambda managed: self._write_target_export(
+                        path, exception, targets, managed
+                    ),
+                )
+            else:
+                self._write_target_export(path, exception, targets, ())
+        chooser.connect("response", respond)
+        chooser.show()
+
+    def _write_target_export(
+        self,
+        path: str,
+        exception: bool,
+        targets: Sequence[Target],
+        managed_lists: Sequence[ManagedList],
+    ) -> None:
+        try:
+            content = target_list_export_text(
+                "exceptions" if exception else "targets",
+                targets,
+                managed_lists,
+            )
+            atomic_write_text(path, content)
+        except (TransferError, OSError) as error:
+            self.error_label.set_text(str(error))
+            return
+        self.error_label.set_text(f"Exported {Path(path).name}.")
+    def _choose_application_import(self) -> None:
+        Gtk = self.Gtk
+        chooser = Gtk.FileChooserNative.new(
+            "Import application list",
+            self.window,
+            Gtk.FileChooserAction.OPEN,
+            "_Open",
+            "_Cancel",
+        )
+
+        def respond(dialog: object, response: int) -> None:
+            if response != Gtk.ResponseType.ACCEPT:
+                dialog.destroy()
+                return
+            selected = dialog.get_file()
+            path = selected.get_path() if selected is not None else None
+            dialog.destroy()
+            if path is None:
+                self.error_label.set_text("Select a local JSON file.")
+                return
+
+            def read_preview() -> TargetListPreview:
+                preview = parse_target_list_text(
+                    read_target_list_text(path), expected_scope="applications"
+                )
+                if not preview.targets:
+                    raise TransferError(
+                        "The application list contains no entries."
+                    )
+                return preview
+
+            self._run_worker(
+                read_preview,
+                lambda preview: self._confirm_application_import(
+                    preview, Path(path).name
+                ),
+            )
+        chooser.connect("response", respond)
+        chooser.show()
+
+    def _confirm_application_import(
+        self, preview: TargetListPreview, filename: str
+    ) -> None:
+        Gtk = self.Gtk
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"Add applications from {filename}?",
+            secondary_text=(
+                f"{len(preview.targets)} executable paths will be added. "
+                "Existing paths are kept."
+            ),
+        )
+        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("_Add", Gtk.ResponseType.ACCEPT)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+
+        def respond(_dialog: object, response: int) -> None:
+            dialog.destroy()
+            if response != Gtk.ResponseType.ACCEPT:
+                return
+            for target in preview.targets:
+                if target.value not in self.application_paths:
+                    self.application_paths.append(target.value)
+            self._render_applications()
+        dialog.connect("response", respond)
+        dialog.present()
+
+    def _choose_application_export(self) -> None:
+        Gtk = self.Gtk
+        chooser = Gtk.FileChooserNative.new(
+            "Export application blocks",
+            self.window,
+            Gtk.FileChooserAction.SAVE,
+            "_Save",
+            "_Cancel",
+        )
+        chooser.set_current_name("applications.json")
+
+        def respond(dialog: object, response: int) -> None:
+            if response != Gtk.ResponseType.ACCEPT:
+                dialog.destroy()
+                return
+            selected = dialog.get_file()
+            export_path = (
+                selected.get_path() if selected is not None else None
+            )
+            dialog.destroy()
+            if export_path is None:
+                self.error_label.set_text("Select a local export path.")
+                return
+            try:
+                targets = tuple(
+                    Target.from_dict(
+                        {"kind": "application", "value": application_path}
+                    )
+                    for application_path in self.application_paths
+                )
+                atomic_write_text(
+                    export_path,
+                    target_list_export_text("applications", targets),
+                )
+            except (TransferError, ValidationError, OSError) as error:
+                self.error_label.set_text(str(error))
+                return
+            self.error_label.set_text(
+                f"Exported {Path(export_path).name}."
+            )
+        chooser.connect("response", respond)
+        chooser.show()
+
+
     def _set_website_lines(self, domains: Sequence[str]) -> None:
+        if hasattr(self, "target_entries"):
+            website_entries: list[dict[str, str]] = []
+            for domain in dict.fromkeys(domains):
+                target = Target.from_dict({
+                    "kind": "website", "value": domain
+                })
+                website_entries.append(target.to_dict())
+            self.target_entries = [
+                entry for entry in self.target_entries
+                if entry.get("kind") != "website"
+            ]
+            self.target_entries[0:0] = website_entries
+            self._render_targets()
+            self._update_time_allowance_availability()
+            return
         self.website_view.get_buffer().set_text("\n".join(domains))
         self._update_time_allowance_availability()
 
     def _website_lines(self) -> tuple[str, ...]:
+        if hasattr(self, "target_entries"):
+            return tuple(
+                entry["value"]
+                for entry in self.target_entries
+                if entry.get("kind") == "website"
+            )
         buffer = self.website_view.get_buffer()
         text = buffer.get_text(
             buffer.get_start_iter(), buffer.get_end_iter(), False
@@ -5155,15 +5764,27 @@ class RuleEditor:
         selected = self.schedule_dropdown.get_selected()
         if selected >= len(SCHEDULE_KINDS):
             raise FormError("Select a valid schedule type.")
+        target_entries = self._block_target_entries()
+        websites = tuple(
+            entry["value"]
+            for entry in target_entries
+            if entry.get("kind") == "website"
+        )
+        managed_list_ids = tuple(
+            entry["value"]
+            for entry in target_entries
+            if entry.get("kind") == "managed_list"
+        )
+        url_targets = tuple(
+            entry for entry in target_entries
+            if entry.get("kind") in Target.URL_LIKE_KINDS
+        )
         return RuleForm(
             name=self.name_entry.get_text(),
-            websites=self._website_lines(),
+            websites=websites,
             applications=tuple(self.application_paths),
-            managed_list_ids=tuple(
-                list_id
-                for list_id, check in self.managed_list_checks.items()
-                if check.get_active()
-            ),
+            managed_list_ids=managed_list_ids,
+            target_entries=target_entries,
             network_controls=tuple(
                 control
                 for control, check in self.network_checks.items()
@@ -5184,7 +5805,7 @@ class RuleEditor:
             pomodoro_work_minutes=self.pomodoro_work.get_value_as_int(),
             pomodoro_break_minutes=self.pomodoro_break.get_value_as_int(),
             pomodoro_cycles=self.pomodoro_cycles.get_value_as_int(),
-            url_targets=tuple(self.url_targets),
+            url_targets=url_targets,
             url_exceptions=tuple(self.url_exceptions),
             allowance_starts=(
                 None if self.allowance_spin.get_value_as_int() == 0
@@ -5226,12 +5847,29 @@ class RuleEditor:
 
     def _populate(self, form: RuleForm) -> None:
         self.name_entry.set_text(form.name)
-        self.website_view.get_buffer().set_text("\n".join(form.websites))
+        entries = list(form.target_entries)
+        if not entries:
+            entries = [
+                {"kind": "website", "value": domain}
+                for domain in form.websites
+            ]
+            entries.extend(
+                {"kind": "managed_list", "value": list_id}
+                for list_id in form.managed_list_ids
+            )
+            entries.extend(form.url_targets)
+        if hasattr(self, "target_entries"):
+            self.target_entries = entries
+            self.url_exceptions = list(form.url_exceptions)
+            self._render_targets()
+        else:
+            self.website_view.get_buffer().set_text("\n".join(form.websites))
+            self.url_targets = list(form.url_targets)
+            self.url_exceptions = list(form.url_exceptions)
+            self._render_applications()
+            self._render_url_targets()
         self.application_paths = list(form.applications)
         self._render_applications()
-        self.url_targets = list(form.url_targets)
-        self.url_exceptions = list(form.url_exceptions)
-        self._render_url_targets()
         enabled_check = getattr(self, "notifications_enabled_check", None)
         if enabled_check is not None:
             enabled_check.set_active(form.notifications_enabled)

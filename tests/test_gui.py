@@ -65,8 +65,17 @@ from distraction_blocker.gui import (
     staged_native_upload_calls,
     utf8_text_chunks,
 )
-from distraction_blocker.model import POLICY_SCHEMA_VERSION, ManagedList, Rule
-from distraction_blocker.transfer import ImportIssue, ImportPreview
+from distraction_blocker.model import (
+    POLICY_SCHEMA_VERSION,
+    ManagedList,
+    Rule,
+    Target,
+)
+from distraction_blocker.transfer import (
+    ImportIssue,
+    ImportPreview,
+    TargetListPreview,
+)
 
 
 RULE_ID = "12345678-1234-5678-1234-567812345678"
@@ -730,6 +739,30 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor._add_url_target()
         self.assertEqual(len(editor.url_targets), 1)
         self.assertIn("2 to 64", editor.error_label.text)
+
+    def test_target_import_selects_missing_managed_snapshots(self) -> None:
+        managed = ManagedList.from_dict({
+            "id": LIST_ID,
+            "name": "Focus",
+            "source": "import",
+            "version": "1",
+            "license": "Test",
+            "imported_utc": "2026-01-01T00:00:00Z",
+            "domains": ["example.com"],
+        })
+        preview = TargetListPreview(
+            "targets",
+            (Target("managed_list", LIST_ID),),
+            (managed,),
+        )
+        self.assertEqual(
+            RuleEditor._missing_managed_snapshots(preview, set()),
+            (managed,),
+        )
+        self.assertEqual(
+            RuleEditor._missing_managed_snapshots(preview, {LIST_ID}),
+            (),
+        )
 
 
 class ScheduleProjectionTests(unittest.TestCase):

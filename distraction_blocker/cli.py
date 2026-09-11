@@ -28,9 +28,12 @@ from .transfer import (
     atomic_write_text,
     block_list_preview_text,
     parse_block_list_export,
+    parse_block_list_mapping,
+    parse_block_list_review,
     parse_domain_text,
+    read_block_list_mapping_text,
+    read_block_list_review_text,
     read_block_list_text,
-    read_import_text,
     statistics_export_text,
 )
 
@@ -87,6 +90,14 @@ def _parser() -> argparse.ArgumentParser:
     block_list.add_argument("path")
     block_list.add_argument(
         "--timezone", default="UTC", help="IANA time zone for scheduled blocks"
+    )
+    block_list.add_argument(
+        "--mapping-file",
+        help="JSON mapping of Block List application IDs to Linux paths",
+    )
+    block_list.add_argument(
+        "--review-file",
+        help="JSON mapping of Block List locks/breaks to local controls",
     )
     block_list.add_argument(
         "--enable",
@@ -213,14 +224,16 @@ def _human_lines(command: str, value: Any) -> list[str]:
         ]
     if command == "import-block-list" and isinstance(value, dict):
         lines = [
-            f"Imported blocks: {value.get('accepted_blocks', 0)}",
+            f"Accepted rules: {value.get('accepted', value.get('accepted_blocks', 0))}",
+            f"Transformed targets: {value.get('transformed', 0)}",
             f"Exact hostnames: {value.get('accepted_websites', 0)}",
             f"Duplicates: {value.get('duplicates', 0)}",
-            f"Unsupported or invalid entries: {len(value.get('issues', []))}",
+            f"Unsupported or invalid entries: {value.get('unsupported', len(value.get('issues', [])))}",
             f"Applied: {value.get('applied', 0)}",
         ]
         lines.extend(
-            f"- {item.get('path', '')}: {item.get('reason', '')}"
+            f"- {item.get('path', '')}: "
+            f"[{item.get('category', 'target')}] {item.get('reason', '')}"
             for item in value.get("issues", [])[:32]
             if isinstance(item, dict)
         )
@@ -458,14 +471,59 @@ def _today(
 
 
 def _block_list_import(arguments: argparse.Namespace, client: Any) -> dict[str, Any]:
+    export_text = read_block_list_text(arguments.path)
+    import_issues = ()
+    mappings: dict[str, str] = {}
+    reviews: dict[str, dict[str, Any]] = {}
+    if arguments.mapping_file:
+        mapping_preview = parse_block_list_mapping(
+            read_block_list_mapping_text(arguments.mapping_file)
+        )
+        mappings = mapping_preview.mapping_dict
+        import_issues = (*import_issues, *mapping_preview.issues)
+    if arguments.review_file:
+        review_preview = parse_block_list_review(
+            read_block_list_review_text(arguments.review_file)
+        )
+        reviews = review_preview.review_dict
+        import_issues = (*import_issues, *review_preview.issues)
     preview = parse_block_list_export(
-        read_block_list_text(arguments.path),
+        export_text,
         timezone_name=arguments.timezone,
         enabled=arguments.enable,
+        application_mappings=mappings,
+        review_mappings=reviews,
     )
+    if any(
+        issue.category == "policy_capability"
+        for issue in preview.issues
+    ):
+        status = client.request("status")
+        network_available = (
+            isinstance(status, dict)
+            and bool(status.get("network_available", False))
+        )
+        if network_available:
+            preview = parse_block_list_export(
+                export_text,
+                timezone_name=arguments.timezone,
+                enabled=arguments.enable,
+                network_available=True,
+                application_mappings=mappings,
+                review_mappings=reviews,
+            )
+    preview = preview.with_issues(import_issues)
     applied = 0
     if arguments.apply and preview.rules:
-        response = client.request("begin_rule_import")
+        lock_data = [
+            {
+                "rule_id": item["rule_id"],
+                **item["lock"],
+            }
+            for item in preview.lock_reviews
+        ]
+        begin_fields = {"locks": lock_data} if lock_data else {}
+        response = client.request("begin_rule_import", **begin_fields)
         import_id = response["import_id"]
         try:
             for offset in range(0, len(preview.rules), 200):
@@ -487,10 +545,18 @@ def _block_list_import(arguments: argparse.Namespace, client: Any) -> dict[str, 
             raise
     return {
         "accepted_blocks": preview.accepted_blocks,
+        "accepted": preview.accepted,
+        "transformed": preview.transformed,
         "accepted_websites": preview.accepted_websites,
         "duplicates": preview.duplicates,
+        "unsupported": preview.unsupported,
         "issues": [
-            {"path": issue.path, "text": issue.text, "reason": issue.reason}
+            {
+                "category": issue.category,
+                "path": issue.path,
+                "text": issue.text,
+                "reason": issue.reason,
+            }
             for issue in preview.issues
         ],
         "applied": applied,

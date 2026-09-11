@@ -9,9 +9,11 @@ from pathlib import Path
 import stat
 import tempfile
 from typing import Iterable, Mapping, Any
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import uuid4
 
+from .control import ControlError, RuleLock
 from .model import POLICY_SCHEMA_VERSION, ManagedList, Policy, Rule, Schedule, Target, ValidationError
 
 NATIVE_FORMAT = "distraction-blocker"
@@ -47,13 +49,51 @@ class ImportPreview:
         return len(self.domains)
 
 
+
+TARGET_LIST_FORMAT = "distraction-blocker-target-list"
+TARGET_LIST_VERSION = 1
+TARGET_LIST_SCOPES = frozenset({"targets", "exceptions", "applications"})
+
+
+@dataclass(frozen=True)
+class TargetListPreview:
+    """Validated typed target-list contents and managed-list snapshots."""
+
+    scope: str
+    targets: tuple[Target, ...]
+    managed_lists: tuple[ManagedList, ...] = ()
+
 @dataclass(frozen=True)
 class BlockListIssue:
-    """One unsupported or malformed entry in a Block List export."""
+    """One reported Block List setting and its stable category."""
 
     path: str
     text: str
     reason: str
+    category: str = "target"
+
+
+@dataclass(frozen=True)
+class BlockListMappingPreview:
+    """Validated application mappings plus issues needing user correction."""
+
+    mappings: tuple[tuple[str, str], ...]
+    issues: tuple[BlockListIssue, ...] = ()
+
+    @property
+    def mapping_dict(self) -> dict[str, str]:
+        return dict(self.mappings)
+
+@dataclass(frozen=True)
+class BlockListReviewPreview:
+    """Validated explicit lock/break mappings for named imported blocks."""
+
+    reviews: tuple[tuple[str, dict[str, Any]], ...]
+    issues: tuple[BlockListIssue, ...] = ()
+
+    @property
+    def review_dict(self) -> dict[str, dict[str, Any]]:
+        return {name: dict(value) for name, value in self.reviews}
 
 
 @dataclass(frozen=True)
@@ -61,6 +101,7 @@ class BlockListImportPreview:
     rules: tuple[Rule, ...]
     duplicates: int
     issues: tuple[BlockListIssue, ...]
+    lock_reviews: tuple[dict[str, Any], ...] = ()
 
     @property
     def accepted_websites(self) -> int:
@@ -73,6 +114,44 @@ class BlockListImportPreview:
     @property
     def accepted_blocks(self) -> int:
         return len(self.rules)
+
+    @property
+    def accepted(self) -> int:
+        return self.accepted_blocks
+
+    @property
+    def transformed(self) -> int:
+        return sum(
+            target.kind != "website"
+            for rule in self.rules
+            for target in (*rule.targets, *rule.exceptions)
+        )
+
+    @property
+    def unsupported(self) -> int:
+        return len(self.issues)
+
+    def with_issues(
+        self, issues: Iterable[BlockListIssue]
+    ) -> "BlockListImportPreview":
+        return BlockListImportPreview(
+            self.rules,
+            self.duplicates,
+            (*self.issues, *tuple(issues)),
+            self.lock_reviews,
+        )
+
+
+_COLD_TURKEY_ISSUE_CATEGORIES = frozenset({
+    "format",
+    "target",
+    "schedule",
+    "lock",
+    "break",
+    "application",
+    "user_scope",
+    "policy_capability",
+})
 
 
 _COLD_TURKEY_FIELDS = {
@@ -92,6 +171,7 @@ _COLD_TURKEY_FIELDS = {
     "customUsers",
     "blockList",
 }
+
 
 
 def _bounded_utf8(text: Any, label: str, maximum_bytes: int) -> str:
@@ -153,9 +233,256 @@ def parse_domain_text(text: str, *, max_entries: int = MAX_IMPORT_ENTRIES) -> Im
 
 
 def _block_list_issue(
-    issues: list[BlockListIssue], path: str, value: Any, reason: str
+    issues: list[BlockListIssue],
+    path: str,
+    value: Any,
+    reason: str,
+    *,
+    category: str = "target",
 ) -> None:
-    issues.append(BlockListIssue(path, str(value), reason))
+    if category not in _COLD_TURKEY_ISSUE_CATEGORIES:
+        raise ValueError(f"unknown Block List issue category: {category}")
+    issues.append(BlockListIssue(path, str(value), reason, category))
+
+
+_YOUTUBE_HOSTS = frozenset({
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtube-nocookie.com",
+    "www.youtube-nocookie.com",
+    "youtu.be",
+})
+
+
+def _youtube_target(parsed: Any) -> Target | None:
+    host = parsed.hostname.lower() if parsed.hostname else ""
+    if host not in _YOUTUBE_HOSTS:
+        return None
+    if parsed.username or parsed.password or parsed.fragment:
+        return None
+    segments = [item for item in parsed.path.split("/") if item]
+    if host == "youtu.be":
+        if len(segments) == 1 and not parsed.query:
+            try:
+                return Target.from_dict({
+                    "kind": "youtube_video",
+                    "value": segments[0],
+                })
+            except ValidationError:
+                return None
+        return None
+    if parsed.path.rstrip("/") == "/watch":
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        values = query.get("v")
+        if set(query) == {"v"} and values is not None and len(values) == 1:
+            try:
+                return Target.from_dict({
+                    "kind": "youtube_video",
+                    "value": values[0],
+                })
+            except ValidationError:
+                return None
+        return None
+    if parsed.query:
+        return None
+    if segments and segments[0].startswith("@"):
+        if len(segments) > 2 or (
+            len(segments) == 2 and segments[1] != "videos"
+        ):
+            return None
+        try:
+            return Target.from_dict({
+                "kind": "youtube_channel",
+                "value": segments[0],
+            })
+        except ValidationError:
+            return None
+    if len(segments) == 2 and segments[0] == "channel":
+        try:
+            return Target.from_dict({
+                "kind": "youtube_channel",
+                "value": segments[1],
+            })
+        except ValidationError:
+            return None
+    if len(segments) == 2 and segments[0] in {"shorts", "embed", "live"}:
+        try:
+            return Target.from_dict({
+                "kind": "youtube_video",
+                "value": segments[1],
+            })
+        except ValidationError:
+            return None
+    return None
+
+
+def _block_list_target(
+    value: Any,
+    path: str,
+    issues: list[BlockListIssue],
+    *,
+    network_available: bool,
+    exception: bool = False,
+) -> Target | None:
+    if isinstance(value, Mapping):
+        if set(value) != {"kind", "value"}:
+            _block_list_issue(
+                issues, path, value, "target object fields are invalid",
+                category="format",
+            )
+            return None
+        kind = value.get("kind")
+        raw_value = value.get("value")
+        if kind == "network" and raw_value == "whole_internet":
+            if exception:
+                _block_list_issue(
+                    issues, path, value,
+                    "exceptions require URL-level targets",
+                    category="target",
+                )
+                return None
+            if not network_available:
+                _block_list_issue(
+                    issues, path, value,
+                    "whole-internet import requires enabled network controls",
+                    category="policy_capability",
+                )
+                return None
+            return Target.from_dict({"kind": "network", "value": raw_value})
+        _block_list_issue(
+            issues, path, value,
+            "structured target form is not supported",
+            category="target",
+        )
+        return None
+    if not isinstance(value, str):
+        _block_list_issue(
+            issues, path, value, "target entry must be text",
+            category="target",
+        )
+        return None
+    candidate = value.strip()
+    if not candidate:
+        _block_list_issue(
+            issues, path, value, "target entry must not be empty",
+            category="target",
+        )
+        return None
+    if candidate == "whole_internet":
+        if exception:
+            _block_list_issue(
+                issues, path, candidate,
+                "exceptions require URL-level targets",
+                category="target",
+            )
+            return None
+        if not network_available:
+            _block_list_issue(
+                issues, path, candidate,
+                "whole-internet import requires enabled network controls",
+                category="policy_capability",
+            )
+            return None
+        return Target.from_dict({"kind": "network", "value": candidate})
+    if candidate.startswith("keyword:"):
+        try:
+            return Target.from_dict({
+                "kind": "url_keyword",
+                "value": candidate[8:],
+            })
+        except ValidationError as error:
+            _block_list_issue(
+                issues, path, candidate, error.message, category="target"
+            )
+            return None
+    has_scheme = "://" in candidate
+    parse_value = candidate if has_scheme else f"https://{candidate}"
+    try:
+        parsed = urlsplit(parse_value)
+    except ValueError:
+        parsed = None
+    if parsed is None or not parsed.hostname:
+        _block_list_issue(
+            issues, path, candidate, "target URL is invalid", category="target"
+        )
+        return None
+    if has_scheme and parsed.scheme not in {"http", "https"}:
+        _block_list_issue(
+            issues, path, candidate,
+            "only HTTP and HTTPS URL targets are supported",
+            category="target",
+        )
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        _block_list_issue(
+            issues, path, candidate, "target URL port is invalid",
+            category="target",
+        )
+        return None
+    if port is not None:
+        _block_list_issue(
+            issues, path, candidate,
+            "URL ports are not supported by the target model",
+            category="target",
+        )
+        return None
+    youtube = _youtube_target(parsed)
+    if youtube is not None:
+        if exception and youtube.kind not in Target.URL_LIKE_KINDS:
+            _block_list_issue(
+                issues, path, candidate,
+                "exceptions require URL-level targets", category="target"
+            )
+            return None
+        return youtube
+    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+        _block_list_issue(
+            issues, path, candidate,
+            "URL query, fragment, or credentials are not supported",
+            category="target",
+        )
+        return None
+    raw_path = parsed.path
+    if "*" in candidate:
+        if not candidate.endswith("*") or candidate.count("*") != 1 or "/" not in raw_path:
+            _block_list_issue(
+                issues, path, candidate,
+                "wildcard URL rules are not supported", category="target"
+            )
+            return None
+        target_kind = "url_wildcard"
+    elif raw_path not in ("", "/"):
+        target_kind = "url_path"
+    else:
+        target_kind = "website"
+    if exception and target_kind == "website":
+        _block_list_issue(
+            issues, path, candidate,
+            "website exceptions are not supported", category="target"
+        )
+        return None
+    normalized = parsed.hostname + (raw_path if target_kind != "website" else "")
+    try:
+        target = Target.from_dict({
+            "kind": target_kind,
+            "value": normalized,
+        })
+    except ValidationError as error:
+        _block_list_issue(
+            issues, path, candidate, error.message, category="target"
+        )
+        return None
+    if exception and target.kind not in Target.URL_LIKE_KINDS:
+        _block_list_issue(
+            issues, path, candidate,
+            "exceptions require URL-level targets", category="target"
+        )
+        return None
+    return target
 
 
 def _block_list_endpoint(
@@ -166,44 +493,64 @@ def _block_list_endpoint(
     maximum_day: int,
 ) -> tuple[int, int, int] | None:
     if not isinstance(value, str):
-        _block_list_issue(issues, path, value, "schedule endpoint must be text")
+        _block_list_issue(
+            issues, path, value, "schedule endpoint must be text",
+            category="schedule",
+        )
         return None
     fields = value.split(",")
     if len(fields) != 3:
         _block_list_issue(
-            issues, path, value, "schedule endpoint must be day,hour,minute"
+            issues, path, value, "schedule endpoint must be day,hour,minute",
+            category="schedule",
         )
         return None
     try:
         day, hour, minute = (int(field) for field in fields)
     except ValueError:
         _block_list_issue(
-            issues, path, value, "schedule endpoint must be day,hour,minute"
+            issues, path, value, "schedule endpoint must be day,hour,minute",
+            category="schedule",
         )
         return None
     if not 0 <= day <= maximum_day or not 0 <= hour <= 23 or not 0 <= minute <= 59:
-        _block_list_issue(issues, path, value, "schedule endpoint is out of range")
+        _block_list_issue(
+            issues, path, value, "schedule endpoint is out of range",
+            category="schedule",
+        )
         return None
     return day, hour, minute
+
 
 def _block_list_schedule(
     settings: Mapping[str, Any],
     path: str,
     timezone_name: str,
     issues: list[BlockListIssue],
+    *,
+    duplicate_counter: list[int] | None = None,
 ) -> Schedule | None:
     schedule_type = settings.get("type")
     if schedule_type == "continuous":
+        raw_schedule = settings.get("schedule")
+        if raw_schedule not in (None, "", [], {}):
+            _block_list_issue(
+                issues, f"{path}.schedule", raw_schedule,
+                "continuous blocks must not contain scheduled periods",
+                category="schedule",
+            )
         return Schedule.from_dict({"kind": "indefinite"})
     if schedule_type != "scheduled":
         _block_list_issue(
-            issues, f"{path}.type", schedule_type, "block type is not supported"
+            issues, f"{path}.type", schedule_type,
+            "block type is not supported", category="schedule"
         )
         return None
     raw_schedule = settings.get("schedule")
     if not isinstance(raw_schedule, list) or not raw_schedule:
         _block_list_issue(
-            issues, f"{path}.schedule", raw_schedule, "scheduled block has no periods"
+            issues, f"{path}.schedule", raw_schedule,
+            "scheduled block has no periods", category="schedule"
         )
         return None
     periods: list[dict[str, Any]] = []
@@ -212,9 +559,18 @@ def _block_list_schedule(
         period_path = f"{path}.schedule[{index}]"
         if not isinstance(raw_period, Mapping):
             _block_list_issue(
-                issues, period_path, raw_period, "schedule period must be an object"
+                issues, period_path, raw_period,
+                "schedule period must be an object", category="schedule"
             )
             continue
+        for field in sorted(
+            set(raw_period) - {"startTime", "endTime", "break"}
+        ):
+            _block_list_issue(
+                issues, f"{period_path}.{field}", raw_period[field],
+                "schedule period field is not supported",
+                category="schedule",
+            )
         start = _block_list_endpoint(
             raw_period.get("startTime"),
             f"{period_path}.startTime",
@@ -244,11 +600,14 @@ def _block_list_schedule(
                 period_path,
                 raw_period,
                 "schedule period spans more than one supported local day",
+                category="schedule",
             )
             continue
         weekday = (start_day - 1) % 7
         key = (weekday, start_text, end_text)
         if key in seen:
+            if duplicate_counter is not None:
+                duplicate_counter[0] += 1
             continue
         seen.add(key)
         if raw_period.get("break", "none") not in (None, "", "none"):
@@ -257,6 +616,7 @@ def _block_list_schedule(
                 f"{period_path}.break",
                 raw_period.get("break"),
                 "scheduled breaks are not supported",
+                category="break",
             )
         periods.append({
             "weekdays": [weekday],
@@ -272,8 +632,250 @@ def _block_list_schedule(
             "periods": periods,
         })
     except ValidationError as error:
-        _block_list_issue(issues, f"{path}.schedule", raw_schedule, error.message)
+        _block_list_issue(
+            issues, f"{path}.schedule", raw_schedule, error.message,
+            category="schedule",
+        )
         return None
+
+
+class _BlockListJsonObject(dict):
+    def __init__(self, pairs: list[tuple[Any, Any]]) -> None:
+        duplicates: list[tuple[Any, Any, Any]] = []
+        values: dict[Any, Any] = {}
+        for key, value in pairs:
+            if key in values:
+                duplicates.append((key, values[key], value))
+            values[key] = value
+        super().__init__(values)
+        self.duplicate_pairs = tuple(duplicates)
+
+def _block_list_report_duplicates(
+    value: Any,
+    path: str,
+    issues: list[BlockListIssue],
+) -> None:
+    if isinstance(value, _BlockListJsonObject):
+        for key, _old, new in value.duplicate_pairs:
+            duplicate_path = f"{path}.{key}" if path else str(key)
+            _block_list_issue(
+                issues,
+                duplicate_path,
+                new,
+                "duplicate JSON setting; the later value was retained",
+                category="format",
+            )
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            _block_list_report_duplicates(child, child_path, issues)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _block_list_report_duplicates(child, f"{path}[{index}]", issues)
+
+
+def parse_block_list_mapping(text: str) -> BlockListMappingPreview:
+    """Parse an explicit JSON application-id to Linux-path mapping file."""
+    content = _bounded_utf8(
+        text, "Block List mapping", MAX_NATIVE_IMPORT_BYTES
+    )
+    duplicate_pairs: list[tuple[str, tuple[Any, Any, Any]]] = []
+    try:
+        value = json.loads(content, object_pairs_hook=_BlockListJsonObject)
+    except json.JSONDecodeError as error:
+        raise TransferError(
+            "Block List mapping is not valid JSON at "
+            f"line {error.lineno}, column {error.colno}"
+        ) from error
+    if not isinstance(value, Mapping):
+        raise TransferError("Block List mapping must be a JSON object")
+    issues: list[BlockListIssue] = []
+    if isinstance(value, _BlockListJsonObject):
+        for key, _old, new in value.duplicate_pairs:
+            if key == "applications":
+                _block_list_issue(
+                    issues,
+                    f"mapping[{key!r}]",
+                    new,
+                    "application mapping wrapper is duplicated; "
+                    "the later value was retained",
+                    category="application",
+                )
+    source: Mapping[str, Any] = value
+    if "applications" in value:
+        source = value["applications"]
+        if not isinstance(source, Mapping):
+            _block_list_issue(
+                issues,
+                "applications",
+                source,
+                "application mappings must be an object",
+                category="format",
+            )
+            return BlockListMappingPreview((), tuple(issues))
+        extras = sorted(set(value) - {"applications"})
+        for key in extras:
+            duplicate_pairs.append((f"mapping[{key!r}]", (key, value[key], None)))
+    mappings: list[tuple[str, str]] = []
+    invalid: set[str] = set()
+    if isinstance(source, _BlockListJsonObject):
+        for key, old, new in source.duplicate_pairs:
+            path = f"applications[{key!r}]"
+            category = "application"
+            reason = (
+                "application mapping is duplicated"
+                if old == new
+                else "application mapping conflicts with another value"
+            )
+            _block_list_issue(
+                issues, path, new, reason, category=category
+            )
+            invalid.add(str(key))
+    for key, raw_path in source.items():
+        path = f"applications[{key!r}]"
+        if not isinstance(key, str) or not key.strip():
+            _block_list_issue(
+                issues, path, raw_path,
+                "application identifier must be non-empty text",
+                category="application",
+            )
+            continue
+        if key in invalid:
+            continue
+        if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
+            _block_list_issue(
+                issues, path, raw_path,
+                "mapped application path must be absolute",
+                category="application",
+            )
+            continue
+        try:
+            normalized = Target.from_dict({
+                "kind": "application", "value": raw_path,
+            }).value
+        except ValidationError as error:
+            _block_list_issue(
+                issues, path, raw_path, error.message, category="application"
+            )
+            continue
+        mappings.append((key, normalized))
+    for path, (key, value, _unused) in duplicate_pairs:
+        _block_list_issue(
+            issues, path, value,
+            "mapping file contains an unsupported top-level setting",
+            category="format",
+        )
+    return BlockListMappingPreview(tuple(mappings), tuple(issues))
+
+
+def _block_list_review_lock(
+    value: Any,
+    path: str,
+    issues: list[BlockListIssue],
+    *,
+    category: str,
+) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        _block_list_issue(
+            issues, path, value, "review lock must be an object",
+            category=category,
+        )
+        return None
+    kind = value.get("kind")
+    if "rule_id" in value:
+        _block_list_issue(
+            issues, path, value,
+            "review locks must not specify a rule id",
+            category=category,
+        )
+        return None
+    if kind == "password":
+        _block_list_issue(
+            issues, path, value,
+            "password locks require a fresh local password",
+            category=category,
+        )
+        return None
+    candidate = {"rule_id": "12345678-1234-5678-1234-567812345678", **value}
+    try:
+        normalized = RuleLock.from_dict(candidate).to_dict()
+    except (ControlError, TypeError, ValueError) as error:
+        _block_list_issue(
+            issues, path, value, str(error), category=category
+        )
+        return None
+    normalized.pop("rule_id", None)
+    return normalized
+
+
+def parse_block_list_review(text: str) -> BlockListReviewPreview:
+    """Parse explicit lock/break mappings for named Block List blocks."""
+    content = _bounded_utf8(
+        text, "Block List review", MAX_NATIVE_IMPORT_BYTES
+    )
+    try:
+        value = json.loads(content, object_pairs_hook=_BlockListJsonObject)
+    except json.JSONDecodeError as error:
+        raise TransferError(
+            "Block List review is not valid JSON at "
+            f"line {error.lineno}, column {error.colno}"
+        ) from error
+    if not isinstance(value, Mapping):
+        raise TransferError("Block List review must be a JSON object")
+    blocks: Mapping[str, Any] = value
+    if set(value) == {"blocks"} and isinstance(value["blocks"], Mapping):
+        blocks = value["blocks"]
+    issues: list[BlockListIssue] = []
+    _block_list_report_duplicates(value, "reviews", issues)
+    reviews: list[tuple[str, dict[str, Any]]] = []
+    for name, raw_review in blocks.items():
+        path = f"reviews[{name!r}]"
+        if not isinstance(name, str) or not name.strip():
+            _block_list_issue(
+                issues, path, name, "block name must be non-empty text",
+                category="format",
+            )
+            continue
+        if not isinstance(raw_review, Mapping):
+            _block_list_issue(
+                issues, path, raw_review, "review must be an object",
+                category="format",
+            )
+            continue
+        unknown = sorted(set(raw_review) - {"lock", "break"})
+        for field in unknown:
+            _block_list_issue(
+                issues, f"{path}.{field}", raw_review[field],
+                "review setting is not supported", category="format"
+            )
+        if "lock" in raw_review and "break" in raw_review:
+            _block_list_issue(
+                issues, path, raw_review,
+                "a review cannot map both lock and break settings",
+                category="lock",
+            )
+            continue
+        field = "lock" if "lock" in raw_review else "break"
+        if field not in raw_review:
+            _block_list_issue(
+                issues, path, raw_review,
+                "review must contain lock or break", category="format"
+            )
+            continue
+        mapped = _block_list_review_lock(
+            raw_review[field], f"{path}.{field}", issues,
+            category="break" if field == "break" else "lock",
+        )
+        if mapped is not None:
+            if field == "break" and mapped.get("kind") != "delay":
+                _block_list_issue(
+                    issues, f"{path}.{field}", raw_review[field],
+                    "break reviews require an equivalent delay lock",
+                    category="break",
+                )
+                continue
+            reviews.append((name, {field: mapped}))
+    return BlockListReviewPreview(tuple(reviews), tuple(issues))
 
 
 def parse_block_list_export(
@@ -281,16 +883,18 @@ def parse_block_list_export(
     *,
     timezone_name: str = "UTC",
     enabled: bool = False,
+    network_available: bool = False,
+    application_mappings: Mapping[str, str] | None = None,
+    review_mappings: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> BlockListImportPreview:
     """Parse a Block List ``.blocklist.json`` mapping without repairing its JSON.
 
-    Block List exports a mapping of block names to settings. Only exact
-    hostnames and representable weekly schedules are imported; every other
-    entry is retained in ``issues`` for the confirmation UI.
+    Every source target is either represented exactly, reported with a
+    categorized issue, or resolved by an explicit application mapping.
     """
     content = _bounded_utf8(text, "Block List export", MAX_NATIVE_IMPORT_BYTES)
     try:
-        value = json.loads(content)
+        value = json.loads(content, object_pairs_hook=_BlockListJsonObject)
     except json.JSONDecodeError as error:
         raise TransferError(
             "Block List export is not valid JSON at "
@@ -311,121 +915,275 @@ def parse_block_list_export(
         ZoneInfo(timezone_name)
     except (ZoneInfoNotFoundError, ValueError) as error:
         raise TransferError("Block List import time zone is invalid") from error
+    if not isinstance(network_available, bool):
+        raise TransferError("Block List network capability is invalid")
+    if application_mappings is not None and not isinstance(
+        application_mappings, Mapping
+    ):
+        raise TransferError("Block List application mappings are invalid")
     issues: list[BlockListIssue] = []
+    _block_list_report_duplicates(value, "blocks", issues)
     rules: list[Rule] = []
-    duplicates = 0
+    duplicates = [0]
+    used_mappings: set[str] = set()
+    mapping_values = dict(application_mappings or {})
+    if review_mappings is not None and not isinstance(review_mappings, Mapping):
+        raise TransferError("Block List review mappings are invalid")
+    review_values = dict(review_mappings or {})
+    lock_reviews: list[dict[str, Any]] = []
+    used_reviews: set[str] = set()
     for name, raw_settings in blocks.items():
         path = f"blocks[{name!r}]"
         if not isinstance(name, str) or not name.strip():
-            _block_list_issue(issues, path, name, "block name must be non-empty text")
+            _block_list_issue(
+                issues, path, name, "block name must be non-empty text",
+                category="format",
+            )
             continue
         if not isinstance(raw_settings, Mapping):
             _block_list_issue(
-                issues, path, raw_settings, "block settings must be an object"
+                issues, path, raw_settings, "block settings must be an object",
+                category="format",
             )
             continue
         settings = dict(raw_settings)
-        for field in set(settings) - _COLD_TURKEY_FIELDS:
+        for field in sorted(set(settings) - _COLD_TURKEY_FIELDS):
             _block_list_issue(
-                issues, f"{path}.{field}", settings[field], "setting is not supported"
+                issues, f"{path}.{field}", settings[field],
+                "setting is not supported", category="format"
+            )
+        if "web" in settings and "blockList" in settings and (
+            settings["web"] != settings["blockList"]
+        ):
+            _block_list_issue(
+                issues, f"{path}.blockList", settings["blockList"],
+                "web and blockList settings conflict", category="format"
             )
         raw_web = settings.get("web", settings.get("blockList"))
         if not isinstance(raw_web, list):
             _block_list_issue(
-                issues, f"{path}.web", raw_web, "block website list must be a list"
+                issues, f"{path}.web", raw_web,
+                "block website list must be a list", category="target"
             )
             raw_web = []
         targets: list[Target] = []
-        seen: set[str] = set()
+        seen_targets: set[tuple[str, str]] = set()
         for index, raw_target in enumerate(raw_web):
-            target_path = f"{path}.web[{index}]"
-            if not isinstance(raw_target, str):
-                _block_list_issue(
-                    issues, target_path, raw_target, "website entry must be text"
+            target = _block_list_target(
+                raw_target, f"{path}.web[{index}]", issues,
+                network_available=network_available,
+            )
+            if target is None:
+                continue
+            key = (target.kind, target.value)
+            if key in seen_targets:
+                duplicates[0] += 1
+                continue
+            seen_targets.add(key)
+            targets.append(target)
+
+        raw_exceptions = settings.get("exceptions", [])
+        exception_targets: list[Target] = []
+        exceptions_valid = True
+        if not isinstance(raw_exceptions, list):
+            _block_list_issue(
+                issues, f"{path}.exceptions", raw_exceptions,
+                "exceptions must be a list", category="target"
+            )
+            exceptions_valid = False
+        else:
+            for index, entry in enumerate(raw_exceptions):
+                exception = _block_list_target(
+                    entry, f"{path}.exceptions[{index}]", issues,
+                    network_available=network_available, exception=True,
                 )
-                continue
-            candidate = raw_target.strip()
-            if "*" in candidate:
-                reason = "wildcard URL rules are not supported"
-            elif "://" in candidate or "/" in candidate:
-                reason = "URL-path rules are not supported"
-            else:
-                reason = ""
-            if reason:
-                _block_list_issue(issues, target_path, candidate, reason)
-                continue
-            try:
-                domain = Target.from_dict({
-                    "kind": "website",
-                    "value": candidate,
-                }).value
-            except ValidationError as error:
-                _block_list_issue(issues, target_path, candidate, error.message)
-                continue
-            if domain in seen:
-                duplicates += 1
-                continue
-            seen.add(domain)
-            targets.append(Target("website", domain))
-        for field, reason in (
-            ("exceptions", "website exceptions are not supported"),
-            ("apps", "Block List application entries are not supported"),
+                if exception is None:
+                    exceptions_valid = False
+                    continue
+                exception_targets.append(exception)
+            if not exceptions_valid:
+                exception_targets = []
+        raw_apps = settings.get("apps", [])
+        if not isinstance(raw_apps, list):
+            _block_list_issue(
+                issues, f"{path}.apps", raw_apps,
+                "apps must be a list", category="application"
+            )
+        else:
+            seen_apps: set[str] = set()
+            for index, entry in enumerate(raw_apps):
+                app_path = f"{path}.apps[{index}]"
+                if not isinstance(entry, str):
+                    _block_list_issue(
+                        issues, app_path, entry,
+                        "application identifier must be text",
+                        category="application",
+                    )
+                    continue
+                if entry in seen_apps:
+                    duplicates[0] += 1
+                    continue
+                seen_apps.add(entry)
+                mapped_path = mapping_values.get(entry)
+                if mapped_path is None:
+                    _block_list_issue(
+                        issues, app_path, entry,
+                        "application mapping is required",
+                        category="application",
+                    )
+                    continue
+                used_mappings.add(entry)
+                try:
+                    target = Target.from_dict({
+                        "kind": "application", "value": mapped_path,
+                    })
+                except ValidationError as error:
+                    _block_list_issue(
+                        issues, app_path, mapped_path, error.message,
+                        category="application",
+                    )
+                    continue
+                key = (target.kind, target.value)
+                if key in seen_targets:
+                    duplicates[0] += 1
+                    continue
+                seen_targets.add(key)
+                targets.append(target)
+
+        reviewed_lock: tuple[str, dict[str, Any]] | None = None
+        review = review_values.get(name)
+        if review is not None and not isinstance(review, Mapping):
+            _block_list_issue(
+                issues, f"reviews[{name!r}]", review,
+                "review mapping must be an object", category="format"
+            )
+            review = None
+        lock_value = settings.get("lock", "none")
+        break_value = settings.get("break", "none")
+        has_lock = lock_value not in (None, "", "none")
+        has_break = break_value not in (None, "", "none")
+        conflicting_settings = has_lock and has_break
+        if conflicting_settings:
+            _block_list_issue(
+                issues, path, {"lock": lock_value, "break": break_value},
+                "a block cannot define both lock and break settings",
+                category="lock",
+            )
+            review = None
+        for field, category, reason in (
+            ("lock", "lock", "block locks require an explicit review mapping"),
+            ("break", "break", "breaks require an explicit review mapping"),
         ):
-            raw_entries = settings.get(field, [])
-            if not isinstance(raw_entries, list):
+            if conflicting_settings:
+                continue
+            raw_value = settings.get(field, "none")
+            if raw_value in (None, "", "none"):
+                continue
+            candidate = review.get(field) if review is not None else None
+            if candidate is None:
                 _block_list_issue(
-                    issues, f"{path}.{field}", raw_entries, f"{field} must be a list"
+                    issues, f"{path}.{field}", raw_value, reason,
+                    category=category,
                 )
                 continue
-            for index, entry in enumerate(raw_entries):
+            mapped = _block_list_review_lock(
+                candidate, f"reviews[{name!r}].{field}", issues,
+                category=category,
+            )
+            if mapped is None or (
+                field == "break" and mapped.get("kind") != "delay"
+            ):
+                if mapped is not None and field == "break":
+                    _block_list_issue(
+                        issues, f"reviews[{name!r}].break", candidate,
+                        "break reviews require an equivalent delay lock",
+                        category="break",
+                    )
+                continue
+            used_reviews.add(name)
+            reviewed_lock = (field, mapped)
+        for field, category, reason in (
+            ("lockUnblock", "lock", "lock unblock behavior is not supported"),
+            ("restartUnblock", "lock", "restart unlock behavior is not supported"),
+            ("password", "lock", "Block List passwords cannot be imported"),
+            ("randomTextLength", "lock", "Block List friction settings cannot be imported"),
+            ("window", "target", "window-title rules are not supported"),
+        ):
+            raw_value = settings.get(field)
+            if raw_value not in (None, "", False, 0, [], {}):
                 _block_list_issue(
-                    issues, f"{path}.{field}[{index}]", entry, reason
+                    issues, f"{path}.{field}", raw_value, reason,
+                    category=category,
                 )
-        if settings.get("lock", "none") not in (None, "", "none"):
-            _block_list_issue(
-                issues, f"{path}.lock", settings["lock"], "block locks are not supported"
-            )
-        if settings.get("break", "none") not in (None, "", "none"):
-            _block_list_issue(
-                issues, f"{path}.break", settings["break"], "breaks are not supported"
-            )
         if settings.get("users") not in (None, "") or settings.get("customUsers"):
             _block_list_issue(
-                issues, f"{path}.users", settings.get("users"), "user targeting is not supported"
+                issues, f"{path}.users", settings.get("users"),
+                "user targeting is not supported", category="user_scope"
             )
         schedule = _block_list_schedule(
-            settings, path, timezone_name, issues
+            settings, path, timezone_name, issues,
+            duplicate_counter=duplicates,
         )
         if not targets or schedule is None:
             if not targets:
                 _block_list_issue(
-                    issues, path, name, "block has no supported exact hostnames"
+                    issues, path, name,
+                    "block has no supported targets", category="target"
                 )
             continue
         try:
-            rules.append(Rule.from_dict({
+            rule = Rule.from_dict({
                 "id": str(uuid4()),
                 "name": name.strip(),
                 "enabled": enabled,
                 "targets": [target.to_dict() for target in targets],
+                "exceptions": [target.to_dict() for target in exception_targets],
                 "schedule": schedule.to_dict(),
                 "revision": 0,
-            }))
+            })
+            rules.append(rule)
+            if reviewed_lock is not None:
+                field, mapped = reviewed_lock
+                lock_reviews.append({
+                    "rule_id": rule.id,
+                    "source": field,
+                    "lock": mapped,
+                })
         except ValidationError as error:
-            _block_list_issue(issues, path, name, error.message)
-    return BlockListImportPreview(tuple(rules), duplicates, tuple(issues))
+            _block_list_issue(
+                issues, path, name, error.message, category="format"
+            )
+    for name in sorted(set(review_values) - used_reviews):
+        _block_list_issue(
+            issues, f"reviews[{name!r}]", review_values[name],
+            "review mapping does not match an imported lock or break",
+            category="format",
+        )
+    for identifier in sorted(set(mapping_values) - used_mappings):
+        _block_list_issue(
+            issues, f"applications[{identifier!r}]", mapping_values[identifier],
+            "application mapping does not match an exported application",
+            category="application",
+        )
+    return BlockListImportPreview(
+        tuple(rules),
+        duplicates[0],
+        tuple(issues),
+        tuple(lock_reviews),
+    )
 
 
 def block_list_preview_text(preview: BlockListImportPreview) -> str:
     lines = [
-        f"Imported blocks: {preview.accepted_blocks}",
+        f"Accepted rules: {preview.accepted}",
+        f"Transformed targets: {preview.transformed}",
         f"Exact hostnames: {preview.accepted_websites}",
         f"Duplicates: {preview.duplicates}",
-        f"Unsupported or invalid entries: {len(preview.issues)}",
+        f"Unsupported or invalid entries: {preview.unsupported}",
     ]
     if preview.issues:
         lines.extend(
-            f"- {issue.path}: {issue.reason} ({issue.text})"
+            f"- {issue.path}: [{issue.category}] {issue.reason} ({issue.text})"
             for issue in preview.issues[:32]
         )
         if len(preview.issues) > 32:
@@ -474,6 +1232,16 @@ def read_block_list_text(path: str | os.PathLike[str]) -> str:
         path, maximum_bytes=MAX_NATIVE_IMPORT_BYTES, label="Block List export"
     )
 
+def read_block_list_mapping_text(path: str | os.PathLike[str]) -> str:
+    return _read_utf8_text(
+        path, maximum_bytes=MAX_NATIVE_IMPORT_BYTES, label="Block List mapping"
+    )
+
+def read_block_list_review_text(path: str | os.PathLike[str]) -> str:
+    return _read_utf8_text(
+        path, maximum_bytes=MAX_NATIVE_IMPORT_BYTES, label="Block List review"
+    )
+
 def domain_export_text(rules: Iterable[Rule], managed_lists: Iterable[ManagedList] = ()) -> str:
     lists = {item.id: item for item in managed_lists}
     domains: set[str] = set()
@@ -488,6 +1256,148 @@ def domain_export_text(rules: Iterable[Rule], managed_lists: Iterable[ManagedLis
                 domains.update(item.domains)
     lines = ["# Distraction Blocker domain export", *sorted(domains)]
     return "\n".join(lines) + "\n"
+
+def target_list_export_text(
+    scope: str,
+    targets: Iterable[Target],
+    managed_lists: Iterable[ManagedList] = (),
+) -> str:
+    """Serialize one editor pane without losing target kinds."""
+    if not isinstance(scope, str) or scope not in TARGET_LIST_SCOPES:
+        raise TransferError("target-list export scope is invalid")
+    normalized_targets: list[Target] = []
+    seen_targets: set[Target] = set()
+    for item in targets:
+        if not isinstance(item, Target):
+            raise TransferError("target-list export targets are invalid")
+        try:
+            normalized = Target.from_dict(item.to_dict())
+        except ValidationError as error:
+            raise TransferError(error.message) from error
+        if scope == "exceptions" and normalized.kind not in Target.URL_LIKE_KINDS:
+            raise TransferError("target-list exceptions must be URL-level")
+        if scope == "applications" and normalized.kind != "application":
+            raise TransferError("application export contains a non-application")
+        if scope == "targets" and normalized.kind == "application":
+            raise TransferError("target export contains an application")
+        if normalized in seen_targets:
+            raise TransferError("target-list export contains duplicate targets")
+        seen_targets.add(normalized)
+        normalized_targets.append(normalized)
+    normalized_lists: list[ManagedList] = []
+    seen_lists: set[str] = set()
+    for item in managed_lists:
+        if not isinstance(item, ManagedList):
+            raise TransferError("target-list managed-list snapshots are invalid")
+        try:
+            normalized = ManagedList.from_dict(item.to_dict())
+        except ValidationError as error:
+            raise TransferError(error.message) from error
+        if normalized.id in seen_lists:
+            raise TransferError("target-list export contains duplicate lists")
+        seen_lists.add(normalized.id)
+        normalized_lists.append(normalized)
+    managed_target_ids = {
+        item.value
+        for item in normalized_targets
+        if item.kind == "managed_list"
+    }
+    if managed_target_ids != seen_lists:
+        raise TransferError(
+            "target-list managed-list snapshots must match target references"
+        )
+    payload = {
+        "format": TARGET_LIST_FORMAT,
+        "version": TARGET_LIST_VERSION,
+        "scope": scope,
+        "items": [item.to_dict() for item in normalized_targets],
+        "managed_lists": [item.to_dict() for item in normalized_lists],
+    }
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False
+    ) + "\n"
+
+
+def parse_target_list_text(
+    text: str,
+    *,
+    expected_scope: str | None = None,
+) -> TargetListPreview:
+    """Parse a typed editor-pane export using the existing model schema."""
+    content = _bounded_utf8(text, "target-list export", MAX_NATIVE_IMPORT_BYTES)
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError as error:
+        raise TransferError(
+            "target-list export is not valid JSON at "
+            f"line {error.lineno}, column {error.colno}"
+        ) from error
+    if not isinstance(value, Mapping):
+        raise TransferError("target-list export must be an object")
+    if set(value) not in (
+        {"format", "version", "scope", "items"},
+        {"format", "version", "scope", "items", "managed_lists"},
+    ):
+        raise TransferError("target-list export fields are invalid")
+    if value.get("format") != TARGET_LIST_FORMAT:
+        raise TransferError("target-list export format is not supported")
+    if value.get("version") != TARGET_LIST_VERSION:
+        raise TransferError("target-list export version is not supported")
+    scope = value.get("scope")
+    if not isinstance(scope, str) or scope not in TARGET_LIST_SCOPES:
+        raise TransferError("target-list export scope is invalid")
+    if expected_scope is not None and scope != expected_scope:
+        raise TransferError(f"target-list export must contain {expected_scope}")
+    raw_items = value.get("items")
+    if not isinstance(raw_items, list):
+        raise TransferError("target-list export items must be a list")
+    targets: list[Target] = []
+    seen_targets: set[Target] = set()
+    try:
+        for raw_item in raw_items:
+            target = Target.from_dict(raw_item)
+            if scope == "exceptions" and target.kind not in Target.URL_LIKE_KINDS:
+                raise TransferError("target-list exceptions must be URL-level")
+            if scope == "applications" and target.kind != "application":
+                raise TransferError("application export contains a non-application")
+            if scope == "targets" and target.kind == "application":
+                raise TransferError("target export contains an application")
+            if target in seen_targets:
+                raise TransferError("target-list export contains duplicate targets")
+            seen_targets.add(target)
+            targets.append(target)
+    except ValidationError as error:
+        raise TransferError(error.message) from error
+    raw_lists = value.get("managed_lists", [])
+    if not isinstance(raw_lists, list):
+        raise TransferError("target-list managed lists must be a list")
+    managed_lists: list[ManagedList] = []
+    seen_lists: set[str] = set()
+    try:
+        for raw_list in raw_lists:
+            managed = ManagedList.from_dict(raw_list)
+            if managed.id in seen_lists:
+                raise TransferError("target-list export contains duplicate lists")
+            seen_lists.add(managed.id)
+            managed_lists.append(managed)
+    except ValidationError as error:
+        raise TransferError(error.message) from error
+    managed_target_ids = {
+        target.value
+        for target in targets
+        if target.kind == "managed_list"
+    }
+    if managed_target_ids != seen_lists:
+        raise TransferError(
+            "target-list managed-list snapshots must match target references"
+        )
+    return TargetListPreview(scope, tuple(targets), tuple(managed_lists))
+
+
+def read_target_list_text(path: str | os.PathLike[str]) -> str:
+    return _read_utf8_text(
+        path, maximum_bytes=MAX_NATIVE_IMPORT_BYTES, label="target-list export"
+    )
 
 
 def native_export_text(
