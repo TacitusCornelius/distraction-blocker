@@ -81,6 +81,8 @@ WHOLE_SAFE_DESIRED = _desired_ruleset(
     UID, frozenset({"whole_internet", "safe_search"})
 )
 
+LOCAL_DESIRED = _desired_ruleset(UID, frozenset({"local_dns"}))
+
 
 class _Result:
     def __init__(self, returncode: int, stdout: bytes = b"", stderr: bytes = b"") -> None:
@@ -561,6 +563,48 @@ class ResolverConfigTests(unittest.TestCase):
         dns.enforced["bing.com"] = ("198.51.100.7",)
         self.assertFalse(resolver_health(expected, query=dns))
 
+    def test_resolver_health_bounds_large_block_projection(self):
+        blocked = tuple(f"blocked-{index}.example" for index in range(5000))
+        normalized = tuple(sorted(blocked))
+        calls = []
+
+        def query(family, addr, port, name, qtype, timeout=2.0):
+            calls.append((name, qtype))
+            if name not in normalized:
+                return 3, []
+            if qtype == A_QTYPE:
+                return 0, [ne.SINK_ADDRESS_V4]
+            if qtype == AAAA_QTYPE:
+                return 0, [ne.SINK_ADDRESS_V6]
+            return 0, []
+
+        self.assertTrue(resolver_health({}, query=query, blocked_domains=blocked))
+        expected = set(normalized[:16]) | set(normalized[-16:]) | {ne._HEALTH_NAME}
+        self.assertEqual({name for name, _qtype in calls}, expected)
+
+    def test_resolver_health_avoids_blocked_allowed_probe_name(self):
+        calls = []
+
+        def query(family, addr, port, name, qtype, timeout=2.0):
+            calls.append(name)
+            if name == ne._HEALTH_NAME:
+                if qtype == A_QTYPE:
+                    return 0, [ne.SINK_ADDRESS_V4]
+                if qtype == AAAA_QTYPE:
+                    return 0, [ne.SINK_ADDRESS_V6]
+                return 0, []
+            return 3, []
+
+        self.assertTrue(
+            resolver_health(
+                {},
+                query=query,
+                blocked_domains=(ne._HEALTH_NAME,),
+            )
+        )
+        self.assertNotIn(ne._HEALTH_NAME, calls[-8:])
+        self.assertIn("distraction-blocker-health-0", calls[-8:])
+
     def test_resolver_health_rejects_service_metadata_records(self):
         resolved = self._resolved()
         expected = {
@@ -842,6 +886,71 @@ class SafeSearchTests(EnforcerTestCase):
         # transition safe -> whole+safe adds the final deny without losing the chain
         self.enforcer.reconcile(frozenset({"safe_search", "whole_internet"}))
         self.assertEqual(_canon(self.kernel.state), _canon(WHOLE_SAFE_DESIRED))
+class LocalDnsTests(EnforcerTestCase):
+    def test_local_config_is_canonical_and_dual_stack_sink(self):
+        config = ne.render_resolver_config(
+            {},
+            ("Example.COM", "sub.example.com", "example.com"),
+            safe_search=False,
+        )
+        self.assertEqual(
+            ne._parse_resolver_config_details(config.encode()),
+            ({}, ("example.com", "sub.example.com"), False),
+        )
+        self.assertIn("address=/example.com/0.0.0.0\n", config)
+        self.assertIn("address=/example.com/::\n", config)
+        self.assertNotIn("local=/google.com/", config)
+
+    def test_parent_block_supersedes_nested_safesearch_sources(self):
+        resolved = {
+            target: (f"203.0.113.{index + 1}",)
+            for index, target in enumerate(ne.SAFESEARCH_TARGETS)
+            if target != "forcesafesearch.google.com"
+        }
+        config = ne.render_resolver_config(
+            resolved,
+            ("google.com",),
+            safe_search=True,
+        )
+        state = ne._parse_resolver_config_details(config.encode("utf-8"))
+        self.assertEqual(state[1:], (("google.com",), True))
+        self.assertNotIn("local=/www.google.com/", config)
+        self.assertIn("address=/google.com/0.0.0.0", config)
+
+    def test_large_owned_config_round_trips_above_legacy_read_limit(self):
+        domains = tuple(f"blocked-{index}.example" for index in range(5000))
+        config = ne.render_resolver_config({}, domains, safe_search=False)
+        self.assertGreater(len(config), 65536)
+        self.assertTrue(self.enforcer._write_resolver_config(config))
+        state = self.enforcer._read_owned_config_state()
+        self.assertEqual(state, ({}, tuple(sorted(domains)), False))
+
+    def test_local_reconcile_projects_blocked_names_before_redirect(self):
+        class LocalDns:
+            def __call__(self, family, addr, port, name, qtype, timeout=2.0):
+                if port != ne.RESOLVER_PORT:
+                    raise AssertionError("local DNS must not query upstream")
+                if name == "blocked.example":
+                    if qtype == A_QTYPE:
+                        return 0, [ne.SINK_ADDRESS_V4]
+                    if qtype == AAAA_QTYPE:
+                        return 0, [ne.SINK_ADDRESS_V6]
+                    return 0, []
+                return 3, []
+
+        self.enforcer._query = LocalDns()
+        self.enforcer.reconcile(
+            frozenset({"local_dns"}),
+            blocked_domains={"blocked.example"},
+        )
+        self.assertTrue(self.enforcer.healthy)
+        self.assertEqual(_canon(self.kernel.state), _canon(LOCAL_DESIRED))
+        config = self._conf_bytes().decode("utf-8")
+        self.assertIn("local=/blocked.example/", config)
+        self.assertIn("address=/blocked.example/0.0.0.0", config)
+        self.assertIn("address=/blocked.example/::", config)
+
+
 
 
 class RecoverTests(EnforcerTestCase):

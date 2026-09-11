@@ -96,7 +96,7 @@ class CommandImportTests(unittest.TestCase):
             def request(self, command, **_fields):
                 self.call = command
                 return {
-                    "schema_version": 5,
+                    "schema_version": 6,
                     "revision": 4,
                     "rules": [{
                         "id": "11111111-1111-4111-8111-111111111111",
@@ -218,7 +218,7 @@ class CommandImportTests(unittest.TestCase):
                         self.call = (command, fields)
                         if command == "list_rules":
                             return {
-                                "schema_version": 5,
+                                "schema_version": 6,
                                 "revision": 0,
                                 "rules": [],
                             }

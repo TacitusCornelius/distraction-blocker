@@ -235,16 +235,18 @@ class BlockerService:
                 continue
             active.append(rule)
             for target in rule.targets:
-                if target.kind == "website":
-                    website.add(target.value)
-                elif target.kind == "application":
+                if target.kind == "application":
                     application.add(target.value)
                 elif target.kind == "network":
                     network.add(target.value)
-                elif target.kind == "managed_list":
-                    managed = lists.get(target.value)
-                    if managed is not None:
-                        website.update(managed.domains)
+            if rule.system_blocking:
+                for target in rule.system_targets:
+                    if target.kind == "website":
+                        website.add(target.value)
+                    elif target.kind == "managed_list":
+                        managed = lists.get(target.value)
+                        if managed is not None:
+                            website.update(managed.domains)
         return website, application, frozenset(network), active
 
     def _application_rule_map(
@@ -548,9 +550,10 @@ class BlockerService:
                 if item.id == rule_id
                 and item.allowance_starts is not None
                 and all(
-                    target.kind in Target.URL_LIKE_KINDS
+                    target.kind in Target.URL_LIKE_KINDS | {"website", "managed_list"}
                     for target in item.targets
                 )
+                and not (item.system_blocking and item.system_targets)
             ),
             None,
         ) if selected is not None else None
@@ -606,15 +609,27 @@ class BlockerService:
         return frozenset(exhausted)
 
     def _policy_projection(
-        self, policy: Policy | None = None
+        self,
+        policy: Policy | None = None,
+        *,
+        active_only: bool = False,
     ) -> dict[str, Any]:
-        """Build the one strict projection shared by RPC and size checks."""
+        """Build the strict projection shared by RPC and size checks."""
         selected = policy if policy is not None else self.policy
         if selected is None:
             raise RuntimeError("service is not started")
-        return PolicyProjection.from_policy(
-            selected, self._exhausted_rule_ids(selected)
-        ).to_dict()
+        exhausted = self._exhausted_rule_ids(selected)
+        if active_only:
+            active_ids = {
+                rule.id for rule in self._active_targets(selected)[3]
+            }
+            selected = Policy(
+                selected.revision,
+                tuple(rule for rule in selected.rules if rule.id in active_ids),
+                selected.managed_lists,
+                selected.schema_version,
+            )
+        return PolicyProjection.from_policy(selected, exhausted).to_dict()
 
 
     @staticmethod
@@ -702,9 +717,13 @@ class BlockerService:
         self.applications.set_blocked(applications)
         if not getattr(self.applications, "healthy", True):
             self._healthy = False
-        self._reconcile_network(network)
+        self._reconcile_network(network, websites)
 
-    def _reconcile_network(self, controls: frozenset[str]) -> None:
+    def _reconcile_network(
+        self,
+        controls: frozenset[str],
+        blocked_domains: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
         self._active_network = controls
         if self.network is None or not self.network.available:
             if controls:
@@ -712,7 +731,13 @@ class BlockerService:
                 raise StorageError("active network controls require network enablement")
             return
         try:
-            self.network.reconcile(controls)
+            if "local_dns" in controls:
+                self.network.reconcile(
+                    controls,
+                    blocked_domains=blocked_domains,
+                )
+            else:
+                self.network.reconcile(controls)
             if not self.network.healthy:
                 raise StorageError("network enforcement is unhealthy")
         except Exception:
@@ -883,17 +908,27 @@ class BlockerService:
             raise ValidationError(
                 "too_large", "policy is too large for the service protocol"
             )
-        # Breadcrumb for reviewers (fail-closed ordering): persist before
-        # exposing a weaker live policy, and install the stronger union of
-        # old and new active network controls BEFORE the signed write. A
-        # failed save or failed union reconcile leaves the old stronger
-        # enforcement in place; it is never removed here.
+        # Breadcrumb (fail-closed ordering): persist before exposing a weaker
+        # live policy, and install the stronger union of old and new active
+        # network controls BEFORE the signed write. A failed save or failed
+        # union reconcile leaves the old stronger enforcement in place.
         if self.network is not None and bool(getattr(self.network, "available", False)):
-            old_network = self._active_targets()[2]
-            new_network = self._active_targets(policy)[2]
-            if old_network or new_network:
+            old_websites, _old_applications, old_network, _old_active = (
+                self._active_targets()
+            )
+            new_websites, _new_applications, new_network, _new_active = (
+                self._active_targets(policy)
+            )
+            union_network = frozenset(old_network | new_network)
+            if union_network:
                 try:
-                    self.network.reconcile(frozenset(old_network | new_network))
+                    if "local_dns" in union_network:
+                        self.network.reconcile(
+                            union_network,
+                            blocked_domains=old_websites | new_websites,
+                        )
+                    else:
+                        self.network.reconcile(union_network)
                     if not self.network.healthy:
                         raise StorageError("network enforcement is unhealthy")
                 except Exception as error:
@@ -954,6 +989,12 @@ class BlockerService:
     def _weakened_change(old: Rule, new: Rule) -> bool:
         old_targets = {(target.kind, target.value) for target in old.targets}
         new_targets = {(target.kind, target.value) for target in new.targets}
+        old_system_targets = {
+            (target.kind, target.value) for target in old.system_targets
+        }
+        new_system_targets = {
+            (target.kind, target.value) for target in new.system_targets
+        }
         old_exceptions = {
             (target.kind, target.value) for target in old.exceptions
         }
@@ -962,7 +1003,12 @@ class BlockerService:
         }
         return (
             old.enabled and not new.enabled
+            or (old.system_blocking and not new.system_blocking)
             or not old_targets <= new_targets
+            or (
+                old.system_blocking
+                and not old_system_targets <= new_system_targets
+            )
             or not new_exceptions <= old_exceptions
             or old.schedule.to_dict() != new.schedule.to_dict()
             or BlockerService._weakened_allowance(old, new)
@@ -1043,8 +1089,18 @@ class BlockerService:
             return "active rule allowance cannot be weakened"
         old_targets = {(target.kind, target.value) for target in old.targets}
         new_targets = {(target.kind, target.value) for target in new.targets}
+        old_system_targets = {
+            (target.kind, target.value) for target in old.system_targets
+        }
+        new_system_targets = {
+            (target.kind, target.value) for target in new.system_targets
+        }
         if not old_targets <= new_targets:
             return "active rule cannot remove targets"
+        if old.system_blocking and (
+            not new.system_blocking or not old_system_targets <= new_system_targets
+        ):
+            return "active rule cannot remove system targets"
         if old.schedule.kind != new.schedule.kind:
             return "active rule cannot shorten schedule"
         if old.schedule.kind == "one_time":
@@ -1103,7 +1159,7 @@ class BlockerService:
             if any(
                 target.kind == "managed_list"
                 and target.value == list_id
-                for target in rule.targets
+                for target in (*rule.targets, *rule.system_targets)
             )
         }
 
@@ -1797,6 +1853,7 @@ class BlockerService:
         "start_focus": ((frozenset({"command", "rule_id", "minutes"}),), "rule_id and minutes are required", "_cmd_start_focus"),
         "daily_schedule": ((frozenset({"command", "timezone", "date"}),), "timezone and date are required", "_cmd_daily_schedule"),
         "list_rules": ((frozenset({"command"}),), "unknown command field", "_cmd_list_rules"),
+        "list_active_rules": ((frozenset({"command"}),), "unknown command field", "_cmd_list_active_rules"),
         "list_locks": ((frozenset({"command"}),), "unknown command field", "_cmd_list_locks"),
         "list_denial_stats": ((frozenset({"command"}),), "unknown command field", "_cmd_list_denial_stats"),
         "clear_denial_stats": ((frozenset({"command"}),), "unknown command field", "_cmd_clear_denial_stats"),
@@ -2063,6 +2120,8 @@ class BlockerService:
         # Breadcrumb: the same projection is returned and size-checked by
         # _save, so an accepted policy always fits the RPC response frame.
         return self._ok(self._policy_projection())
+    def _cmd_list_active_rules(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
+        return self._ok(self._policy_projection(active_only=True))
 
     # Refused while enforcement is unhealthy. The gate runs before field
     # validation so an unhealthy service cannot weaken enforcement.
@@ -2088,6 +2147,7 @@ class BlockerService:
         entry = self._COMMANDS.get(command)
         if entry is None:
             return self._error("bad_request", "unknown command")
+
         allowed, message, handler = entry
         if command in self._UNHEALTHY_COMMANDS and not self.healthy:
             return self._error("unhealthy", "enforcement is not healthy")
@@ -2501,6 +2561,7 @@ class BlockerService:
             "offset": offset,
             "domains": list(domains),
             "next_offset": following if following < len(managed.domains) else None,
+            "revision": self.policy.revision,
         })
 
     def _cmd_begin_list_import(self, uid: int, request: dict[str, Any]) -> dict[str, Any]:
@@ -2633,7 +2694,11 @@ class BlockerService:
         if not isinstance(request.get("list_id"), str):
             return self._error("bad_request", "list_id is required")
         list_id = request["list_id"]
-        if any(target.kind == "managed_list" and target.value == list_id for rule in self.policy.rules for target in rule.targets):
+        if any(
+            target.kind == "managed_list" and target.value == list_id
+            for rule in self.policy.rules
+            for target in (*rule.targets, *rule.system_targets)
+        ):
             return self._error("in_use", "managed list is used by a rule")
         lists = tuple(item for item in self.policy.managed_lists if item.id != list_id)
         if len(lists) == len(self.policy.managed_lists):

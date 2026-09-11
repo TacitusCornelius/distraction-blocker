@@ -82,7 +82,7 @@ class ExportTests(unittest.TestCase):
         text = native_export_text(policy, datetime(2026, 8, 13, 12, tzinfo=timezone.utc))
         value = json.loads(text)
         self.assertEqual(value["format"], "distraction-blocker")
-        self.assertEqual(value["version"], 6)
+        self.assertEqual(value["version"], 8)
         self.assertEqual(parse_native_export(text), policy)
 
     def test_native_v1_import_converts_to_empty_lists(self):
@@ -177,7 +177,7 @@ class ExportTests(unittest.TestCase):
         })
         policy = Policy(0, (rule,))
         text = native_export_text(policy, datetime(2026, 8, 13, 12, tzinfo=timezone.utc))
-        self.assertEqual(json.loads(text)["version"], 6)
+        self.assertEqual(json.loads(text)["version"], 8)
         self.assertEqual(parse_native_export(text), policy)
 
     def test_native_v2_import_refuses_network_targets(self):
@@ -244,6 +244,27 @@ class ExportTests(unittest.TestCase):
                 }
                 with self.assertRaisesRegex(TransferError, "v5"):
                     parse_native_export(json.dumps(value))
+
+    def test_native_v6_import_refuses_local_dns_targets(self):
+        rule = Rule.from_dict({
+            "id": RULE_ID,
+            "name": "Local DNS",
+            "enabled": True,
+            "targets": [{"kind": "network", "value": "local_dns"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        value = {
+            "format": "distraction-blocker",
+            "version": 6,
+            "exported_utc": "2026-08-13T12:00:00Z",
+            "revision": 0,
+            "rules": [rule.to_dict()],
+            "managed_lists": [],
+        }
+        with self.assertRaisesRegex(TransferError, "v7"):
+            parse_native_export(json.dumps(value))
+
     def test_native_import_refuses_malformed_or_unknown_data(self):
         with self.assertRaisesRegex(TransferError, "line 1"):
             parse_native_export('{"format":"distraction-blocker"')

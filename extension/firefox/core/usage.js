@@ -44,6 +44,8 @@ function partition_rules(rules) {
 /** Maximum exact value for one counter. */
 const COUNTER_MAX = Number.MAX_SAFE_INTEGER;
 const USAGE_KINDS = new Set([
+  "website",
+  "managed_list",
   "url_path",
   "url_wildcard",
   "url_keyword",

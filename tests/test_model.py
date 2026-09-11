@@ -94,6 +94,30 @@ class ModelTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 Target.from_dict({"kind": "managed_list", "value": bad})
 
+    def test_system_target_scope_round_trips_and_restricts_kinds(self):
+        rule = Rule.from_dict({
+            "id": str(uuid.uuid4()),
+            "name": "system",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "browser.example"}],
+            "system_blocking": True,
+            "system_targets": [
+                {"kind": "website", "value": "system.example"},
+                {"kind": "managed_list", "value": LIST_ID},
+            ],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        self.assertTrue(rule.system_blocking)
+        self.assertEqual(len(rule.system_targets), 2)
+        with self.assertRaises(ValidationError):
+            Rule.from_dict({
+                **rule.to_dict(),
+                "system_targets": [
+                    {"kind": "application", "value": "/bin/app"}
+                ],
+            })
+
     def test_rejects_bool_integer_and_unknown_field(self):
         with self.assertRaises(ValidationError):
             Schedule.from_dict({"kind": "weekly", "timezone": "UTC", "periods": [{"weekdays": [True], "start": "09:00", "end": "10:00"}]})
@@ -323,7 +347,7 @@ class NetworkTargetTests(unittest.TestCase):
     # closed NETWORK_CONTROLS set, never raw firewall input.
 
     def test_network_control_values_round_trip(self):
-        for value in ("whole_internet", "alternate_dns", "safe_search", "doh", "proxy", "vpn"):
+        for value in ("whole_internet", "alternate_dns", "local_dns", "safe_search", "doh", "proxy", "vpn"):
             with self.subTest(value=value):
                 target = Target.from_dict({"kind": "network", "value": value})
                 self.assertEqual(target.to_dict(), {"kind": "network", "value": value})
@@ -441,13 +465,20 @@ class AllowanceStartsTests(unittest.TestCase):
             Rule.from_dict(allowance_rule_dict(allowance_startss=5))
 
 
-    def test_rejects_allowance_for_non_url_targets(self):
-        with self.assertRaisesRegex(
-            ValidationError, "URL-level targets"
-        ):
+    def test_browser_websites_accept_allowances(self):
+        rule = Rule.from_dict(
+            allowance_rule_dict(
+                targets=[{"kind": "website", "value": "example.com"}],
+                allowance_starts=5,
+            )
+        )
+        self.assertEqual(rule.allowance_starts, 5)
+
+    def test_rejects_allowance_for_non_browser_targets(self):
+        with self.assertRaisesRegex(ValidationError, "browser URL-level"):
             Rule.from_dict(
                 allowance_rule_dict(
-                    targets=[{"kind": "website", "value": "example.com"}],
+                    targets=[{"kind": "application", "value": "/bin/app"}],
                     allowance_starts=5,
                 )
             )
@@ -524,10 +555,10 @@ class TimeAllowanceTests(unittest.TestCase):
                     }
                 )
             )
-        with self.assertRaisesRegex(ValidationError, "URL-level"):
+        with self.assertRaisesRegex(ValidationError, "browser URL-level"):
             Rule.from_dict(
                 self._rule(
-                    targets=[{"kind": "website", "value": "example.com"}]
+                    targets=[{"kind": "application", "value": "/bin/app"}]
                 )
             )
 

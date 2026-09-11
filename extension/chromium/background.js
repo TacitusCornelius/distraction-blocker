@@ -15,7 +15,7 @@ import { AllowanceTracker } from "./core/allowance.js";
 // Breadcrumb: observational attribution only. DNR does the blocking; this
 // matcher just attributes observed loads so denial counts match Firefox.
 import { compile } from "./core/engine.js";
-import { rules_from_policy } from "./core/policy.js";
+import { expand_managed_lists, rules_from_policy } from "./core/policy.js";
 import {
   bump_bounded,
   bump_usage,
@@ -584,13 +584,27 @@ async function refresh() {
   await totals_ready;
   await usage_ready;
   await allowance_reports_ready;
-  const response = await host_request({ command: "list_rules" });
+  const response = await host_request({ command: "list_active_rules" });
   if (response && response.ok) {
     last_refresh_ms = Date.now();
-    if (await apply_policy(response.result)) {
-      await report_matches();
-      await report_usage();
-      await allowance_tracker.pulse();
+    try {
+      const expanded = await expand_managed_lists(
+        response.result,
+        (list_id, offset) =>
+          host_request({
+            command: "read_managed_list",
+            list_id,
+            offset,
+            limit: 200,
+          }),
+      );
+      if (await apply_policy(expanded)) {
+        await report_matches();
+        await report_usage();
+        await allowance_tracker.pulse();
+      }
+    } catch (error) {
+      record_state(`Managed-list policy load failed: ${String(error.message ?? error)}`);
     }
   } else {
     record_state(

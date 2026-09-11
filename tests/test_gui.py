@@ -459,6 +459,7 @@ class FormConversionTests(unittest.TestCase):
             targets=[
                 {"kind": "website", "value": "example.com"},
                 {"kind": "network", "value": "whole_internet"},
+                {"kind": "network", "value": "local_dns"},
                 {"kind": "network", "value": "safe_search"},
                 {"kind": "network", "value": "proxy"},
                 {"kind": "network", "value": "vpn"},
@@ -469,10 +470,10 @@ class FormConversionTests(unittest.TestCase):
         rebuilt = form_to_request(form, id_factory=lambda: UUID(RULE_ID))
 
         self.assertEqual(
-            form.network_controls, ("whole_internet", "safe_search", "proxy", "vpn")
+            form.network_controls, ("whole_internet", "local_dns", "safe_search", "proxy", "vpn")
         )
         self.assertEqual(rebuilt["rule"], rule.to_dict())
-        self.assertIn("4 network controls", _target_summary(rule))
+        self.assertIn("5 network controls", _target_summary(rule))
 
     def test_network_control_can_be_the_only_target(self) -> None:
         form = RuleForm(
@@ -1623,11 +1624,29 @@ class WebsiteUsageViewTests(unittest.TestCase):
             "allowance_starts", form_to_rule(no_budget).to_dict()
         )
 
-    def test_form_rejects_allowance_for_non_url_targets(self):
+    def test_form_round_trips_system_targets_and_toggle(self):
+        rule = Rule.from_dict({
+            "id": RULE_ID,
+            "name": "Scoped",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "browser.example"}],
+            "system_blocking": True,
+            "system_targets": [
+                {"kind": "website", "value": "system.example"},
+            ],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        form = rule_to_form(rule, "UTC")
+        rebuilt = form_to_rule(form, existing=rule)
+        self.assertTrue(form.system_blocking)
+        self.assertEqual(rebuilt.system_targets[0].value, "system.example")
+
+    def test_form_rejects_allowance_for_non_browser_targets(self):
         form = RuleForm(
             name="Budgeted",
-            websites=("example.com",),
-            applications=(),
+            websites=(),
+            applications=("/bin/app",),
             managed_list_ids=(),
             schedule_kind="indefinite",
             timezone="UTC",
@@ -1635,7 +1654,7 @@ class WebsiteUsageViewTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(FormError, "URL-level"):
             form_to_rule(form)
-    def test_timed_allowance_rejects_managed_list_targets(self):
+    def test_timed_allowance_accepts_managed_list_targets(self):
         form = RuleForm(
             name="Managed allowance",
             websites=(),
@@ -1646,6 +1665,24 @@ class WebsiteUsageViewTests(unittest.TestCase):
             weekly_periods=(WeeklyPeriodForm((0,), "09:00", "17:00"),),
             time_allowance_enabled=True,
             time_allowance_periods=(PeriodAllowanceForm("total", 30),),
+        )
+        self.assertIsNotNone(form_to_rule(form).time_allowance)
+
+    def test_timed_allowance_rejects_active_system_targets(self):
+        form = RuleForm(
+            name="System allowance",
+            websites=("example.com",),
+            applications=(),
+            managed_list_ids=(),
+            schedule_kind="weekly",
+            timezone="UTC",
+            weekly_periods=(WeeklyPeriodForm((0,), "09:00", "17:00"),),
+            time_allowance_enabled=True,
+            time_allowance_periods=(PeriodAllowanceForm("total", 30),),
+            system_blocking=True,
+            system_target_entries=(
+                {"kind": "website", "value": "system.example"},
+            ),
         )
         with self.assertRaisesRegex(FormError, "URL-level"):
             form_to_rule(form)

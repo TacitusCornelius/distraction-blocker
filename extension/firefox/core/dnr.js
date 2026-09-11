@@ -64,7 +64,14 @@ function case_insensitive_host(host) {
 
 /** Build the anchored DNR regexFilter body for one target, or null. */
 function target_pattern(target) {
-  const anchor = "^https?://" ;
+  const anchor = "^https?://";
+  if (target.kind === "website") {
+    return (
+      anchor +
+      case_insensitive_host(target.value) +
+      "(?::[0-9]+)?(?:[/?#].*)?$"
+    );
+  }
   if (target.kind === "url_path" || target.kind === "url_wildcard") {
     const parts = split_target(target.value);
     if (parts === null) {
@@ -154,6 +161,9 @@ function compile_dnr(rules) {
         });
       }
     }
+  }
+  if (entries.length > 5000) {
+    throw new Error("browser rule capacity cannot hold the complete policy");
   }
   entries.sort((a, b) =>
     a.exception - b.exception ||

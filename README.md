@@ -66,6 +66,10 @@ The supported controls are:
 - **Whole internet:** drops the protected UID's non-loopback IPv4 and IPv6
   output.
 - **Alternate DNS:** denies non-local DNS and DNS-over-TLS ports 53 and 853.
+- **Local DNS:** redirects the protected UID's DNS through an owned dnsmasq
+  resolver. Active website and managed-list hostnames resolve to deterministic
+  sink addresses while other names forward through systemd-resolved; remote
+  DNS and DNS-over-TLS are denied.
 - **SafeSearch:** redirects the protected UID's local DNS port 53 traffic to an
   owned resolver and applies documented Google, Bing, and YouTube mappings.
 - **Known DoH endpoints:** denies protected-UID TCP and UDP port 443 traffic
@@ -121,9 +125,9 @@ host console:
 sudo python3 scripts/recover_network.py --confirm
 ```
 
-Recovery removes only the owned nftables table and SafeSearch resolver,
-disables the boot fence, and removes the network opt-in marker after cleanup
-succeeds. The signed policy is preserved.
+Recovery removes only the owned nftables table and local DNS/SafeSearch
+resolver, disables the boot fence, and removes the network opt-in marker after
+cleanup succeeds. The signed policy is preserved.
 
 
 
@@ -207,6 +211,8 @@ sudo python3 scripts/install.py --confirm --owner-uid 1000
 ```
 
 The installer copies root-owned code to `/usr/lib/distraction-blocker`. It installs and starts `distraction-blocker.service`.
+
+
 
 Open **Distraction Blocker** from the Ubuntu application menu. You can also run the installed GUI directly:
 
@@ -464,7 +470,8 @@ Run the existing policy/browser acceptance:
 sudo python3 scripts/ubuntu_acceptance.py
 ```
 
-For the opt-in protected-user firewall and SafeSearch acceptance, use:
+For the opt-in protected-user firewall and local DNS/SafeSearch acceptance,
+use:
 
 ```bash
 sudo python3 scripts/network_acceptance.py
@@ -472,10 +479,10 @@ sudo python3 scripts/network_acceptance.py
 
 The network procedure requires `nftables`, `dnsmasq-base` (version 2.86 or
 newer), and active `systemd-resolved`; it refuses to install packages. It
-checks IPv4/IPv6 output, existing-flow denial, UID scope, DNS and
-SafeSearch transitions, resolver metadata records, drift repair, reboot fence
-behavior, offline recovery, uninstall, and preservation of foreign firewall
-state.
+checks IPv4/IPv6 output, existing-flow denial, UID scope, local DNS projection
+and forwarding, SafeSearch transitions, resolver metadata records, drift
+repair, reboot fence behavior, offline recovery, uninstall, and preservation
+of foreign firewall state.
 
 
 

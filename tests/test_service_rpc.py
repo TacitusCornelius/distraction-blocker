@@ -147,16 +147,63 @@ class FakeNetwork:
 
     def __init__(self):
         self.controls = frozenset()
+        self.blocked_domains = frozenset()
         self.fail = False
 
-    def reconcile(self, controls):
+    def reconcile(self, controls, blocked_domains=()):
         if self.fail:
             self.healthy = False
             raise OSError("network apply failed")
         self.controls = frozenset(controls)
+        self.blocked_domains = frozenset(blocked_domains)
 
 
 class ServiceTests(unittest.TestCase):
+    def test_local_dns_receives_active_website_projection(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Local DNS", "enabled": True,
+            "targets": [
+                {"kind": "network", "value": "local_dns"},
+                {"kind": "website", "value": "Example.COM"},
+            ],
+            "schedule": {"kind": "indefinite"}, "revision": 0,
+        })
+        store, network = FakeStore(Policy(0, (rule,))), FakeNetwork()
+        service = BlockerService(
+            store,
+            FakeClock(),
+            FakeHosts(),
+            FakeApplications(),
+            network=network,
+        )
+        service.start()
+        self.assertEqual(network.controls, {"local_dns"})
+        self.assertEqual(network.blocked_domains, set())
+
+    def test_system_targets_are_the_only_website_host_projection(self):
+        rule = Rule.from_dict({
+            "id": "12345678-1234-5678-1234-567812345678",
+            "name": "Scopes",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "browser.example"}],
+            "system_blocking": True,
+            "system_targets": [
+                {"kind": "website", "value": "system.example"},
+            ],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        hosts = FakeHosts()
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,))),
+            FakeClock(),
+            hosts,
+            FakeApplications(),
+        )
+        service.start()
+        self.assertEqual(hosts.values, {"system.example"})
+
     def test_network_strengthening_precedes_save_and_failed_weakening_keeps_policy(self):
         rule = Rule.from_dict({
             "id": "12345678-1234-5678-1234-567812345678",
@@ -671,7 +718,7 @@ class ServiceTests(unittest.TestCase):
         store = FakeStore(Policy(0, (rule,)))
         service = BlockerService(store, clock, FakeHosts(), FakeApplications())
         service.start()
-        self.assertEqual(service.hosts.values, {"example.com"})
+        self.assertEqual(service.hosts.values, set())
         configured = service.dispatch(1000, {
             "command": "set_rule_lock",
             "rule_id": rule.id,
@@ -683,7 +730,7 @@ class ServiceTests(unittest.TestCase):
         })
         self.assertTrue(pending["ok"], pending)
         self.assertIsNotNone(pending["result"]["pending_until_utc"])
-        self.assertEqual(service.hosts.values, {"example.com"})
+        self.assertEqual(service.hosts.values, set())
         repeated = service.dispatch(1000, {
             "command": "request_delay_break", "rule_id": rule.id,
         })
@@ -704,7 +751,7 @@ class ServiceTests(unittest.TestCase):
             store, clock, restarted_hosts, FakeApplications()
         )
         restarted.start()
-        self.assertEqual(restarted_hosts.values, {"example.com"})
+        self.assertEqual(restarted_hosts.values, set())
         clock.current += timedelta(seconds=60)
         restarted.tick()
         self.assertEqual(restarted_hosts.values, set())
@@ -734,7 +781,7 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(added["ok"], added)
         clock.current += timedelta(seconds=181)
         restarted.tick()
-        self.assertEqual(restarted_hosts.values, {"example.com"})
+        self.assertEqual(restarted_hosts.values, set())
 
     def test_clearing_active_delay_lock_reconciles_immediately(self):
         rule = Rule.from_dict({
@@ -766,7 +813,7 @@ class ServiceTests(unittest.TestCase):
             "lock": {"kind": "none"},
         })
         self.assertTrue(cleared["ok"], cleared)
-        self.assertEqual(service.hosts.values, {"example.com"})
+        self.assertEqual(service.hosts.values, set())
         self.assertEqual(store.delay_breaks.items, ())
 
     def test_failed_delay_lock_change_preserves_break_state(self):
@@ -1103,7 +1150,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(service.hosts.values, set())
         clock.current = datetime(2026, 1, 1, 2, tzinfo=timezone.utc)
         service.tick()
-        self.assertEqual(service.hosts.values, {"example.com"})
+        self.assertEqual(service.hosts.values, set())
 
     def test_managed_list_expands_and_status_is_bounded(self):
         managed = ManagedList.from_dict({
@@ -1130,14 +1177,44 @@ class ServiceTests(unittest.TestCase):
             FakeApplications(),
         )
         service.start()
-        self.assertEqual(service.hosts.values, set(managed.domains))
+        self.assertEqual(service.hosts.values, set())
         status = service.dispatch(1000, {"command": "status"})
-        self.assertEqual(status["result"]["active_counts"], {"website": 2, "application": 0, "network": 0})
+        self.assertEqual(status["result"]["active_counts"], {"website": 0, "application": 0, "network": 0})
         self.assertNotIn("active_targets", status["result"])
         listed = service.dispatch(1000, {"command": "list_managed_lists"})
         self.assertNotIn("domains", listed["result"][0])
         chunk = service.dispatch(1000, {"command": "read_managed_list", "list_id": managed.id, "offset": 0})
         self.assertEqual(chunk["result"]["domains"], list(managed.domains))
+    def test_system_managed_list_projects_domains_to_hosts(self):
+        managed = ManagedList.from_dict({
+            "id": "22222222-2222-4222-8222-222222222222",
+            "name": "System list",
+            "source": "starter",
+            "version": "1",
+            "license": "CC0",
+            "imported_utc": "2026-01-01T00:00:00Z",
+            "domains": ["one.example", "two.example"],
+        })
+        rule = Rule.from_dict({
+            "id": "23456789-2345-6789-2345-678923456789",
+            "name": "System block list",
+            "enabled": True,
+            "system_blocking": True,
+            "system_targets": [{"kind": "managed_list", "value": managed.id}],
+            "targets": [],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        hosts = FakeHosts()
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,), (managed,))),
+            FakeClock(),
+            hosts,
+            FakeApplications(),
+        )
+        service.start()
+        self.assertEqual(hosts.values, set(managed.domains))
+
 
     def test_rule_cannot_refer_to_unknown_managed_list(self):
         store = FakeStore(Policy(0, ()))
@@ -1268,7 +1345,7 @@ class ServiceTests(unittest.TestCase):
         result = service.dispatch(1000, {"command": "commit_native_import", "import_id": token})
         self.assertTrue(result["ok"])
         self.assertEqual(store.policy.rules, (replacement,))
-        self.assertEqual(service.hosts.values, {"new.example"})
+        self.assertEqual(service.hosts.values, set())
 
     def test_native_import_replaces_inactive_rules_atomically(self):
         old = Rule.from_dict({
@@ -1296,7 +1373,7 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertTrue(result["ok"])
         self.assertEqual(store.policy.rules, (replacement,))
-        self.assertEqual(service.hosts.values, {"new.example"})
+        self.assertEqual(service.hosts.values, set())
 
     def test_native_import_refuses_invalid_data_without_partial_save(self):
         old = Rule.from_dict({
@@ -1624,6 +1701,64 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(
             service.controls.lock_for(imported.id).break_seconds, 120
         )
+    def test_list_active_rules_excludes_rules_outside_schedule(self):
+        inactive = closed_weekly_rule()
+        active = Rule.from_dict({
+            "id": "33333333-3333-4333-8333-333333333333",
+            "name": "Active",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "active.example"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        service = BlockerService(
+            FakeStore(Policy(0, (inactive, active))),
+            FakeClock(),
+            FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        result = service.dispatch(1000, {"command": "list_active_rules"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [rule["id"] for rule in result["result"]["rules"]],
+            [active.id],
+        )
+    def test_list_active_rules_respects_weekly_boundary_gap(self):
+        rule = Rule.from_dict({
+            "id": "44444444-4444-4444-8444-444444444444",
+            "name": "Weekday boundary",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "boundary.example"}],
+            "schedule": {
+                "kind": "weekly",
+                "timezone": "America/New_York",
+                "periods": [
+                    {
+                        "weekdays": [4],
+                        "start": "09:00:00",
+                        "end": "12:00:00",
+                    },
+                    {
+                        "weekdays": [4],
+                        "start": "13:00:00",
+                        "end": "17:00:00",
+                    },
+                ],
+            },
+            "revision": 0,
+        })
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,))),
+            FakeClock(datetime(2026, 1, 2, 17, 58, tzinfo=timezone.utc)),
+            FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        result = service.dispatch(1000, {"command": "list_active_rules"})
+        self.assertEqual(result["result"]["rules"], [])
+
+
 
 def closed_weekly_rule(rule_id="12345678-1234-5678-1234-567812345678", **extra):
     """A weekly rule that is CLOSED at the FakeClock default instant."""

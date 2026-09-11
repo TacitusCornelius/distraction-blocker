@@ -1,7 +1,7 @@
 # distraction-blocker-network-owned-v1
 # Only the protected user's DNS sockets are redirected here.
 [Unit]
-Description=Distraction Blocker SafeSearch DNS resolver
+Description=Distraction Blocker local DNS and SafeSearch resolver
 Wants=systemd-resolved.service
 After=systemd-resolved.service
 BindsTo=distraction-blocker.service

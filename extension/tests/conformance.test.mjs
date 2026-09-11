@@ -76,6 +76,18 @@ test("URL exceptions allow a path covered by a broader rule", () => {
   assert.equal(match("https://example.com/allowed"), null);
 });
 
+test("website targets match an exact hostname across all paths", () => {
+  const match = compile([{
+    id: "website",
+    enabled: true,
+    targets: [{ kind: "website", value: "example.com" }],
+  }]);
+  assert.ok(match("https://example.com/any/path"));
+  assert.ok(match("https://EXAMPLE.COM/?q=1"));
+  assert.equal(match("https://sub.example.com/"), null);
+  assert.equal(match("https://example.com.evil.test/"), null);
+});
+
 
 // Breadcrumb: Firefox compiles the shared core to classic scripts (MV2
 // persistent background), so its copies intentionally differ from the

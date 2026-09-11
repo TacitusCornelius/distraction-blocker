@@ -154,12 +154,20 @@ class NativeHostTests(unittest.TestCase):
             host_entry,
             "Client",
             lambda socket_path: type(
-                "C", (), {"request": lambda self, command: {"healthy": True}}
+                "C", (), {"request": lambda self, **request: {"healthy": True}}
             )(),
         ):
             allowed = host_entry.handle({"command": "status"})
             self.assertTrue(allowed["ok"])
             self.assertEqual(allowed["result"], {"healthy": True})
+            allowed_list = host_entry.handle({
+                "command": "read_managed_list",
+                "list_id": "11111111-1111-4111-8111-111111111111",
+                "offset": 0,
+            })
+            self.assertTrue(allowed_list["ok"])
+            active = host_entry.handle({"command": "list_active_rules"})
+            self.assertTrue(active["ok"])
         denied = host_entry.handle({"command": "delete_rule"})
         self.assertFalse(denied["ok"])
         fields = host_entry.handle({"command": "status", "extra": 1})

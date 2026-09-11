@@ -455,9 +455,9 @@ remain part of this contract.
 
 ## Version 1.6 — Local DNS hostname backend
 
-Version 1.6 defines an opt-in local DNS backend for protected-user hostname
-enforcement. `local_dns` is a new closed network-control token, not an
-arbitrary firewall or resolver-configuration input. It uses the existing
+Version 1.6 implements an opt-in local DNS backend for protected-user
+hostname enforcement. `local_dns` is a new closed network-control token, not
+an arbitrary firewall or resolver-configuration input. It uses the existing
 installer risk acknowledgement and is not required for existing `/etc/hosts`
 operation.
 
@@ -515,6 +515,110 @@ cached answers, arbitrary DoH, proxies, VPNs, and direct-address traffic are
 not covered. This contract promises neither machine-wide DNS enforcement nor
 exhaustive SafeSearch.
 
+## Version 1.8 — Browser and system-level website enforcement
+
+Version 1.8 changes website enforcement to be browser-level by default.
+Browser website blocks and browser-expanded managed-list domains are enforced
+by the installed browser adapters and show the branded block page for
+top-level navigations. Existing `website` and `managed_list` rule targets are
+migrated to this browser-level behavior.
+
+System-level website enforcement becomes explicit and opt-in per rule through
+the **System-level blocks** section in the rule editor. The system-level
+section is disabled while its toggle is off, but its configured entries remain
+stored so toggling the section does not delete policy.
+
+### Policy scope and precedence
+
+The normal block-target box contains browser-level targets:
+
+- exact website hostnames, matching every path on that exact hostname;
+- managed-list contents expanded into browser website targets;
+- URL paths and bounded URL wildcards;
+- URL keywords; and
+- YouTube video and channel targets.
+
+The rule editor adds a **System-level blocks** box below **Application
+Blocks**. Its toggle controls whether the rule's `system_targets` contribute
+to root enforcement. `system_targets` are restricted to:
+
+- exact website hostnames; and
+- managed-list references.
+
+URL paths, keywords, YouTube targets, browser exceptions, and applications
+cannot be represented by the existing system hosts layer. Applications remain
+system-level independently of this toggle.
+
+When the system toggle is off, only browser-level targets apply. When it is
+on, active `system_targets` are projected through the root service's existing
+system enforcement. A system-level block takes precedence over a browser
+block because hostname resolution or system enforcement can prevent the
+browser request from reaching the extension. A browser exception can never
+override an active system-level block.
+
+The system-level explainer must state that system blocks normally produce a
+DNS or connection failure rather than the branded browser page. Browser-only
+mode is the default; it does not provide coverage when the extension is
+disabled, absent, or bypassed.
+
+### Browser block exceptions
+
+The editor section currently named **Block exceptions** is renamed
+**Browser Block exceptions**. Its entries remain URL-level, browser-only
+allows. They may allow a URL inside a browser-level website or URL block, but
+they do not weaken `system_targets`, application enforcement, or network
+controls.
+
+### Managed-list import behavior
+
+Managed lists are imported into the target box as their normalized contents,
+not as a visible `[Managed List] Name` target row. Selecting a list adds each
+website/domain in that list as an individual browser-level domain entry.
+Deselecting the list removes the domains contributed by that list from the
+box. Entries shared by another selected source remain because the target box
+represents a deduplicated union; provenance is retained so removal is
+deterministic.
+
+The visible editor representation is flattened, while policy storage may
+retain compact list provenance and a canonical expansion so large lists do
+not duplicate their full source data in every rule. The browser projection
+must build and install the complete effective domain set atomically. It must
+never silently drop entries, partially apply a list, or fall back to
+system-level enforcement when an adapter cannot accept the complete
+projection.
+
+Managed-list selection is an explicit import operation. Editing a managed
+list does not silently mutate an already saved rule; refreshing a rule's
+contents requires an explicit reimport or refresh action. A refresh replaces
+the list-owned contribution atomically and preserves separately authored
+browser targets.
+
+Expanded managed-list domains are browser targets and may participate in the
+same elapsed-time allowance contract as other browser website/URL targets.
+The allowance is shared by the rule's matching browser targets unless a later
+contract defines per-domain budgets. System-level targets, applications, and
+network controls remain ineligible for elapsed-time allowances.
+
+### Migration and schema
+
+The policy schema gains explicit `system_targets` and the per-rule system
+blocking state. Existing `website` and `managed_list` targets migrate to the
+browser target collection, and existing root hosts entries are removed by
+normal reconciliation. New rules default to browser-only with no
+`system_targets`.
+
+Native import/export, GUI editing, CLI summaries, browser projections, and
+statistics retain one strict schema contract. Migration must preserve target
+names, schedules, locks, and browser exceptions while making the website
+scope change explicit in preview and status output. A system toggle change is
+atomic with the rule update; failure must not leave a stale system block
+active or partially install a new one.
+
+These rules define the Version 1.8 scope. Any change to target placement,
+managed-list refresh behavior, system precedence, allowance eligibility, or
+browser capacity handling requires updating this contract before source
+changes.
+
 ## Dependency and release order
 
 The two tracks share a strict release order:
@@ -528,10 +632,10 @@ The two tracks share a strict release order:
    network target can be capability-checked through the service and the
    installer's explicit network opt-in. Import must not create a policy the
    host cannot enforce.
-3. Land the local DNS backend only after the existing SafeSearch resolver and
-   nftables ownership/recovery contract. Keep `/etc/hosts` through the full
-   disposable-VM matrix; only after it passes may local DNS become the
-   recommended backend for large managed lists.
+3. Version 1.6's local DNS backend is implemented behind the existing
+   SafeSearch resolver and nftables ownership/recovery contract. Keep
+   `/etc/hosts` through the full disposable-VM matrix; only after it passes
+   may local DNS become the recommended backend for large managed lists.
 
 Timed elapsed allowances remain browser-only. They are not attached to DNS or
 mixed-target rules unless a later contract defines a trustworthy DNS usage

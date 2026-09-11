@@ -17,9 +17,11 @@ from .control import ControlError, RuleLock
 from .model import POLICY_SCHEMA_VERSION, ManagedList, Policy, Rule, Schedule, Target, ValidationError
 
 NATIVE_FORMAT = "distraction-blocker"
-# Version 6 adds elapsed-time allowance policy fields; earlier portable
-# files are migrated on import when their targets remain supported.
-NATIVE_VERSION = 6
+# Version 6 adds elapsed-time allowance policy fields; version 7 adds the
+# local DNS network target; version 8 adds browser/system target separation.
+# Earlier portable files are migrated on import when their targets remain
+# supported.
+NATIVE_VERSION = 8
 MAX_DOMAIN_IMPORT_BYTES = 4 * 1024 * 1024
 MAX_NATIVE_IMPORT_BYTES = 8 * 1024 * 1024
 MAX_IMPORT_ENTRIES = 50_000
@@ -1456,7 +1458,7 @@ def parse_native_export(text: str) -> Policy:
     if value.get("format") != NATIVE_FORMAT:
         raise TransferError("native export format is not supported")
     version = value.get("version")
-    if type(version) is not int or version not in {1, 2, 3, 4, 5, NATIVE_VERSION}:
+    if type(version) is not int or version not in {1, 2, 3, 4, 5, 6, 7, NATIVE_VERSION}:
         raise TransferError("native export version is not supported")
     raw_rules = value.get("rules")
     if not isinstance(raw_rules, list):
@@ -1465,20 +1467,32 @@ def parse_native_export(text: str) -> Policy:
         for raw_rule in raw_rules:
             if not isinstance(raw_rule, Mapping) or not isinstance(raw_rule.get("targets"), list):
                 raise TransferError("native rule targets are invalid")
-            if version < NATIVE_VERSION and "allowance_time" in raw_rule:
+            if version < 8 and (
+                "system_blocking" in raw_rule
+                or "system_targets" in raw_rule
+            ):
+                raise TransferError(
+                    "system-level targets require native format v8"
+                )
+            if version < 6 and "allowance_time" in raw_rule:
                 raise TransferError(
                     "elapsed-time allowances require native format v6"
                 )
             for target in raw_rule["targets"]:
                 if not isinstance(target, Mapping) or target.get("kind") != "network":
                     continue
-                if version < 3 or target.get("value") in {"doh", "proxy", "vpn"}:
+                raw_target_value = target.get("value")
+                if raw_target_value == "local_dns" and version < 7:
+                    raise TransferError(
+                        "local DNS targets require native format v7"
+                    )
+                if version < 3 or raw_target_value in {"doh", "proxy", "vpn"}:
                     raise TransferError(
                         "network targets require native format v5"
-                        if target.get("value") in {"proxy", "vpn"}
+                        if raw_target_value in {"proxy", "vpn"}
                         else (
                             "DoH network targets require native format v4"
-                            if target.get("value") == "doh"
+                            if raw_target_value == "doh"
                             else "network targets require native format v3"
                         )
                     )

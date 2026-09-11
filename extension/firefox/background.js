@@ -16,6 +16,8 @@ const REFRESH_ALARM = "policy-refresh";
 const REFRESH_MINUTES = 1;
 const INACTIVE_KEY = "inactive-tab";
 const ALLOWANCE_REPORTS_KEY = "allowance_reports";
+const POLICY_KEY = "policy_snapshot";
+const STARTUP_REFRESH_WAIT_MS = 2000;
 let match = compile([]);
 let match_time_allowance = compile([]);
 let policy_ready = false;
@@ -59,6 +61,7 @@ const allowance_tracker = new AllowanceTracker({
 
 // Breadcrumb: onInstalled/onStartup/alarm ticks can overlap; serialize
 // refreshes so interleaved host_request/apply_rules pairs never race.
+let initial_refresh = Promise.resolve();
 let refresh_queue = Promise.resolve();
 function queue_refresh() {
   refresh_queue = refresh_queue.then(refresh).catch((err) => {
@@ -117,16 +120,7 @@ function record_state(error) {
     // A closed event page loses nothing that matters; the next refresh rewrites it.
   }
 }
-
-function apply_policy(policy) {
-  let rules;
-  try {
-    rules = rules_from_policy(policy);
-  } catch (error) {
-    policy_ready = false;
-    record_state(String(error.message ?? error));
-    return false;
-  }
+function install_matchers(rules) {
   // Breadcrumb: partition before compiling. Enforced rules keep blocking;
   // allowance rules permit starts until their budget is exhausted.
   const { enforced, allowance } = partition_rules(rules);
@@ -138,8 +132,55 @@ function apply_policy(policy) {
   if (active_tab_id !== null && active_tab_url !== null) {
     update_allowance_url(active_tab_id, active_tab_url);
   }
-  // Breadcrumb: Firefox has no persisted DNR equivalent. Once compilation
-  // succeeds, requests can leave the startup fail-closed state.
+}
+
+function restore_policy_snapshot(stored) {
+  const snapshot = stored && stored[POLICY_KEY];
+  if (!snapshot || typeof snapshot !== "object") {
+    return false;
+  }
+  try {
+    const rules = rules_from_policy(snapshot);
+    install_matchers(rules);
+    policy_ready = true;
+    last_error = null;
+    record_state(null);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function apply_policy(policy) {
+  let rules;
+  try {
+    rules = rules_from_policy(policy);
+  } catch (error) {
+    policy_ready = false;
+    record_state(String(error.message ?? error));
+    return false;
+  }
+  try {
+    install_matchers(rules);
+  } catch (error) {
+    policy_ready = false;
+    record_state(`Policy compile failed: ${String(error.message ?? error)}`);
+    return false;
+  }
+  // Breadcrumb: Firefox has no persisted DNR equivalent. Persist the
+  // complete expanded browser policy so startup can avoid a blanket block
+  // while the authoritative service refresh is in flight.
+  browser.storage.local
+    .set({
+      [POLICY_KEY]: {
+        schema_version: policy.schema_version,
+        revision: policy.revision,
+        rules,
+      },
+    })
+    .catch(() => {});
+  // Once compilation succeeds, requests can leave the startup fail-closed
+  // state.
   policy_ready = true;
   last_error = null;
   record_state(null);
@@ -299,14 +340,29 @@ async function flush_usage() {
 
 async function refresh() {
   await state_ready;
-  const response = await host_request({ command: "list_rules" });
+  const response = await host_request({ command: "list_active_rules" });
   last_refresh_ms = Date.now();
   if (response && response.ok) {
-    // The schema parser accepts the policy before either matcher changes.
-    if (apply_policy(response.result)) {
-      await flush_denials();
-      await flush_usage();
-      await allowance_tracker.pulse();
+    try {
+      const expanded = await expand_managed_lists(
+        response.result,
+        (list_id, offset) =>
+          host_request({
+            command: "read_managed_list",
+            list_id,
+            offset,
+            limit: 200,
+          }),
+      );
+      // The schema parser accepts the complete policy before either matcher
+      // changes.
+      if (apply_policy(expanded)) {
+        await flush_denials();
+        await flush_usage();
+        await allowance_tracker.pulse();
+      }
+    } catch (error) {
+      record_state(`Managed-list policy load failed: ${String(error.message ?? error)}`);
     }
   } else {
     record_state(
@@ -319,7 +375,7 @@ async function refresh() {
 
 /** True when the tab holding this request is not the visible tab. */
 const state_ready = browser.storage.local
-  .get(["denials", "usage", ALLOWANCE_REPORTS_KEY])
+  .get(["denials", "usage", ALLOWANCE_REPORTS_KEY, POLICY_KEY])
   .then((stored) => {
     merge_labels(pending_denials, stored?.denials, [INACTIVE_KEY]);
     merge_labels(pending_usage, stored?.usage);
@@ -330,6 +386,7 @@ const state_ready = browser.storage.local
         bump_bounded(inactive_denials, label.slice(prefix.length), count);
       }
     }
+    restore_policy_snapshot(stored);
   });
 browser.tabs.onActivated?.addListener(({ tabId }) => {
   active_tab_id = tabId;
@@ -379,11 +436,22 @@ function block_result(details, hit = null) {
   return { redirectUrl: block_page_url(details.url, hit) };
 }
 
+async function wait_for_initial_refresh() {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(resolve, STARTUP_REFRESH_WAIT_MS);
+  });
+  await Promise.race([initial_refresh, timeout]);
+  clearTimeout(timer);
+}
+
 browser.webRequest.onBeforeRequest.addListener(
   async (details) => {
     if (details.tabId === -1 || !details.url.startsWith("http")) {
       return {};
     }
+    await state_ready;
+    await wait_for_initial_refresh();
     if (!policy_ready) {
       return block_result(details);
     }
@@ -437,3 +505,4 @@ browser.runtime.onMessage.addListener((_message) => {
 });
 
 queue_refresh();
+initial_refresh = refresh_queue;

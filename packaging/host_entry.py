@@ -26,11 +26,15 @@ SOCKET = "/run/distraction-blocker/control.sock"
 READONLY_COMMANDS = frozenset({
     "status",
     "list_rules",
+    "list_active_rules",
     "list_denial_stats",
     "list_website_stats",
 })
 # Commands that carry payload fields; the field set is still pinned here.
 FIELD_COMMANDS = {
+    "read_managed_list": frozenset({
+        "command", "list_id", "offset", "limit",
+    }),
     "report_website_denials": frozenset({"command", "entries"}),
     "report_website_usage": frozenset({"command", "entries"}),
     "request_allowance_lease": frozenset({"command", "rule_id", "seconds"}),

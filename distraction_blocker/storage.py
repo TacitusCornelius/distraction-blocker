@@ -385,7 +385,7 @@ class ProtectedStore:
             raise StorageError("policy is invalid")
         if "schema_version" in data and (
             type(data["schema_version"]) is not int
-            or data["schema_version"] not in {1, 2, 3, 4}
+            or data["schema_version"] not in {1, 2, 3, 4, 5, 6}
         ):
             raise StorageError("old policy schema version is invalid")
         migrated = dict(data)
@@ -414,6 +414,10 @@ class ProtectedStore:
                 if set(old) != required:
                     raise StorageError("old weekly schedule is invalid")
                 converted["schedule"] = {"kind": "weekly", "timezone": old["timezone"], "periods": [{"weekdays": old["weekdays"], "start": old["start"], "end": old["end"]}]}
+            # Version 1.8 makes existing websites and managed-list references
+            # browser-level by default; system enforcement is opt-in.
+            converted.setdefault("system_blocking", False)
+            converted.setdefault("system_targets", [])
             converted_rules.append(converted)
         migrated["rules"] = converted_rules
         return migrated

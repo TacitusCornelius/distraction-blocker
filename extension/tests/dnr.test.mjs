@@ -93,6 +93,19 @@ test("URL exceptions emit higher-priority allow rules", () => {
   assert.equal(rule_to_regexp(entries[0].rule).test("https://example.com/blocked"), true);
   assert.equal(rule_to_regexp(entries[1].rule).test("https://example.com/allowed"), true);
 });
+
+test("website DNR patterns are exact hostnames and allow ports", () => {
+  const entries = compile_dnr([{
+    id: "website",
+    enabled: true,
+    targets: [{ kind: "website", value: "example.com" }],
+  }]);
+  const regexp = rule_to_regexp(entries[0].rule);
+  assert.equal(regexp.test("https://example.com/path"), true);
+  assert.equal(regexp.test("http://EXAMPLE.COM:8443/"), true);
+  assert.equal(regexp.test("https://sub.example.com/"), false);
+  assert.equal(regexp.test("https://example.com.evil/"), false);
+});
 test("YouTube video IDs keep case-sensitive parity with Firefox", () => {
   const rules = [{
     id: "video",

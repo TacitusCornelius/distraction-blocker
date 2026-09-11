@@ -297,7 +297,9 @@ class RuleForm:
     network_controls: tuple[str, ...] = ()
     notifications_enabled: bool = True
     notification_categories: tuple[str, ...] = NOTIFICATION_CATEGORIES
-
+    # System targets are exact hostnames or managed-list references only.
+    system_blocking: bool = False
+    system_target_entries: tuple[dict[str, str], ...] = ()
 
 @dataclass(frozen=True)
 class ServiceSnapshot:
@@ -306,8 +308,7 @@ class ServiceSnapshot:
     clock_reason: str
     active_websites: int
     active_applications: int
-    # Breadcrumb (network seam): count of distinct active network controls
-    # (0..6) across active rules; mirrors list-rules network targets.
+    # (0..7) across active rules; mirrors list-rules network targets.
     active_network: int
     rules: tuple[Rule, ...]
     managed_lists: tuple[ManagedListSummary, ...]
@@ -417,8 +418,17 @@ def _time_allowance_data(
         return None
     if form.schedule_kind != "weekly" or schedule.kind != "weekly":
         raise FormError("Timed allowances require a weekly schedule.")
-    if any(target.kind not in Target.URL_LIKE_KINDS for target in targets):
-        raise FormError("Timed allowances require URL-level targets only.")
+    if (
+        not targets
+        or any(
+            target.kind not in Target.URL_LIKE_KINDS | {"website", "managed_list"}
+            for target in targets
+        )
+        or (form.system_blocking and form.system_target_entries)
+    ):
+        raise FormError(
+            "Timed allowances require browser URL-level targets only."
+        )
     if schedule.has_overlapping_periods():
         raise FormError(
             "Timed allowances require non-overlapping weekly periods."
@@ -559,7 +569,18 @@ def form_to_rule(
         targets.append(
             Target.from_dict({"kind": "network", "value": control})
         )
-    if not targets:
+    system_targets: list[Target] = []
+    for entry in form.system_target_entries:
+        try:
+            target = Target.from_dict(entry)
+        except ValidationError as error:
+            raise FormError(error.message) from error
+        if target.kind not in {"website", "managed_list"}:
+            raise FormError(
+                "System-level blocks require exact websites or managed lists."
+            )
+        system_targets.append(target)
+    if not targets and not system_targets:
         raise FormError("Add at least one target.")
 
     if form.schedule_kind == "one_time":
@@ -653,6 +674,12 @@ def form_to_rule(
         "schedule": schedule.to_dict(),
         "revision": revision,
     }
+    if form.system_blocking:
+        rule_data["system_blocking"] = True
+    if system_targets:
+        rule_data["system_targets"] = [
+            target.to_dict() for target in system_targets
+        ]
     if exceptions:
         rule_data["exceptions"] = [target.to_dict() for target in exceptions]
     if form.allowance_starts is not None:
@@ -664,9 +691,15 @@ def form_to_rule(
             raise FormError(
                 "The daily start allowance must be a whole number from 1 up."
             )
-        if any(target.kind not in Target.URL_LIKE_KINDS for target in targets):
+        if (
+            any(
+                target.kind not in Target.URL_LIKE_KINDS | {"website", "managed_list"}
+                for target in targets
+            )
+            or (form.system_blocking and system_targets)
+        ):
             raise FormError(
-                "Daily start allowances require URL-level targets only."
+                "Daily start allowances require browser URL-level targets only."
             )
         rule_data["allowance_starts"] = form.allowance_starts
     if time_allowance_data is not None:
@@ -714,6 +747,10 @@ def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
         for item in targets
         if item["kind"] not in {"application", "network"}
     )
+    system_target_entries = tuple(
+        {"kind": target.kind, "value": target.value}
+        for target in rule.system_targets
+    )
     time_allowance = rule.time_allowance
     return replace(
         form,
@@ -746,6 +783,8 @@ def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
         network_controls=network_controls,
         notifications_enabled=rule.notifications_enabled,
         notification_categories=rule.notification_categories,
+        system_blocking=rule.system_blocking,
+        system_target_entries=system_target_entries,
     )
 
 
@@ -2931,8 +2970,9 @@ class GuiController:
                 )
                 if (
                     not isinstance(result, Mapping)
-                    or set(result) != {
-                        "id", "offset", "domains", "next_offset"
+                    or not {"id", "offset", "domains", "next_offset"} <= set(result)
+                    or set(result) - {
+                        "id", "offset", "domains", "next_offset", "revision"
                     }
                     or result["id"] != summary.id
                     or result["offset"] != offset
@@ -4390,6 +4430,7 @@ class WeeklyPeriodRow:
         )
 
 
+
 class RuleEditor:
     """Native add and edit window for all schedule forms."""
 
@@ -4427,9 +4468,12 @@ class RuleEditor:
             save,
         )
         self.target_entries: list[dict[str, str]] = []
+        self.system_target_entries: list[dict[str, str]] = []
         self.application_paths: list[str] = []
         self.url_targets: list[dict[str, str]] = []
         self.url_exceptions: list[dict[str, str]] = []
+        self.system_blocking = False
+        self.managed_list_domains: dict[str, tuple[str, ...]] = {}
         self.weekly_rows: list[WeeklyPeriodRow] = []
         local_now = datetime.now(ZoneInfo(timezone_name))
         self.default_one_start, self.default_one_end = default_one_time_window(local_now)
@@ -4600,13 +4644,13 @@ class RuleEditor:
         target_scroller.set_child(self.target_list)
         outer.append(target_scroller)
 
-        exception_heading = Gtk.Label(label="Block Exceptions")
+        exception_heading = Gtk.Label(label="Browser Block exceptions")
         exception_heading.add_css_class("heading")
         exception_heading.set_xalign(0)
         outer.append(exception_heading)
         exception_note = Gtk.Label(
             label=(
-                "Browser exceptions only. These do not override website, "
+                "Browser-only exceptions do not override system-level, "
                 "application, or network enforcement."
             )
         )
@@ -4698,6 +4742,85 @@ class RuleEditor:
         self.application_list.add_css_class("boxed-list")
         application_scroller.set_child(self.application_list)
         outer.append(application_scroller)
+        system_heading = Gtk.Label(label="System-level blocks")
+        system_heading.set_xalign(0)
+        system_heading.add_css_class("heading")
+        outer.append(system_heading)
+        system_note = Gtk.Label(
+            label=(
+                "Optional host-level blocks. These apply before the browser "
+                "extension and cannot be bypassed by browser exceptions."
+            )
+        )
+        system_note.set_xalign(0)
+        system_note.set_wrap(True)
+        system_note.add_css_class("dim-label")
+        outer.append(system_note)
+        system_toggle_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
+        )
+        self.system_blocking_check = Gtk.CheckButton(label="System-level blocks")
+        self.system_blocking_check.connect(
+            "toggled", self._system_blocking_changed
+        )
+        system_toggle_row.append(self.system_blocking_check)
+        system_toggle_row.append(
+            Gtk.Label(label="Exact hostnames and managed lists only.")
+        )
+        outer.append(system_toggle_row)
+        self.system_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.SMALL)
+        )
+        self.system_managed_list_checks: dict[str, object] = {}
+        system_managed_button = Gtk.MenuButton(label="Add managed list")
+        system_managed_popover = Gtk.Popover()
+        system_managed_menu = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.COMPACT)
+        )
+        system_managed_menu.set_margin_top(int(Space.SMALL))
+        system_managed_menu.set_margin_bottom(int(Space.SMALL))
+        system_managed_menu.set_margin_start(int(Space.SMALL))
+        system_managed_menu.set_margin_end(int(Space.SMALL))
+        for summary in self.managed_lists:
+            check = Gtk.CheckButton(
+                label=f"{summary.name} ({summary.domain_count} domains)"
+            )
+            check.connect(
+                "toggled",
+                lambda item, _id=summary.id: self._system_list_toggled(
+                    _id, item
+                ),
+            )
+            system_managed_menu.append(check)
+            self.system_managed_list_checks[summary.id] = check
+        if not self.managed_lists:
+            system_managed_menu.append(
+                Gtk.Label(label="No managed lists are installed.")
+            )
+        system_managed_popover.set_child(system_managed_menu)
+        system_managed_button.set_popover(system_managed_popover)
+        self.system_box.append(system_managed_button)
+        system_input = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=int(Space.SMALL)
+        )
+        self.system_entry = self._new_entry("example.com")
+        system_input.append(self.system_entry)
+        system_add = Gtk.Button.new_with_mnemonic("Add _hostname")
+        system_add.connect(
+            "clicked", lambda _button: self._add_system_target()
+        )
+        system_input.append(system_add)
+        self.system_box.append(system_input)
+        system_scroller = Gtk.ScrolledWindow()
+        system_scroller.set_min_content_height(80)
+        self.system_list = Gtk.ListBox()
+        self.system_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.system_list.add_css_class("boxed-list")
+        system_scroller.set_child(self.system_list)
+        self.system_box.append(system_scroller)
+        outer.append(self.system_box)
+        self._system_blocking_changed(self.system_blocking_check)
+
 
         # Compatibility aliases keep the pure URL-entry helper usable by
         # callers that construct an editor without GTK widget setup.
@@ -4993,10 +5116,11 @@ class RuleEditor:
     def _timed_allowance_targets_eligible(self) -> bool:
         entries = self._block_target_entries()
         return bool(entries) and all(
-            entry.get("kind") in Target.URL_LIKE_KINDS for entry in entries
+            entry.get("kind") in Target.URL_LIKE_KINDS | {"website", "managed_list"}
+            for entry in entries
         ) and not self.application_paths and not any(
             check.get_active() for check in self.network_checks.values()
-        )
+        ) and not (self.system_blocking and self.system_target_entries)
 
     def _update_time_allowance_availability(self) -> None:
         check = getattr(self, "time_allowance_check", None)
@@ -5010,13 +5134,14 @@ class RuleEditor:
         check.set_sensitive(eligible)
         if eligible:
             note.set_text(
-                "Timed allowances apply only to URL-level targets. "
-                "Configure one allowance mode for each weekly period."
+                "Timed allowances apply to browser websites, managed-list "
+                "domains, and URL-level targets. Configure one allowance "
+                "mode for each weekly period."
             )
         else:
             note.set_text(
-                "Add at least one URL rule and remove website, application, "
-                "managed-list, or network targets to enable timed allowances."
+                "Remove applications, network controls, or active "
+                "system-level blocks to enable timed allowances."
             )
     def _target_fields_changed(
         self, _check: object, _parameter: object | None = None
@@ -5140,6 +5265,14 @@ class RuleEditor:
             "stays available.",
         ),
         (
+            "local_dns",
+            "Local DNS",
+            "Routes the protected user's DNS through the local blocking "
+            "resolver. Active system-level website and managed-list "
+            "hostnames resolve to a deterministic sink; other names "
+            "forward normally. Also blocks remote DNS and encrypted DNS.",
+        ),
+        (
             "safe_search",
             "Safe search",
             "Routes the protected user's DNS through a local resolver "
@@ -5181,10 +5314,51 @@ class RuleEditor:
         entry = {"kind": "managed_list", "value": list_id}
         present = entry in self.target_entries
         if check.get_active() and not present:
+            try:
+                self._load_managed_list(list_id)
+            except FormError as error:
+                check.set_active(False)
+                self.error_label.set_text(str(error))
+                return
             self.target_entries.append(entry)
         elif not check.get_active() and present:
             self.target_entries.remove(entry)
         self._render_targets()
+        self._update_time_allowance_availability()
+
+    def _system_list_toggled(self, list_id: str, check: object) -> None:
+        entry = {"kind": "managed_list", "value": list_id}
+        present = entry in self.system_target_entries
+        if check.get_active() and not present:
+            try:
+                self._load_managed_list(list_id)
+            except FormError as error:
+                check.set_active(False)
+                self.error_label.set_text(str(error))
+                return
+            self.system_target_entries.append(entry)
+        elif not check.get_active() and present:
+            self.system_target_entries.remove(entry)
+        self._render_targets()
+        self._update_time_allowance_availability()
+
+    def _load_managed_list(self, list_id: str) -> None:
+        if list_id in self.managed_list_domains:
+            return
+        if self.read_managed_lists is None:
+            raise FormError("Managed-list contents are unavailable.")
+        lists = self.read_managed_lists(self.managed_lists)
+        for managed in lists:
+            if managed.id == list_id:
+                self.managed_list_domains[list_id] = managed.domains
+                return
+        raise FormError("The selected managed list was not found.")
+
+    def _system_blocking_changed(
+        self, check: object, _parameter: object | None = None
+    ) -> None:
+        self.system_blocking = check.get_active()
+        self.system_box.set_sensitive(self.system_blocking)
         self._update_time_allowance_availability()
 
     @staticmethod
@@ -5249,6 +5423,26 @@ class RuleEditor:
         self._render_targets()
         self._update_time_allowance_availability()
 
+    def _add_system_target(self) -> None:
+        value = self.system_entry.get_text().strip()
+        if not value:
+            self.error_label.set_text("Enter a hostname first.")
+            return
+        try:
+            target = Target.from_dict({"kind": "website", "value": value})
+        except ValidationError as error:
+            self.error_label.set_text(error.message)
+            return
+        normalized = target.to_dict()
+        if normalized in self.system_target_entries:
+            self.error_label.set_text("That hostname is already in the list.")
+            return
+        self.system_target_entries.append(normalized)
+        self.system_entry.set_text("")
+        self.error_label.set_text("")
+        self._render_targets()
+        self._update_time_allowance_availability()
+
     def _add_url_target(self) -> None:
         check = getattr(self, "url_exception_check", None)
         self._add_target(bool(check is not None and check.get_active()))
@@ -5267,6 +5461,7 @@ class RuleEditor:
         entries: Sequence[dict[str, str]],
         *,
         exception: bool = False,
+        system: bool = False,
     ) -> None:
         Gtk = self.Gtk
         self._clear_list(widget)
@@ -5283,7 +5478,42 @@ class RuleEditor:
         managed_names = {
             summary.id: summary.name for summary in self.managed_lists
         }
+        rendered: dict[
+            tuple[str, str],
+            tuple[dict[str, str], dict[str, str], list[str]],
+        ] = {}
         for entry in entries:
+            expanded = (
+                [
+                    {"kind": "website", "value": domain}
+                    for domain in self.managed_list_domains.get(
+                        entry["value"], ()
+                    )
+                ]
+                if entry["kind"] == "managed_list"
+                else [entry]
+            )
+            if not expanded:
+                expanded = [entry]
+            for display_entry in expanded:
+                key = (display_entry["kind"], display_entry["value"])
+                source = (
+                    managed_names.get(entry["value"], entry["value"])
+                    if entry["kind"] == "managed_list"
+                    and display_entry is not entry
+                    else None
+                )
+                current = rendered.get(key)
+                if current is not None:
+                    if source is not None and source not in current[2]:
+                        current[2].append(source)
+                    continue
+                rendered[key] = (
+                    display_entry,
+                    entry,
+                    [] if source is None else [source],
+                )
+        for display_entry, entry, sources in rendered.values():
             row = Gtk.ListBoxRow()
             box = Gtk.Box(
                 orientation=Gtk.Orientation.HORIZONTAL,
@@ -5296,26 +5526,32 @@ class RuleEditor:
                 box.set_margin_end,
             ):
                 method(int(Space.COMPACT))
-            value = entry["value"]
-            if entry["kind"] == "managed_list":
+            value = display_entry["value"]
+            if entry["kind"] == "managed_list" and display_entry is entry:
                 value = f"{managed_names.get(value, value)} ({value})"
+            provenance = f" (from {', '.join(sources)})" if sources else ""
             prefix = "Exception: " if exception else ""
             label = Gtk.Label(
-                label=f"{prefix}[{kind_labels.get(entry['kind'], entry['kind'])}] "
-                f"{value}"
+                label=(
+                    f"{prefix}[{kind_labels.get(display_entry['kind'], display_entry['kind'])}] "
+                    f"{value}{provenance}"
+                )
             )
             label.set_xalign(0)
             label.set_ellipsize(3)
             label.set_hexpand(True)
             box.append(label)
-            remove = Gtk.Button.new_with_mnemonic("_Remove")
-            remove.set_tooltip_text(f"Remove {entry['value']}")
-            remove.connect(
-                "clicked",
-                lambda _button, item=dict(entry), is_exception=exception:
-                self._remove_target(item, is_exception),
-            )
-            box.append(remove)
+            if display_entry is entry:
+                remove = Gtk.Button.new_with_mnemonic("_Remove")
+                remove.set_tooltip_text(f"Remove {entry['value']}")
+                remove.connect(
+                    "clicked",
+                    lambda _button, item=dict(entry), is_exception=exception,
+                    is_system=system: self._remove_target(
+                        item, is_exception, is_system
+                    ),
+                )
+                box.append(remove)
             row.set_child(box)
             widget.append(row)
 
@@ -5323,7 +5559,9 @@ class RuleEditor:
         if hasattr(self, "target_list"):
             self._render_list(self.target_list, self.target_entries)
             self._render_list(
-                self.exception_list, self.url_exceptions, exception=True
+                self.system_list,
+                self.system_target_entries,
+                system=True,
             )
             self._render_applications()
             return
@@ -5334,15 +5572,26 @@ class RuleEditor:
             self._render_targets()
             return
         self._render_list(self.url_list, self.url_targets)
-
     def _remove_target(
-        self, entry: dict[str, str], exception: bool = False
+        self,
+        entry: dict[str, str],
+        exception: bool = False,
+        system: bool = False,
     ) -> None:
-        target_list = self.url_exceptions if exception else self.target_entries
+        target_list = (
+            self.system_target_entries
+            if system
+            else self.url_exceptions if exception else self.target_entries
+        )
         if entry in target_list:
             target_list.remove(entry)
-        if not exception and entry.get("kind") == "managed_list":
-            check = self.managed_list_checks.get(entry["value"])
+        if entry.get("kind") == "managed_list":
+            checks = (
+                self.system_managed_list_checks
+                if system
+                else self.managed_list_checks
+            )
+            check = checks.get(entry["value"])
             if check is not None and check.get_active():
                 check.set_active(False)
         self._render_targets()
@@ -5779,6 +6028,7 @@ class RuleEditor:
             entry for entry in target_entries
             if entry.get("kind") in Target.URL_LIKE_KINDS
         )
+        system_target_entries = tuple(self.system_target_entries)
         return RuleForm(
             name=self.name_entry.get_text(),
             websites=websites,
@@ -5824,6 +6074,8 @@ class RuleEditor:
                 else self.time_allowance_daily_spin.get_value_as_int()
             ),
             configure_lock_after_save=self.configure_lock_check.get_active(),
+            system_blocking=self.system_blocking_check.get_active(),
+            system_target_entries=system_target_entries,
         )
 
     def _submit(self) -> None:
@@ -5880,8 +6132,21 @@ class RuleEditor:
             check = self.managed_list_checks.get(list_id)
             if check is not None:
                 check.set_active(True)
-        for control, check in self.network_checks.items():
-            check.set_active(control in form.network_controls)
+            self._load_managed_list(list_id)
+        if hasattr(self, "system_target_entries"):
+            self.system_target_entries = list(form.system_target_entries)
+            for entry in self.system_target_entries:
+                if entry.get("kind") == "managed_list":
+                    if hasattr(self, "system_managed_list_checks"):
+                        self._load_managed_list(entry["value"])
+                        check = self.system_managed_list_checks.get(
+                            entry["value"]
+                        )
+                        if check is not None:
+                            check.set_active(True)
+            if hasattr(self, "system_blocking_check"):
+                self.system_blocking_check.set_active(form.system_blocking)
+            self._render_targets()
         selected = SCHEDULE_KINDS.index(form.schedule_kind)
         self.schedule_dropdown.set_selected(selected)
         self.schedule_stack.set_visible_child_name(form.schedule_kind)

@@ -1,4 +1,4 @@
-"""Privileged network enforcement: nftables UID fence and SafeSearch resolver.
+"""Privileged network enforcement: nftables UID fence and local DNS resolver.
 
 This module owns exactly two kernel-side resources and one local resolver:
 
@@ -20,10 +20,14 @@ Scope and explicit boundaries (do not over-claim):
 * ``whole_internet`` drops all of the protected UID's non-loopback IPv4 and
   IPv6 traffic, including already-established flows. Loopback (and therefore
   the local RPC socket) always works.
-* ``alternate_dns`` blocks the protected UID's non-local TCP/UDP 53 and
+* ``alternate_dns`` blocks the protected user's non-local TCP/UDP 53 and
   TCP/UDP 853. Loopback DNS to the system stub resolver stays reachable.
+* ``local_dns`` redirects the protected user's port-53 DNS through the
+  dedicated dnsmasq instance. Exact active website hostnames are answered
+  locally with deterministic sink addresses; all other names forward to the
+  system stub resolver. Non-local TCP/UDP 53 and 853 are blocked.
 * ``safe_search`` implies the DNS restrictions above and, in addition,
-  redirects the protected UID's loopback-bound TCP/UDP 53 (including the
+  redirects the protected user's loopback-bound TCP/UDP 53 (including the
   systemd stub resolver) to the dedicated dnsmasq on 127.0.0.54:1053 (IPv4)
   and [::1]:1053 (IPv6). The redirect is NAT on *new* flows only; already
   established port-53 flows are dropped by filter rules placed BEFORE the
@@ -48,8 +52,10 @@ Scope and explicit boundaries (do not over-claim):
   identify tunnels on arbitrary ports, encrypted protocols hidden in ordinary
   traffic, or local VPN/proxy processes; it is not exhaustive.
 * The controls combine additively: ``whole_internet`` contributes the final
-  non-loopback deny, ``safe_search`` contributes the port-53/853 drops and
-  the redirect chain, ``alternate_dns`` contributes the non-local 53/853
+  non-loopback deny, ``local_dns`` contributes projected local DNS answers
+  plus port-53/853 restrictions and the redirect chain, ``safe_search``
+  contributes the documented provider mappings, port-53/853 drops, and the
+  redirect chain, ``alternate_dns`` contributes the non-local 53/853
   restrictions, ``doh`` contributes catalog-address 443 drops, ``proxy``
   contributes common proxy-port drops, and ``vpn`` contributes common
   VPN-port plus GRE/ESP drops. Any combination is the union of its members;
@@ -81,8 +87,10 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
+
 from .model import NETWORK_CONTROLS
+
 TABLE_FAMILY = "inet"
 TABLE_NAME = "distraction_blocker"
 OWNERSHIP_COMMENT = "distraction-blocker-network-enforcer"
@@ -358,6 +366,9 @@ RESOLVER_BEGIN = "# distraction-blocker-network-owned-v1"
 RESOLVER_ADDR_V4 = "127.0.0.54"
 RESOLVER_ADDR_V6 = "::1"
 RESOLVER_PORT = 1053
+# A 50,000-domain managed list is bounded to 4 MiB in the policy model; each
+# hostname expands to three dnsmasq directives, so retain headroom here.
+MAX_RESOLVER_CONFIG_BYTES = 16 * 1024 * 1024
 # The only trusted upstream is the systemd-resolved stub. No other
 # (untrusted, user-writable) address may be used as a fallback.
 UPSTREAM_ADDRESSES = ((socket.AF_INET, "127.0.0.53"),)
@@ -381,10 +392,9 @@ _HEALTH_NAME = "distraction-blocker-health.invalid"
 #   ("daddr", "ip" | "ip6", address or "prefix/len")
 #   ("dnat", "ip" | "ip6", address, port)
 #   ("drop",) / ("accept",)
-#
-# Rule order is chain order: the first matching rule wins.  SafeSearch port
-# 53 drops sit BEFORE the general loopback accept (established port-53 flows
-# never re-enter the NAT redirect) and the whole-internet deny is last.
+# Rule order is chain order: resolver-control port 53 drops sit BEFORE the
+# general loopback accept (established port-53 flows never re-enter the NAT
+# redirect) and the whole-internet deny is last.
 _Expr = tuple
 
 
@@ -392,26 +402,27 @@ def _desired_ruleset(uid: int, controls: frozenset[str]) -> dict[str, Any]:
     """Return {"comment", "chains", "rules"} for the active control set."""
     whole = "whole_internet" in controls
     alt = "alternate_dns" in controls
+    local = "local_dns" in controls
     safe = "safe_search" in controls
     doh = "doh" in controls
     proxy = "proxy" in controls
     vpn = "vpn" in controls
     owner: _Expr = ("meta", "skuid", uid)
     output: list[_Expr] = []
-    if safe:
+    if local or safe:
         # Existing port-53 flows cannot be re-evaluated by output NAT.
         output.append((owner, ("dport", "tcp", 53), ("drop",)))
         output.append((owner, ("dport", "udp", 53), ("drop",)))
-    if alt or safe:
-        # Local DoT remains usable; SafeSearch's DNS path is port 1053.
+    if alt or local or safe:
+        # Local DoT remains usable; the local resolver's DNS path is port 1053.
         output.append((owner, ("dport", "tcp", 853), ("meta", "oifname", "lo"), ("accept",)))
         output.append((owner, ("dport", "udp", 853), ("meta", "oifname", "lo"), ("accept",)))
-    if alt and not safe:
+    if alt and not local and not safe:
         output.append((owner, ("dport", "tcp", 53), ("meta", "oifname", "lo"), ("accept",)))
         output.append((owner, ("dport", "udp", 53), ("meta", "oifname", "lo"), ("accept",)))
         output.append((owner, ("dport", "tcp", 53), ("drop",)))
         output.append((owner, ("dport", "udp", 53), ("drop",)))
-    if alt or safe:
+    if alt or local or safe:
         output.append((owner, ("dport", "tcp", 853), ("drop",)))
         output.append((owner, ("dport", "udp", 853), ("drop",)))
     if doh:
@@ -447,11 +458,13 @@ def _desired_ruleset(uid: int, controls: frozenset[str]) -> dict[str, Any]:
         output.append((owner, ("drop",)))
 
     desired: dict[str, Any] = {"comment": OWNERSHIP_COMMENT, "chains": {}, "rules": {}}
-    if whole or alt or safe or doh or proxy or vpn:
+    if whole or alt or local or safe or doh or proxy or vpn:
         desired["chains"]["output"] = ("filter", "output", 0, "accept")
         desired["rules"]["output"] = tuple(output)
-    if safe:
-        # Redirect only loopback-bound new port-53 flows.
+    if local or safe:
+        # Both resolver controls redirect only loopback-bound port-53 traffic.
+        # Remote port 53 is denied in the output filter, rather than silently
+        # rewritten into an allowed local forwarder.
         desired["chains"]["dns_redirect"] = ("nat", "output", -100, "accept")
         desired["rules"]["dns_redirect"] = (
             (owner, ("daddr", "ip", "127.0.0.0/8"), ("dport", "udp", 53),
@@ -790,36 +803,97 @@ def _dns_query(
 
 
 # ---------------------------------------------------------------------------
-# Dedicated SafeSearch resolver (dnsmasq on 1053, forwarding to 53)
+# Dedicated local DNS and SafeSearch resolver (dnsmasq on 1053, forwarding to 53)
 # ---------------------------------------------------------------------------
 
 
-def render_resolver_config(resolved: Mapping[str, tuple[str, ...]]) -> str:
-    """Render the owned dnsmasq config.
+SINK_ADDRESS_V4 = "0.0.0.0"
+SINK_ADDRESS_V6 = "::"
+_SAFESEARCH_SOURCES = frozenset(source for _provider, source, _target in SAFESEARCH_MAPPINGS)
 
-    Every mapped source hostname is locally authoritative: only the enforced
-    A answer exists, so AAAA/HTTPS/SVCB get NOERROR-NODATA.
-    """
+
+def _normalize_blocked_domains(domains: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(domains, (str, bytes)):
+        raise ResolverError("blocked hostnames must be an iterable of hostnames")
+    try:
+        result = set()
+        for value in domains:
+            if not isinstance(value, str):
+                raise ValueError("blocked hostname must be a string")
+            name = value.strip().rstrip(".").lower()
+            if (
+                not name
+                or len(name) > 253
+                or "/" in name
+                or "\\" in name
+                or "*" in name
+                or ":" in name
+                or any(
+                    not label
+                    or len(label) > 63
+                    or not label[0].isalnum()
+                    or not label[-1].isalnum()
+                    or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in label)
+                    for label in name.split(".")
+                )
+            ):
+                raise ValueError(f"invalid blocked hostname {value!r}")
+            result.add(name)
+        return tuple(sorted(result))
+    except (TypeError, ValueError) as exc:
+        raise ResolverError(f"invalid blocked hostnames: {exc}") from exc
+
+def _domain_is_blocked(domain: str, blocked: Iterable[str]) -> bool:
+    return any(domain == parent or domain.endswith("." + parent) for parent in blocked)
+
+
+def render_resolver_config(
+    resolved: Mapping[str, tuple[str, ...]],
+    blocked_domains: Iterable[str] = (),
+    *,
+    safe_search: bool = True,
+) -> str:
+    """Render the owned dnsmasq config for SafeSearch and local DNS."""
     try:
         normalized = {
             target: tuple(sorted(set(ips)))
             for target, ips in resolved.items()
         }
-        if set(normalized) != set(SAFESEARCH_TARGETS):
-            raise ValueError("resolved targets do not match SafeSearch policy")
-        for target, ips in normalized.items():
-            if not ips:
-                raise ValueError(f"no A records for {target}")
-            if any(
-                not isinstance(ip, str) or ipaddress.ip_address(ip).version != 4
-                for ip in ips
-            ):
-                raise ValueError(f"non-IPv4 A record for {target}")
+        blocked = _normalize_blocked_domains(blocked_domains)
+        blocked_sources = {
+            source
+            for _provider, source, _target in SAFESEARCH_MAPPINGS
+            if _domain_is_blocked(source, blocked)
+        }
+        if safe_search:
+            expected_targets = {
+                target
+                for _provider, source, target in SAFESEARCH_MAPPINGS
+                if source not in blocked_sources
+            }
+            if set(normalized) != expected_targets:
+                raise ValueError("resolved targets do not match SafeSearch policy")
+            for target, ips in normalized.items():
+                if not ips:
+                    raise ValueError(f"no A records for {target}")
+                if any(
+                    not isinstance(ip, str) or ipaddress.ip_address(ip).version != 4
+                    for ip in ips
+                ):
+                    raise ValueError(f"non-IPv4 A record for {target}")
+        elif normalized:
+            raise ValueError("SafeSearch addresses supplied while SafeSearch is disabled")
     except (AttributeError, TypeError, ValueError) as exc:
-        raise ResolverError(f"invalid SafeSearch addresses: {exc}") from exc
+        if isinstance(exc, ResolverError):
+            raise
+        raise ResolverError(f"invalid resolver policy: {exc}") from exc
     lines = [
         RESOLVER_BEGIN,
         "# Owned by the distraction-blocker network enforcer. Do not edit.",
+    ]
+    if safe_search:
+        lines.append("# SafeSearch mappings enabled.")
+    lines.extend([
         f"port={RESOLVER_PORT}",
         f"listen-address={RESOLVER_ADDR_V4}",
         f"listen-address={RESOLVER_ADDR_V6}",
@@ -831,69 +905,136 @@ def render_resolver_config(resolved: Mapping[str, tuple[str, ...]]) -> str:
         "group=distraction-blocker-dns",
         "local-ttl=0",
         "auth-ttl=0",
-    ]
-    for _provider, source, _target in SAFESEARCH_MAPPINGS:
-        lines.append(f"local=/{source}/")
-    for _provider, source, target in SAFESEARCH_MAPPINGS:
-        for ip in normalized[target]:
-            lines.append(f"address=/{source}/{ip}")
+    ])
+    for domain in blocked:
+        lines.append(f"local=/{domain}/")
+        lines.append(f"address=/{domain}/{SINK_ADDRESS_V4}")
+        lines.append(f"address=/{domain}/{SINK_ADDRESS_V6}")
+    if safe_search:
+        for _provider, source, _target in SAFESEARCH_MAPPINGS:
+            if source not in blocked_sources:
+                lines.append(f"local=/{source}/")
+        for _provider, source, target in SAFESEARCH_MAPPINGS:
+            if source not in blocked_sources:
+                for ip in normalized[target]:
+                    lines.append(f"address=/{source}/{ip}")
     return "\n".join(lines) + "\n"
 
 
-def _parse_resolver_config(data: bytes) -> dict[str, tuple[str, ...]] | None:
-    """Recover canonical forced-target A records from an owned config."""
+def _parse_resolver_config_details(
+    data: bytes,
+) -> tuple[dict[str, tuple[str, ...]], tuple[str, ...], bool] | None:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return None
     if not text.startswith(RESOLVER_BEGIN + "\n"):
         return None
-    sources: dict[str, list[str]] = {}
+    local_domains: set[str] = set()
+    addresses: dict[str, list[str]] = {}
+    safe_marker = False
     for line in text.splitlines():
-        if line.startswith("local=/") and line.endswith("/"):
-            source = line[len("local=/") : -1]
-            if source in sources:
+        if line == "# SafeSearch mappings enabled.":
+            safe_marker = True
+        elif line.startswith("local=/") and line.endswith("/"):
+            domain = line[len("local=/") : -1]
+            if domain in local_domains:
                 return None
-            sources[source] = []
+            local_domains.add(domain)
         elif line.startswith("address=/"):
             body = line[len("address=/") :]
             host, separator, ip = body.rpartition("/")
-            if not separator or host not in sources or not ip:
+            if not separator or not host or not ip or host not in local_domains:
                 return None
             try:
-                if ipaddress.ip_address(ip).version != 4:
-                    return None
+                ipaddress.ip_address(ip)
             except ValueError:
                 return None
-            sources[host].append(ip)
-    targets: dict[str, set[str]] = {}
-    for _provider, source, target in SAFESEARCH_MAPPINGS:
-        if source not in sources or not sources[source]:
+            addresses.setdefault(host, []).append(ip)
+    blocked = {
+        domain
+        for domain in local_domains
+        if domain not in _SAFESEARCH_SOURCES
+        or addresses.get(domain) == [SINK_ADDRESS_V4, SINK_ADDRESS_V6]
+    }
+    for domain in blocked:
+        if addresses.get(domain) != [SINK_ADDRESS_V4, SINK_ADDRESS_V6]:
             return None
-        targets.setdefault(target, set()).update(sources[source])
-    if set(targets) != set(SAFESEARCH_TARGETS):
+    blocked_sources = {
+        source
+        for _provider, source, _target in SAFESEARCH_MAPPINGS
+        if _domain_is_blocked(source, blocked)
+    }
+    safe_enabled = safe_marker or bool(
+        (local_domains & _SAFESEARCH_SOURCES) - blocked_sources
+    )
+    safe_sources = _SAFESEARCH_SOURCES - blocked_sources if safe_enabled else frozenset()
+    if safe_enabled and local_domains & safe_sources != safe_sources:
         return None
-    normalized = {target: tuple(sorted(ips)) for target, ips in sorted(targets.items())}
-    # Require the complete deterministic file, not merely a trusted-looking
-    # sentinel plus a subset of directives that dnsmasq might interpret.
+    sources = {
+        source: tuple(sorted(set(addresses.get(source, ()))))
+        for source in safe_sources
+    }
+    if safe_enabled and any(not sources[source] for source in safe_sources):
+        return None
+    normalized: dict[str, set[str]] = {}
+    for _provider, source, target in SAFESEARCH_MAPPINGS:
+        if safe_enabled and source not in blocked_sources:
+            normalized.setdefault(target, set()).update(sources[source])
+    normalized_result = {
+        target: tuple(sorted(ips)) for target, ips in sorted(normalized.items())
+    }
     try:
-        if render_resolver_config(normalized).encode("utf-8") != data:
-            return None
+        canonical = render_resolver_config(
+            normalized_result,
+            tuple(sorted(blocked)),
+            safe_search=safe_enabled,
+        ).encode("utf-8")
     except ResolverError:
         return None
-    return normalized
+    if canonical != data:
+        return None
+    return normalized_result, tuple(sorted(blocked)), safe_enabled
+
+
+def _parse_resolver_config(data: bytes) -> dict[str, tuple[str, ...]] | None:
+    """Recover canonical forced-target A records from an owned config."""
+    details = _parse_resolver_config_details(data)
+    return None if details is None else details[0]
+
+# Health is a liveness check; canonical config validation covers the full list.
+_MAX_HEALTH_BLOCKED_DOMAINS = 32
+
+def _health_blocked_sample(blocked: tuple[str, ...]) -> tuple[str, ...]:
+    """Return a deterministic bounded sample for large block projections."""
+    if len(blocked) <= _MAX_HEALTH_BLOCKED_DOMAINS:
+        return blocked
+    half = _MAX_HEALTH_BLOCKED_DOMAINS // 2
+    return blocked[:half] + blocked[-half:]
+
+
+def _health_probe_name(blocked: tuple[str, ...]) -> str:
+    """Choose a name outside the blocked projection for the allowed probe."""
+    if not _domain_is_blocked(_HEALTH_NAME, blocked):
+        return _HEALTH_NAME
+    for index in range(len(blocked) + 1):
+        candidate = f"distraction-blocker-health-{index}"
+        if not _domain_is_blocked(candidate, blocked):
+            return candidate
+    raise ResolverError("blocked projection leaves no health probe name")
 
 
 def resolver_health(
     expected: Mapping[str, tuple[str, ...]],
     query: Callable[..., tuple[int, list[str]]] = _dns_query,
+    blocked_domains: Iterable[str] = (),
 ) -> bool:
-    """Probe the dedicated resolver; True only if enforcement is verifiable.
-    ``expected`` maps source hostname -> enforced A records. Checks both the
-    IPv4 and IPv6 dedicated listeners.  It verifies that mapped names have
-    no AAAA, SVCB, or HTTPS records, preventing alternate-address metadata
-    from bypassing the locally authoritative A mapping.
-    """
+    """Probe both resolver listeners and verify blocked/allowed DNS paths."""
+    try:
+        blocked = _normalize_blocked_domains(blocked_domains)
+    except ResolverError:
+        return False
+    health_name = _health_probe_name(blocked)
     for host, ips in sorted(expected.items()):
         for family, addr in (
             (socket.AF_INET, RESOLVER_ADDR_V4),
@@ -906,6 +1047,39 @@ def resolver_health(
                 rcode, other = query(family, addr, RESOLVER_PORT, host, qtype)
                 if rcode != 0 or other:
                     return False
+    for host in _health_blocked_sample(blocked):
+        for family, addr in (
+            (socket.AF_INET, RESOLVER_ADDR_V4),
+            (socket.AF_INET6, RESOLVER_ADDR_V6),
+        ):
+            rcode, got = query(family, addr, RESOLVER_PORT, host, _QTYPE_A)
+            if rcode != 0 or got != [SINK_ADDRESS_V4]:
+                return False
+            rcode, got = query(family, addr, RESOLVER_PORT, host, _QTYPE_AAAA)
+            if rcode != 0 or got != [SINK_ADDRESS_V6]:
+                return False
+            for qtype in (_QTYPE_SVCB, _QTYPE_HTTPS):
+                rcode, other = query(family, addr, RESOLVER_PORT, host, qtype)
+                if rcode != 0 or other:
+                    return False
+    for family, addr in (
+        (socket.AF_INET, RESOLVER_ADDR_V4),
+        (socket.AF_INET6, RESOLVER_ADDR_V6),
+    ):
+        for qtype in (_QTYPE_A, _QTYPE_AAAA, _QTYPE_SVCB, _QTYPE_HTTPS):
+            rcode, got = query(
+                family,
+                addr,
+                RESOLVER_PORT,
+                health_name,
+                qtype,
+            )
+            if rcode not in (0, 3):
+                return False
+            if qtype == _QTYPE_A and rcode == 0 and SINK_ADDRESS_V4 in got:
+                return False
+            if qtype == _QTYPE_AAAA and rcode == 0 and SINK_ADDRESS_V6 in got:
+                return False
     return True
 
 
@@ -1054,27 +1228,31 @@ class NetworkEnforcer:
 
     # -- public operations ---------------------------------------------------
 
-    def reconcile(self, controls: frozenset[str]) -> None:
-        """Converge the owned state to ``controls`` (the signed active set).
-
-        Ordering invariants: resolver preparation/health happens before any
-        SafeSearch redirect is installed; a failure before the verified
-        table apply leaves the previous (stronger) enforcement in place and
-        fences; an empty reconciliation deletes the table first and only
-        then tears the resolver down.  Any teardown failure also fences.
-        reconcile never enables or disables the boot fence unit.
-        """
+    def reconcile(
+        self,
+        controls: frozenset[str],
+        blocked_domains: Iterable[str] = (),
+    ) -> None:
+        """Converge owned state to controls and its active DNS projection."""
         controls = frozenset(controls)
         unknown = controls - NETWORK_CONTROLS
         if unknown:
             raise ValueError(f"unknown network controls: {sorted(unknown)!r}")
+        blocked = (
+            _normalize_blocked_domains(blocked_domains)
+            if "local_dns" in controls
+            else ()
+        )
         if not self.available:
             if controls:
                 raise NetworkUnavailable("network enforcement is not enabled")
             return
         try:
-            if "safe_search" in controls:
-                self._prepare_resolver()
+            if "safe_search" in controls or "local_dns" in controls:
+                self._prepare_resolver(
+                    safe_search="safe_search" in controls,
+                    blocked_domains=blocked,
+                )
             self._apply_ruleset(_desired_ruleset(self.owner_uid, controls))
         except CollisionError:
             self._healthy = False
@@ -1115,31 +1293,46 @@ class NetworkEnforcer:
         if observed is None or observed.comment != OWNERSHIP_COMMENT:
             raise CollisionError(f"table {TABLE_NAME} is owned by another process")
         self._apply_ruleset({"comment": OWNERSHIP_COMMENT, "chains": {}, "rules": {}})
-
-    # -- dedicated resolver ---------------------------------------------------
-
-    def _prepare_resolver(self) -> None:
-        """Ensure the dedicated resolver is healthy before redirects point at it.
-
-        Steady state (owned config + active unit + passing health) costs only
-        local health probes: no upstream DNS lookup, no config rewrite, no
-        unit restart.
-        """
-        cached = self._read_owned_config_ips()
+    def _prepare_resolver(
+        self,
+        *,
+        safe_search: bool,
+        blocked_domains: tuple[str, ...],
+    ) -> None:
+        """Ensure dnsmasq is validated and healthy before installing redirects."""
+        cached = self._read_owned_config_state()
+        blocked_sources = {
+            source
+            for _provider, source, _target in SAFESEARCH_MAPPINGS
+            if _domain_is_blocked(source, blocked_domains)
+        }
         if cached is not None and self._unit_active(RESOLVER_UNIT):
-            expected = {
-                source: cached[target]
-                for _provider, source, target in SAFESEARCH_MAPPINGS
-            }
-            try:
-                if self._probe_resolver_health(expected):
-                    return
-            except ResolverError:
-                # A live unit can be between activation and bind; the
-                # bounded post-start probe below handles that race.
-                pass
-        resolved = self._resolve_target_ips()
-        changed = self._write_resolver_config(render_resolver_config(resolved))
+            resolved, cached_blocked, cached_safe = cached
+            if cached_blocked == blocked_domains and cached_safe == safe_search:
+                expected = (
+                    {
+                        source: resolved[target]
+                        for _provider, source, target in SAFESEARCH_MAPPINGS
+                        if source not in blocked_sources
+                    }
+                    if safe_search
+                    else {}
+                )
+                try:
+                    if self._probe_resolver_health(expected, blocked_domains):
+                        return
+                except ResolverError:
+                    # A live unit can be between activation and bind; the
+                    # bounded post-start probe below handles that race.
+                    pass
+        resolved = self._resolve_target_ips() if safe_search else {}
+        config = render_resolver_config(
+            resolved,
+            blocked_domains,
+            safe_search=safe_search,
+        )
+        changed = self._write_resolver_config(config)
+        self._validate_resolver_config()
         active = self._unit_active(RESOLVER_UNIT)
         if changed or not active:
             verb = "restart" if active else "start"
@@ -1150,14 +1343,19 @@ class NetworkEnforcer:
                 )
         if not self._unit_becomes_active(RESOLVER_UNIT):
             raise ResolverError(f"{RESOLVER_UNIT} did not become active")
-        expected = {
-            source: resolved[target]
-            for _provider, source, target in SAFESEARCH_MAPPINGS
-        }
+        expected = (
+            {
+                source: resolved[target]
+                for _provider, source, target in SAFESEARCH_MAPPINGS
+                if source not in blocked_sources
+            }
+            if safe_search
+            else {}
+        )
         deadline = time.monotonic() + 5.0
         while True:
             try:
-                if self._probe_resolver_health(expected):
+                if self._probe_resolver_health(expected, blocked_domains):
                     break
             except ResolverError:
                 if time.monotonic() >= deadline:
@@ -1165,11 +1363,32 @@ class NetworkEnforcer:
             if time.monotonic() >= deadline:
                 raise ResolverError("dedicated resolver health check failed")
             time.sleep(0.1)
+    def _validate_resolver_config(self) -> None:
+        # In-memory enforcer tests provide a runner that models nft/systemd;
+        # the real runner always performs dnsmasq's own parser validation.
+        if self._runner is not _default_runner:
+            return
+        cp = self._run(
+            ["/usr/sbin/dnsmasq", "--test", f"--conf-file={self.resolver_config}"]
+        )
+        if cp.returncode != 0:
+            raise ResolverError(
+                "dnsmasq rejected resolver config: "
+                + (cp.stderr or b"").decode("utf-8", "replace").strip()
+            )
 
-    def _probe_resolver_health(self, expected: Mapping[str, tuple[str, ...]]) -> bool:
+    def _probe_resolver_health(
+        self,
+        expected: Mapping[str, tuple[str, ...]],
+        blocked_domains: Iterable[str] = (),
+    ) -> bool:
         """resolver_health with socket/parse failures mapped to ResolverError."""
         try:
-            return resolver_health(expected, query=self._query)
+            return resolver_health(
+                expected,
+                query=self._query,
+                blocked_domains=blocked_domains,
+            )
         except (OSError, ValueError, TypeError) as exc:
             raise ResolverError(f"dedicated resolver health probe failed: {exc}") from exc
 
@@ -1199,8 +1418,8 @@ class NetworkEnforcer:
             except OSError as exc:
                 raise ResolverError(f"cannot open resolver config: {exc}") from exc
             with os.fdopen(fd, "rb") as stream:
-                data = stream.read(65537)
-            if len(data) > 65536:
+                data = stream.read(MAX_RESOLVER_CONFIG_BYTES + 1)
+            if len(data) > MAX_RESOLVER_CONFIG_BYTES:
                 raise ResolverError(f"resolver config {self.resolver_config} is too large")
             if not data.decode("utf-8", "replace").startswith(RESOLVER_BEGIN + "\n"):
                 raise CollisionError(f"resolver config {self.resolver_config} is not owned")
@@ -1216,8 +1435,10 @@ class NetworkEnforcer:
             except OSError as exc:
                 raise ResolverError(f"cannot remove resolver config: {exc}") from exc
 
-    def _read_owned_config_ips(self) -> dict[str, tuple[str, ...]] | None:
-        """Parse the owned config as {target: A records}; None when absent."""
+    def _read_owned_config_state(
+        self,
+    ) -> tuple[dict[str, tuple[str, ...]], tuple[str, ...], bool] | None:
+        """Parse the canonical owned config and recover its active projection."""
         try:
             st = os.lstat(self.resolver_config)
         except FileNotFoundError:
@@ -1235,10 +1456,14 @@ class NetworkEnforcer:
         except OSError as exc:
             raise ResolverError(f"cannot open resolver config: {exc}") from exc
         with os.fdopen(fd, "rb") as stream:
-            data = stream.read(65537)
-        if len(data) > 65536:
+            data = stream.read(MAX_RESOLVER_CONFIG_BYTES + 1)
+        if len(data) > MAX_RESOLVER_CONFIG_BYTES:
             raise ResolverError(f"resolver config {self.resolver_config} is too large")
-        return _parse_resolver_config(data)
+        return _parse_resolver_config_details(data)
+
+    def _read_owned_config_ips(self) -> dict[str, tuple[str, ...]] | None:
+        state = self._read_owned_config_state()
+        return None if state is None else state[0]
 
     def _write_resolver_config(self, config: str) -> bool:
         """Atomically replace the owned config; returns True when changed.
@@ -1248,7 +1473,8 @@ class NetworkEnforcer:
         """
         path = self.resolver_config
         new = config.encode("utf-8")
-        existing: bytes | None
+        if len(new) > MAX_RESOLVER_CONFIG_BYTES:
+            raise ResolverError(f"resolver config {path} is too large")
         try:
             st = os.lstat(path)
         except FileNotFoundError:
@@ -1267,8 +1493,8 @@ class NetworkEnforcer:
             except OSError as exc:
                 raise ResolverError(f"cannot open resolver config: {exc}") from exc
             with os.fdopen(fd, "rb") as stream:
-                existing = stream.read(65537)
-            if len(existing) > 65536:
+                existing = stream.read(MAX_RESOLVER_CONFIG_BYTES + 1)
+            if len(existing) > MAX_RESOLVER_CONFIG_BYTES:
                 raise ResolverError(f"resolver config {path} is too large")
         if existing is not None and not existing.decode("utf-8", "replace").startswith(
             RESOLVER_BEGIN + "\n"

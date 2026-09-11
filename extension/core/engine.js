@@ -6,13 +6,13 @@
  * browser or service APIs appear here, so the matching contract is unit
  * testable with `node --test`.
  *
- * Matching contract (mirrors distraction_blocker.model validation):
- * - url_path:       hostname equal (case-insensitive) AND path exactly equal.
- * - url_wildcard:   hostname equal AND path starts with the stored prefix.
- * - url_keyword:    keyword occurs anywhere in the full lowercase URL.
- * - youtube_video:  video ID equal on any YouTube host (case-sensitive).
- * - youtube_channel: @handle or UC channel ID in the URL path.
- * - network:        ignored; OS-level enforcer targets, never URLs.
+ * website: exact lowercase hostname (case-insensitive) across all paths.
+ * url_path:       hostname equal (case-insensitive) AND path exactly equal.
+ * url_wildcard:   hostname equal AND path starts with the stored prefix.
+ * url_keyword:    keyword occurs anywhere in the full lowercase URL.
+ * youtube_video:  video ID equal on any YouTube host (case-sensitive).
+ * youtube_channel: @handle or UC channel ID in the URL path.
+ * network:        ignored; OS-level enforcer targets, never URLs.
  */
 "use strict";
 
@@ -93,6 +93,9 @@ export function describe_url(raw) {
 }
 
 function target_matches(target, url) {
+  if (target.kind === "website") {
+    return target.value === url.host;
+  }
   if (target.kind === "url_keyword") {
     return url.href.includes(target.value);
   }

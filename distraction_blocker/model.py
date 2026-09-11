@@ -33,12 +33,21 @@ MAX_ALLOWANCE_STARTS = 2**53 - 1
 MAX_TIME_ALLOWANCE_SECONDS = 24 * 60 * 60
 TIME_ALLOWANCE_MODES = frozenset({"strict", "total", "fixed_window"})
 # Breadcrumb: schema 5 adds elapsed-time allowance configuration while
-# retaining allowance_starts as a separate legacy behavior.
-POLICY_SCHEMA_VERSION = 5
+# retaining allowance_starts as a separate legacy behavior. Schema 6 adds
+# browser/system target separation without rewriting existing browser targets.
+POLICY_SCHEMA_VERSION = 6
 # Breadcrumb: the closed set of network control names a network target may
 # carry. The value is a fixed control name, never raw firewall input.
 NETWORK_CONTROLS = frozenset(
-    {"whole_internet", "alternate_dns", "safe_search", "doh", "proxy", "vpn"}
+    {
+        "whole_internet",
+        "alternate_dns",
+        "local_dns",
+        "safe_search",
+        "doh",
+        "proxy",
+        "vpn",
+    }
 )
 
 NOTIFICATION_CATEGORIES = ("state_changes", "upcoming_changes")
@@ -616,6 +625,9 @@ class Rule:
     exceptions: tuple[Target, ...] = ()
     notifications_enabled: bool = True
     notification_categories: tuple[str, ...] = NOTIFICATION_CATEGORIES
+    # System targets are retained even while the system-level toggle is off.
+    system_blocking: bool = False
+    system_targets: tuple[Target, ...] = ()
 
 
     @classmethod
@@ -633,6 +645,8 @@ class Rule:
                 "allowance_time",
                 "exceptions",
                 "notifications",
+                "system_blocking",
+                "system_targets",
             },
             "rule",
         )
@@ -641,28 +655,44 @@ class Rule:
         if not isinstance(obj.get("enabled"), bool):
             _error("bad_type", "enabled must be a boolean")
         raw_targets = obj.get("targets")
-        if not isinstance(raw_targets, list) or not raw_targets:
-            _error("bad_value", "targets must be a non-empty list")
+        if not isinstance(raw_targets, list):
+            _error("bad_type", "targets must be a list")
         targets = tuple(Target.from_dict(item) for item in raw_targets)
         if len(set(targets)) != len(targets):
             _error("bad_value", "targets must be unique")
+        raw_system_targets = obj.get("system_targets", [])
+        if not isinstance(raw_system_targets, list):
+            _error("bad_type", "system_targets must be a list")
+        system_targets = tuple(
+            Target.from_dict(item) for item in raw_system_targets
+        )
+        if any(
+            target.kind not in {"website", "managed_list"}
+            for target in system_targets
+        ):
+            _error(
+                "bad_value",
+                "system_targets require exact websites or managed lists",
+            )
+        if len(set(system_targets)) != len(system_targets):
+            _error("bad_value", "system_targets must be unique")
+        system_blocking = obj.get("system_blocking", False)
+        if not isinstance(system_blocking, bool):
+            _error("bad_type", "system_blocking must be a boolean")
+        if not targets and not system_targets:
+            _error("bad_value", "rule requires at least one target")
         raw_exceptions = obj.get("exceptions", [])
         if not isinstance(raw_exceptions, list):
             _error("bad_type", "exceptions must be a list")
-        exceptions = tuple(
-            Target.from_dict(item) for item in raw_exceptions
-        )
+        exceptions = tuple(Target.from_dict(item) for item in raw_exceptions)
         if any(
-            target.kind not in Target.URL_LIKE_KINDS
-            for target in exceptions
+            target.kind not in Target.URL_LIKE_KINDS for target in exceptions
         ):
             _error("bad_value", "exceptions require URL-level targets")
         if len(set(exceptions)) != len(exceptions):
             _error("bad_value", "exceptions must be unique")
         schedule = Schedule.from_dict(obj.get("schedule"))
         revision = _integer(obj.get("revision"), "rule revision", minimum=0)
-        # Breadcrumb: _integer rejects bools, so true/false can never pose
-        # as an allowance; absence keeps both fields optional.
         allowance = (
             _integer(
                 obj["allowance_starts"],
@@ -673,12 +703,15 @@ class Rule:
             if "allowance_starts" in obj
             else None
         )
-        if allowance is not None and any(
-            target.kind not in Target.URL_LIKE_KINDS for target in targets
+        allowance_kinds = Target.URL_LIKE_KINDS | {"website", "managed_list"}
+        if allowance is not None and (
+            not targets
+            or any(target.kind not in allowance_kinds for target in targets)
+            or (system_blocking and system_targets)
         ):
             _error(
                 "bad_value",
-                "allowance_starts requires URL-level targets",
+                "allowance_starts requires browser URL-level targets",
             )
         time_allowance = (
             TimeAllowance.from_dict(obj["allowance_time"])
@@ -701,13 +734,14 @@ class Rule:
                     "bad_value",
                     "allowance_time periods must match the weekly schedule",
                 )
-            if any(
-                target.kind not in Target.URL_LIKE_KINDS
-                for target in targets
+            if (
+                not targets
+                or any(target.kind not in allowance_kinds for target in targets)
+                or (system_blocking and system_targets)
             ):
                 _error(
                     "bad_value",
-                    "allowance_time requires URL-level targets",
+                    "allowance_time requires browser URL-level targets",
                 )
             if schedule.has_overlapping_periods():
                 _error(
@@ -720,17 +754,19 @@ class Rule:
             else (True, NOTIFICATION_CATEGORIES)
         )
         return cls(
-            ident,
-            name,
-            obj["enabled"],
-            targets,
-            schedule,
-            revision,
-            allowance,
-            time_allowance,
-            exceptions,
-            notifications_enabled,
-            notification_categories,
+            id=ident,
+            name=name,
+            enabled=obj["enabled"],
+            targets=targets,
+            schedule=schedule,
+            revision=revision,
+            allowance_starts=allowance,
+            time_allowance=time_allowance,
+            exceptions=exceptions,
+            notifications_enabled=notifications_enabled,
+            notification_categories=notification_categories,
+            system_blocking=system_blocking,
+            system_targets=system_targets,
         )
 
 
@@ -750,6 +786,12 @@ class Rule:
         if self.exceptions:
             data["exceptions"] = [
                 target.to_dict() for target in self.exceptions
+            ]
+        if self.system_blocking:
+            data["system_blocking"] = True
+        if self.system_targets:
+            data["system_targets"] = [
+                target.to_dict() for target in self.system_targets
             ]
         if (
             not self.notifications_enabled
@@ -843,12 +885,19 @@ class Policy:
         list_ids = {item.id for item in managed_lists}
         if len(list_ids) != len(managed_lists):
             _error("bad_value", "managed list ids must be unique")
-        total_bytes = sum(len(domain.encode("utf-8")) for item in managed_lists for domain in item.domains)
+        total_bytes = sum(
+            len(domain.encode("utf-8"))
+            for item in managed_lists
+            for domain in item.domains
+        )
         if total_bytes > 4 * 1024 * 1024:
             _error("bad_value", "managed list domains are too large")
         for rule in rules:
-            for target in rule.targets:
-                if target.kind == "managed_list" and target.value not in list_ids:
+            for target in (*rule.targets, *rule.system_targets):
+                if (
+                    target.kind == "managed_list"
+                    and target.value not in list_ids
+                ):
                     _error("bad_value", "rule refers to an unknown managed list")
         return cls(revision, rules, managed_lists, schema_version)
 
@@ -903,6 +952,8 @@ class PolicyProjection:
             "allowance_time",
             "exceptions",
             "notifications",
+            "system_blocking",
+            "system_targets",
         }
         normalized: list[dict[str, Any]] = []
         seen_ids: set[str] = set()

@@ -263,14 +263,17 @@ def serve():
     threading.Event().wait()
 
 
-def controls(owner, *names):
+def controls(owner, *names, website=None):
     if not names:
         return owner.rpc('set_enabled', rule_id=RULE_ID, enabled=False)
     if any(rule["id"] == RULE_ID and rule["enabled"] for rule in owner.rpc("list_rules")["rules"]):
-        owner.rpc("set_enabled", rule_id=RULE_ID, enabled=False)
+        owner.rpc('set_enabled', rule_id=RULE_ID, enabled=False)
+    targets = [{'kind': 'network', 'value': name} for name in names]
+    if website is not None:
+        targets.append({'kind': 'website', 'value': website})
     return owner.rpc('put_rule', rule={
         'id': RULE_ID, 'name': 'Network acceptance', 'enabled': True,
-        'targets': [{'kind': 'network', 'value': name} for name in names],
+        'targets': targets,
         'schedule': {'kind': 'indefinite'}, 'revision': 0,
     })
 
@@ -441,6 +444,68 @@ def main(keep_installed):
         ordinary = expect(root, True, action='dns', address='127.0.0.53', port=53, tcp=False, name='www.google.com')
         if ordinary == forced['www.google.com']:
             raise RuntimeError('root resolver unexpectedly received SafeSearch mapping')
+        forwarded_bing = expect(
+            root,
+            True,
+            action='dns',
+            address='127.0.0.53',
+            port=53,
+            tcp=False,
+            name='www.bing.com',
+        )
+        controls(owner, 'local_dns', website='www.google.com')
+        for address in ('127.0.0.53', '::1'):
+            for tcp in (False, True):
+                blocked = expect(
+                    owner,
+                    True,
+                    action='dns',
+                    address=address,
+                    port=53,
+                    tcp=tcp,
+                    name='www.google.com',
+                )
+                if blocked != ['0.0.0.0']:
+                    raise RuntimeError(f'local DNS did not sink blocked A record: {blocked}')
+                blocked_v6 = expect(
+                    owner,
+                    True,
+                    action='dns',
+                    address=address,
+                    port=53,
+                    tcp=tcp,
+                    name='www.google.com',
+                    qtype=28,
+                )
+                if blocked_v6 != ['::']:
+                    raise RuntimeError(f'local DNS did not sink blocked AAAA record: {blocked_v6}')
+                for qtype in (64, 65):
+                    response = owner.ask(
+                        action='dns',
+                        address=address,
+                        port=53,
+                        tcp=tcp,
+                        name='www.google.com',
+                        qtype=qtype,
+                    )
+                    if not response['ok'] or response['result']:
+                        raise RuntimeError(f'local DNS metadata leakage: {response}')
+                allowed = expect(
+                    owner,
+                    True,
+                    action='dns',
+                    address=address,
+                    port=53,
+                    tcp=tcp,
+                    name='www.bing.com',
+                )
+                if allowed != forwarded_bing:
+                    raise RuntimeError(f'local DNS changed allowed forwarding: {allowed}')
+        for address in (V4, V6):
+            for tcp in (False, True):
+                expect(owner, False, action='echo', address=address, port=53, tcp=tcp)
+                expect(owner, False, action='echo', address=address, port=853, tcp=tcp)
+        print('PASS local DNS projection, forwarding, sink answers, and metadata isolation', flush=True)
         controls(owner, 'whole_internet', 'safe_search')
         expect(owner, False, action='echo', address=V4, port=18080)
         if expect(owner, True, action='dns', address='127.0.0.53', port=53, tcp=False,
