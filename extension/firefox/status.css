@@ -1,0 +1,215 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: #f1f5f9;
+  color: #172554;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-width: 340px;
+  padding: 16px;
+}
+
+.popup {
+  display: grid;
+  gap: 12px;
+  width: 100%;
+}
+
+.brand {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  padding: 2px 2px 4px;
+}
+
+.brand img {
+  height: 42px;
+  width: 42px;
+}
+
+.eyebrow,
+.status-label,
+.metric-label,
+h2,
+summary {
+  color: #64748b;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+.eyebrow { color: #2563eb; margin-bottom: 2px; }
+
+h1 {
+  font-size: 1.16rem;
+  line-height: 1.1;
+  margin: 0;
+}
+
+.status-card,
+.activity,
+.setting,
+.diagnostics {
+  background: #ffffff;
+  border: 1px solid #dbeafe;
+  border-radius: 14px;
+  box-shadow: 0 5px 16px rgb(23 37 84 / 7%);
+}
+
+.status-card {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  padding: 13px 14px;
+}
+
+.status-icon {
+  align-items: center;
+  background: #dcfce7;
+  border-radius: 50%;
+  color: #15803d;
+  display: flex;
+  flex: 0 0 26px;
+  font-size: 0.9rem;
+  font-weight: 800;
+  height: 26px;
+  justify-content: center;
+  width: 26px;
+}
+
+.status-copy {
+  color: #15803d;
+  font-size: 0.86rem;
+  font-weight: 700;
+  margin: 3px 0 0;
+}
+
+.status-copy.bad { color: #b91c1c; }
+.status-copy.ok { color: #15803d; }
+
+.metrics {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.metric {
+  background: #e0ecff;
+  border-radius: 12px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.metric-value {
+  display: block;
+  font-size: 0.9rem;
+  font-weight: 750;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+
+.activity,
+.setting { padding: 14px; }
+
+h2 { margin-bottom: 9px; }
+
+ul {
+  list-style: none;
+  margin: 0;
+  max-height: 112px;
+  overflow-y: auto;
+  padding: 0;
+}
+
+li {
+  border-top: 1px solid #e2e8f0;
+  display: flex;
+  font-size: 0.78rem;
+  gap: 8px;
+  justify-content: space-between;
+  padding: 7px 0;
+}
+
+li:first-child { border-top: 0; padding-top: 0; }
+li:last-child { padding-bottom: 0; }
+li span:first-child { overflow-wrap: anywhere; }
+li span:last-child { color: #475569; flex: 0 0 auto; font-weight: 700; }
+.empty { color: #64748b; display: block; }
+
+.toggle-row {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.toggle-copy { min-width: 0; }
+.toggle-title { display: block; font-size: 0.84rem; font-weight: 700; }
+.toggle-help { color: #64748b; display: block; font-size: 0.74rem; margin-top: 3px; }
+
+input[type="checkbox"] {
+  appearance: none;
+  background: #cbd5e1;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  flex: 0 0 40px;
+  height: 23px;
+  margin: 0;
+  position: relative;
+  transition: background 120ms ease;
+  width: 40px;
+}
+
+input[type="checkbox"]::after {
+  background: #ffffff;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgb(15 23 42 / 30%);
+  content: "";
+  height: 17px;
+  left: 3px;
+  position: absolute;
+  top: 3px;
+  transition: transform 120ms ease;
+  width: 17px;
+}
+
+input[type="checkbox"]:checked { background: #2563eb; }
+input[type="checkbox"]:checked::after { transform: translateX(17px); }
+input[type="checkbox"]:focus-visible { outline: 3px solid #93c5fd; outline-offset: 2px; }
+
+.setting-status { color: #64748b; font-size: 0.73rem; margin-top: 9px; }
+.setting-status.ok { color: #15803d; }
+.setting-status.bad { color: #b91c1c; }
+
+.diagnostics { padding: 0; }
+summary { cursor: pointer; padding: 12px 14px; }
+.diagnostics code {
+  border-top: 1px solid #e2e8f0;
+  color: #475569;
+  display: block;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  max-height: 92px;
+  overflow: auto;
+  padding: 10px 14px 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root { background: #0f172a; color: #eff6ff; }
+  .status-card, .activity, .setting, .diagnostics { background: #172554; border-color: #1e40af; }
+  .metric { background: #1e3a8a; }
+  .metric-label, h2, summary, .toggle-help, .setting-status { color: #bfdbfe; }
+  li { border-color: #334155; }
+  li span:last-child, .diagnostics code { color: #cbd5e1; }
+  .diagnostics code { border-color: #334155; }
+}

@@ -1,38 +1,61 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Distraction Blocker</title>
-  <style>
-    body { font: 14px sans-serif; margin: 12px; min-width: 320px; }
-    h1 { font-size: 16px; margin: 0 0 8px; }
-    .ok { color: #1a7f37; }
-    .bad { color: #c62828; }
-    dl { margin: 8px 0; }
-    dt { font-weight: bold; margin-top: 6px; }
-    dd { margin: 0 0 4px 0; }
-    li { margin: 2px 0; }
-  </style>
+  <link rel="stylesheet" href="status.css">
 </head>
 <body>
-  <h1>Distraction Blocker</h1>
-  <p id="state">Checking the service…</p>
-  <dl>
-    <dt>Last policy refresh</dt>
-    <dd id="refresh">never</dd>
-    <dt>Recorded state</dt>
-    <dd><code id="recorded" style="word-break: break-all;"></code></dd>
-    <dt>Denied loads by rule</dt>
-    <dd><ul id="denials"><li>none yet</li></ul></dd>
-    <dt>Inactive-tab blocking</dt>
-    <dd>
-      <label>
-        <input type="checkbox" id="block_inactive" />
-        Block network loads in background tabs
+  <main class="popup" aria-labelledby="title">
+    <header class="brand">
+      <img src="icons/icon48.png" alt="Distraction Blocker">
+      <div>
+        <p class="eyebrow">Focus protection</p>
+        <h1 id="title">Distraction Blocker</h1>
+      </div>
+    </header>
+
+    <section class="status-card" aria-live="polite">
+      <span class="status-icon" aria-hidden="true">✓</span>
+      <div>
+        <p class="status-label">Service status</p>
+        <p id="state" class="status-copy">Checking the service…</p>
+      </div>
+    </section>
+
+    <section class="metrics" aria-label="Protection summary">
+      <div class="metric">
+        <span class="metric-label">Last refresh</span>
+        <strong id="refresh" class="metric-value">Never</strong>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Denied loads</span>
+        <strong id="denial-count" class="metric-value">0</strong>
+      </div>
+    </section>
+
+    <section class="activity" aria-labelledby="denied-heading">
+      <h2 id="denied-heading">Recent denied loads</h2>
+      <ul id="denials"><li class="empty">None recorded</li></ul>
+    </section>
+
+    <section class="setting" aria-labelledby="inactive-heading">
+      <label class="toggle-row" for="block_inactive">
+        <span class="toggle-copy">
+          <span id="inactive-heading" class="toggle-title">Background-tab blocking</span>
+          <span class="toggle-help">Block network loads in inactive tabs</span>
+        </span>
+        <input type="checkbox" id="block_inactive">
       </label>
-      <div id="inactive_state"></div>
-    </dd>
-  </dl>
+      <div id="inactive_state" class="setting-status"></div>
+    </section>
+
+    <details class="diagnostics">
+      <summary>Technical details</summary>
+      <code id="recorded"></code>
+    </details>
+  </main>
   <script src="status.js"></script>
 </body>
 </html>

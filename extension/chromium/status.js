@@ -81,6 +81,11 @@ browser.runtime.sendMessage({ topic: "status" }).then((state) => {
   const list = document.getElementById("denials");
   list.replaceChildren();
   const entries = Object.entries(state.denials ?? {});
+  const denied_count = entries.reduce(
+    (total, [, count]) => total + (Number.isInteger(count) ? count : 0),
+    0,
+  );
+  document.getElementById("denial-count").textContent = String(denied_count);
   if (entries.length === 0) {
     const item = document.createElement("li");
     item.textContent = "none yet";

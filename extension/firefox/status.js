@@ -7,6 +7,14 @@
 /* global browser */
 
 const checkbox = document.getElementById("block_inactive");
+const inactive_state = document.getElementById("inactive_state");
+
+function show_inactive_state(state) {
+  inactive_state.textContent = state.block_inactive
+    ? "Background-tab loads are blocked."
+    : "Background-tab loads are permitted.";
+  inactive_state.className = state.block_inactive ? "ok" : "";
+}
 
 browser.storage.local.get("block_inactive").then((stored) => {
   checkbox.checked = stored.block_inactive === true;
@@ -25,6 +33,7 @@ browser.runtime.sendMessage({ topic: "status" }).then((state) => {
     marker.textContent = `Not enforcing: ${state.last_error}`;
     marker.className = "bad";
   }
+  show_inactive_state(state);
   if (state.last_refresh_ms > 0) {
     document.getElementById("refresh").textContent = new Date(
       state.last_refresh_ms,
@@ -42,6 +51,11 @@ browser.runtime.sendMessage({ topic: "status" }).then((state) => {
   const list = document.getElementById("denials");
   list.replaceChildren();
   const entries = Object.entries(state.denials ?? {});
+  const denied_count = entries.reduce(
+    (total, [, count]) => total + (Number.isInteger(count) ? count : 0),
+    0,
+  );
+  document.getElementById("denial-count").textContent = String(denied_count);
   if (entries.length === 0) {
     const item = document.createElement("li");
     item.textContent = "none yet";
