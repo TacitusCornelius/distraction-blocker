@@ -238,6 +238,22 @@ sudo python3 scripts/install.py --confirm --owner-uid "$(id -u)"
 
 Do not use **Load unpacked** as the production installation method.
 
+### Firefox / LibreWolf extension (Version 1.9)
+
+Build the Firefox submission archive from the repository root:
+
+```bash
+python3 extension/build.py
+python3 scripts/package_firefox_extension.py
+```
+
+Submit `dist/distraction-blocker-firefox-1.9.0.xpi` to Mozilla's AMO
+self-distribution channel, download the resulting signed XPI, and install that
+signed file through the Firefox or LibreWolf Add-ons page. The root service and
+native-messaging host are still required; install them with the command above.
+The complete AMO, LibreWolf, stable-ID, and update procedure is in
+`FIREFOXADDONS.md`.
+
 
 
 Open **Distraction Blocker** from the Ubuntu application menu. You can also run the installed GUI directly:

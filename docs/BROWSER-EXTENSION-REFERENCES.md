@@ -25,6 +25,19 @@ extension for Chrome Web Store publication. That file records permission
 justifications and store-readiness information; it is relevant to publication
 work, not runtime enforcement.
 
+## Firefox and LibreWolf: signing and distribution
+
+- Mozilla signing and distribution overview: <https://extensionworkshop.com/documentation/publish/signing-and-distribution-overview/>
+- Mozilla self-distribution: <https://extensionworkshop.com/documentation/publish/self-distribution/>
+- Mozilla packaging: <https://extensionworkshop.com/documentation/publish/package-your-extension/>
+- AMO Developer Hub: <https://addons.mozilla.org/developers/>
+
+Production Firefox and LibreWolf installs use the AMO-signed XPI. The
+repository's unsigned XPI is only an AMO submission artifact; the acceptance
+harness may sideload an unsigned copy only inside its marked disposable VM.
+The release procedure and stable Gecko ID are recorded in
+`FIREFOXADDONS.md`.
+
 ## Application to this repository
 
 Use these references for Chromium adapter API choices, real-browser smoke

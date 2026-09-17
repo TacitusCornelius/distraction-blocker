@@ -56,6 +56,17 @@ class ExtensionCoreSyncTests(unittest.TestCase):
         self.assertIn("browser_action", manifest)
         self.assertNotIn("action", manifest)
 
+    def test_firefox_declares_required_data_collection(self):
+        import json
+
+        manifest = json.loads(
+            (self.root / "extension" / "firefox" / "manifest.json").read_text()
+        )
+        permissions = manifest["browser_specific_settings"]["gecko"][
+            "data_collection_permissions"
+        ]
+        self.assertEqual(permissions, {"required": ["browsingActivity"]})
+
     def test_chromium_manifest_key_matches_packaged_extension_id(self):
         # Breadcrumb: Chromium derives the extension id from the manifest
         # "key" (SHA-256 over the DER SPKI, first 16 bytes), while the native
@@ -146,6 +157,36 @@ class ExtensionCoreSyncTests(unittest.TestCase):
                 manifest = json.loads(archive.read("manifest.json"))
         self.assertEqual(manifest["version"], "1.9.0")
         self.assertNotIn("key", manifest)
+
+    def test_firefox_xpi_preserves_gecko_identity(self):
+        import json
+        import tempfile
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "extension.xpi"
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(self.root / "scripts" / "package_firefox_extension.py"),
+                    "--output",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(self.root),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with zipfile.ZipFile(output) as archive:
+                names = archive.namelist()
+                manifest = json.loads(archive.read("manifest.json"))
+        self.assertIn("manifest.json", names)
+        self.assertEqual(manifest["version"], "1.9.0")
+        self.assertEqual(
+            manifest["browser_specific_settings"]["gecko"]["id"],
+            "{e4f1a2b3-9c8d-4e5f-a6b7-8c9d0e1f2a3b}",
+        )
+        self.assertTrue(all("__pycache__" not in name for name in names))
 
 if __name__ == "__main__":
     unittest.main()
