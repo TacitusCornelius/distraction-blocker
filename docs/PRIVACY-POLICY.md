@@ -1,3 +1,8 @@
+---
+title: Distraction Blocker Privacy Policy
+permalink: /privacy-policy/
+---
+
 # Distraction Blocker Privacy Policy
 
 **Applies to:** Distraction Blocker Chrome extension, Version 1.9.0
