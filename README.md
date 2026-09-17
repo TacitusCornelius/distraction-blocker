@@ -21,6 +21,17 @@ changes until its condition is satisfied.
 
 The service continues after the GUI closes. The service starts during the Ubuntu boot process.
 
+## Current release
+
+The current root service and Ubuntu application release is **Version 1.8
+(v1.8.0)**. Version 1.8 makes browser-level website enforcement the default
+and adds explicit, per-rule opt-in system-level website blocks.
+
+The Chrome and Firefox/LibreWolf browser adapters are packaged as **Version
+1.9**. They require the root service and native-messaging host described in
+[Install](#install).
+
+
 ## Version 1.4
 
 Version 1.4 adds timed allowances and Delay locks for URL-level browser
