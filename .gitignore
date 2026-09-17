@@ -6,4 +6,7 @@ htmlcov/
 build/
 dist/
 .vm/
-block-list-ui-examples/
+*-ui-examples/
+HANDOFF.md
+extension/DESIGN.md
+docs/MULTI-USER-RESEARCH.md

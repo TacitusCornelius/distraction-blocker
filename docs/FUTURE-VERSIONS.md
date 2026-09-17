@@ -76,8 +76,8 @@ files. Its current compatibility contract is defined in
 [Version 1.5](#version-15--block-list-import-fidelity) below.
 
 The importer creates disabled Distraction Blocker rules from representable
-targets and weekly schedules. The import time zone is explicit because Cold
-Turkey exports do not carry an IANA time-zone name. Unsupported or ambiguous
+targets and weekly schedules. The import time zone is explicit because these
+exports do not carry an IANA time-zone name. Unsupported or ambiguous
 URL forms, user targeting, window-title rules, unmapped applications, lock and
 break settings, and unrepresentable schedule periods remain visible as
 categorized preview issues rather than being silently discarded.
@@ -168,7 +168,7 @@ The installed `distraction-blocker` command uses the existing owner-checked Unix
 
 ### Multi-user policy research
 
-[`MULTI-USER-RESEARCH.md`](MULTI-USER-RESEARCH.md) recommends one explicit machine-wide owner policy. Version 1.3 does not add multi-user enforcement.
+The multi-user policy research record remains local-only. Version 1.3 does not add multi-user enforcement.
 
 ## Browser extension version
 
@@ -257,7 +257,7 @@ best-effort bypass reduction, not a solution for arbitrary encrypted paths.
 
 ## Current feature cycle
 
-The following lower-priority Block List features are now implemented:
+The following lower-priority application features are now implemented:
 
 - Lock, log out, or shut down the workstation on a separately persisted schedule.
 - GNOME notification suppression with restoration of the prior state.
@@ -448,10 +448,8 @@ contract.
 
 Block List user targeting remains outside automatic import while the
 one-owner policy boundary and unresolved multi-user decisions remain in force.
-The preview states that such entries were not imported and links to
-[`MULTI-USER-RESEARCH.md`](MULTI-USER-RESEARCH.md). The compatibility examples
-and the [official Block List user guide](https://)
-remain part of this contract.
+The preview states that such entries were not imported. The compatibility
+examples remain part of this contract.
 
 ## Version 1.6 — Local DNS hostname backend
 
@@ -639,10 +637,9 @@ The two tracks share a strict release order:
 
 Timed elapsed allowances remain browser-only. They are not attached to DNS or
 mixed-target rules unless a later contract defines a trustworthy DNS usage
-signal. Multi-user private-policy work remains blocked on the written
-decisions in [`MULTI-USER-RESEARCH.md`](MULTI-USER-RESEARCH.md).
+signal. Multi-user private-policy work remains blocked on the written design
+decisions.
 
 ## Sources
 
-- Block List user guide: https://
 - HaGeZi DNS block lists: https://github.com/hagezi/dns-blocklists

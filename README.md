@@ -200,6 +200,11 @@ python3 -m unittest discover -s tests
 
 These tests do not need root access. They do not change the real hosts file, clock, or systemd state.
 
+## License
+
+Distraction Blocker is released under the Apache License, Version 2.0.
+See [`LICENSE`](LICENSE).
+
 ## Install
 
 CAUTION: Get approval before you run these commands. Installation uses root access and changes `/etc/hosts` during active website rules.

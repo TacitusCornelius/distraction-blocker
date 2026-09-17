@@ -144,7 +144,7 @@ class BlockListImportPreview:
         )
 
 
-_COLD_TURKEY_ISSUE_CATEGORIES = frozenset({
+_BLOCK_LIST_ISSUE_CATEGORIES = frozenset({
     "format",
     "target",
     "schedule",
@@ -156,7 +156,7 @@ _COLD_TURKEY_ISSUE_CATEGORIES = frozenset({
 })
 
 
-_COLD_TURKEY_FIELDS = {
+_BLOCK_LIST_FIELDS = {
     "type",
     "lock",
     "lockUnblock",
@@ -242,7 +242,7 @@ def _block_list_issue(
     *,
     category: str = "target",
 ) -> None:
-    if category not in _COLD_TURKEY_ISSUE_CATEGORIES:
+    if category not in _BLOCK_LIST_ISSUE_CATEGORIES:
         raise ValueError(f"unknown Block List issue category: {category}")
     issues.append(BlockListIssue(path, str(value), reason, category))
 
@@ -949,7 +949,7 @@ def parse_block_list_export(
             )
             continue
         settings = dict(raw_settings)
-        for field in sorted(set(settings) - _COLD_TURKEY_FIELDS):
+        for field in sorted(set(settings) - _BLOCK_LIST_FIELDS):
             _block_list_issue(
                 issues, f"{path}.{field}", settings[field],
                 "setting is not supported", category="format"
