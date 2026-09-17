@@ -21,15 +21,15 @@ review. Those are operator actions in the Chrome Developer Dashboard.
 
 ## Current publication status
 
-Version 1.9.0 has been uploaded as a Chrome Web Store draft. The publisher
-contact email is verified. Publication is intentionally deferred by the owner
-until a public HTTPS URL for [`docs/PRIVACY-POLICY.md`](docs/PRIVACY-POLICY.md)
-is available.
+Version 1.9.0 has been submitted to the Chrome Web Store for review. The
+publisher contact email is verified, and the public HTTPS privacy-policy URL
+is available at:
 
-The privacy-policy URL is the only currently known publication blocker. No
-source or ZIP change is required when publication resumes: host the policy,
-enter its URL on the Privacy practices tab, save the draft, and submit it for
-review.
+<https://tacituscornelius.github.io/distraction-blocker/privacy-policy/>
+
+The submission now awaits the Chrome Web Store review outcome. No source or
+ZIP change is required while review is pending. If Google requests changes,
+record the review feedback here before preparing a new submission.
 
 ## Build the upload archive
 
@@ -83,8 +83,8 @@ disagree.
 2. Choose **Add new item** and upload the generated ZIP.
 3. On the Package tab, verify the version and Item ID.
 4. Complete the Store Listing tab.
-5. Complete the Privacy tab using the declarations below and a public privacy
-   policy URL. Do not submit until that URL is available to users.
+5. Complete the Privacy tab using the declarations below and the public
+   privacy-policy URL.
 6. On Distribution, select **Unlisted** for link-only installation, or
    **Private** and add the intended testers, group, or managed organization.
 7. Submit for review. Publish immediately or defer publication according to
