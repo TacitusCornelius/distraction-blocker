@@ -263,7 +263,7 @@ python3 extension/build.py
 python3 scripts/package_firefox_extension.py
 ```
 
-Submit `dist/distraction-blocker-firefox-1.9.2.xpi` to Mozilla's AMO
+Submit `dist/distraction-blocker-firefox-1.9.3.xpi` to Mozilla's AMO
 self-distribution channel, download the resulting signed XPI, and install that
 signed file through the Firefox or LibreWolf Add-ons page. The root service and
 native-messaging host are still required; install them with the command above.
