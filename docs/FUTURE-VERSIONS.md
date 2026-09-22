@@ -303,14 +303,14 @@ The initial allowance modes are:
 
 - strict;
 - one total duration per period occurrence;
-- a fixed refill window, such as 10 minutes in each 60-minute bucket,
-  anchored at the occurrence's local start.
+- a rolling refill window, such as 10 minutes in each 60-minute window,
+  anchored when matching use begins after the previous window expires.
 
-Rolling windows and week/month refill scopes are deferred until the fixed
-window behavior is proven. A rule-level daily cap is supported as a hard
-ceiling across all allowance-enabled periods. It resets at local midnight in
-the rule's schedule time zone, and the effective remaining time is the
-smaller of the applicable period budget and the remaining daily cap.
+Rolling windows are scoped to each weekly period occurrence. A rule-level
+daily cap is supported as a hard ceiling across all allowance-enabled periods.
+It resets at local midnight in the rule's schedule time zone, and the effective
+remaining time is the smaller of the applicable period budget and the
+remaining daily cap.
 
 Timed allowances reject overlapping weekly periods because the existing
 continuous-block behavior cannot identify which independent budget should
@@ -364,7 +364,7 @@ locks; an untrusted clock fails closed.
 A break applies to the requested rule only. Other rules that match the same
 target continue to enforce. A break is a separate manual pause: it does not
 refill or modify automatic allowance budgets and is reported separately.
-Global breaks and rolling allowance windows are not part of this contract.
+Global breaks are not part of this contract.
 
 Both features are additive policy changes. The existing `allowance_starts`
 field and behavior remain compatible. New policy and protected-runtime-state

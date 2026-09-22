@@ -433,7 +433,9 @@ for these periods**, then choose a mode for each period:
 
 - **No allowance** keeps that period fully blocked.
 - **Total minutes** permits one elapsed-time quota for each period occurrence.
-- **Fixed refill window** permits a quota within each repeating window.
+- **Rolling refill window** permits a quota within a window that starts on
+  first matching use after the previous window has expired. The window rolls
+  forward from that usage instead of aligning to the top of the hour.
 
 You can also set an optional daily timed-allowance ceiling. Timed allowances
 require URL-level targets and non-overlapping weekly periods. They cannot be

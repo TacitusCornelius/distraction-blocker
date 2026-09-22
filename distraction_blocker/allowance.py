@@ -333,6 +333,41 @@ def _union_seconds(
     # Rounding up prevents sub-second reports from granting extra budget.
     return math.ceil(total.total_seconds())
 
+def _rolling_window_start(
+    usage: Sequence[UsageInterval],
+    occurrence: PeriodOccurrence,
+    now: datetime,
+    window: timedelta,
+) -> datetime:
+    """Find the current usage-anchored refill window.
+
+    The first matching usage after a full-window idle gap starts a new
+    window.  While usage remains within successive windows, the anchor
+    advances in fixed-duration steps from that first usage instead of from
+    the weekly period boundary.
+    """
+    relevant = sorted(
+        (
+            max(item.start_utc, occurrence.start_utc),
+            min(item.end_utc, occurrence.end_utc, now),
+        )
+        for item in usage
+        if item.start_utc < now and item.end_utc > occurrence.start_utc
+    )
+    relevant = [span for span in relevant if span[0] < span[1]]
+    if not relevant:
+        return now
+    anchor = relevant[0][0]
+    previous_end = relevant[0][1]
+    for start, end in relevant[1:]:
+        if start - previous_end >= window:
+            anchor = start
+        previous_end = max(previous_end, end)
+    if now - previous_end >= window:
+        return now
+    candidate = anchor + ((now - anchor) // window) * window
+    return candidate if candidate <= previous_end else now
+
 
 def _daily_windows(
     schedule: Schedule,
@@ -397,8 +432,7 @@ def allowance_decision(
     window_end = current.end_utc
     if period.mode == "fixed_window":
         window = timedelta(seconds=period.window_seconds)
-        bucket = (now - current.start_utc) // window
-        window_start = current.start_utc + bucket * window
+        window_start = _rolling_window_start(observed, current, now, window)
         window_end = min(window_start + window, current.end_utc)
     period_budget = period.quota_seconds
     period_used = _union_seconds(

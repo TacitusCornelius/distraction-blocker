@@ -96,20 +96,46 @@ class AllowanceEngineTests(unittest.TestCase):
         self.assertEqual(monday.period_remaining_seconds, 0)
         self.assertEqual(tuesday.period_remaining_seconds, 600)
 
-    def test_fixed_window_refills_at_utc_elapsed_boundaries(self):
+    def test_fixed_window_starts_at_first_usage_and_rolls_forward(self):
         selected = rule(
             [{"weekdays": [0], "start": "09:00", "end": "10:00"}],
             [{"mode": "fixed_window", "quota_seconds": 600, "window_seconds": 1800}],
         )
         decision = allowance_decision(
             selected,
-            at(9, 35),
+            at(9, 20),
             (UsageInterval(at(9, 5), at(9, 15)),),
         )
-        self.assertEqual(decision.window_start_utc, at(9, 30))
-        self.assertEqual(decision.window_end_utc, at(10))
-        self.assertEqual(decision.period_used_seconds, 0)
-        self.assertEqual(decision.period_remaining_seconds, 600)
+        self.assertEqual(decision.window_start_utc, at(9, 5))
+        self.assertEqual(decision.window_end_utc, at(9, 35))
+        self.assertEqual(decision.period_used_seconds, 600)
+        self.assertEqual(decision.period_remaining_seconds, 0)
+        self.assertFalse(decision.allowed)
+
+        refreshed = allowance_decision(
+            selected,
+            at(9, 36),
+            (UsageInterval(at(9, 5), at(9, 15)),),
+        )
+        self.assertEqual(refreshed.window_start_utc, at(9, 36))
+        self.assertEqual(refreshed.period_used_seconds, 0)
+        self.assertTrue(refreshed.allowed)
+
+        continued = allowance_decision(
+            selected,
+            at(9, 36),
+            (
+                UsageInterval(at(9, 5), at(9, 15)),
+                UsageInterval(at(9, 34), at(9, 40)),
+            ),
+        )
+        self.assertEqual(continued.window_start_utc, at(9, 35))
+        self.assertEqual(continued.period_used_seconds, 60)
+        self.assertTrue(continued.allowed)
+
+        first_navigation = allowance_decision(selected, at(9, 35))
+        self.assertEqual(first_navigation.window_start_utc, at(9, 35))
+        self.assertTrue(first_navigation.allowed)
 
     def test_daily_cap_is_shared_by_enabled_periods(self):
         selected = rule(

@@ -4356,7 +4356,7 @@ class WeeklyPeriodRow:
         allowance_label.set_xalign(0)
         allowance_box.append(allowance_label)
         self.allowance_mode_dropdown = Gtk.DropDown.new_from_strings(
-            ("No allowance", "Total minutes", "Fixed refill window")
+            ("No allowance", "Total minutes", "Rolling refill window")
         )
         allowance_box.append(self.allowance_mode_dropdown)
         self.allowance_quota_label = Gtk.Label(label="Allowed minutes")
