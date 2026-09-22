@@ -87,9 +87,14 @@ Use these notes in the AMO submission metadata:
 > Testing requires the Distraction Blocker Ubuntu service and native-messaging
 > host to be installed first; see `FIREFOXADDONS.md`. The extension
 > communicates only with the locally installed
-> `org.distraction_blocker.extension` host. Configure a browser rule, load a
-> matching URL, and verify that Firefox blocks the request and reports the
-> bounded denial to the local service.
+> `org.distraction_blocker.extension` host. Configure a weekly URL-level rule
+> with a short timed allowance, load the matching URL in the focused active
+> tab,
+> and verify that Firefox permits only the leased foreground time. When the
+> allowance is exhausted and the refreshed policy marks the rule blocked, the
+> active document is redirected to `blocked.html`. Verify that the requested
+> URL and rule name are displayed there. No page content or remote account is
+> involved.
 
 ## AMO self-distribution
 
