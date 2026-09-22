@@ -360,6 +360,7 @@ async function refresh() {
         await flush_denials();
         await flush_usage();
         await allowance_tracker.pulse();
+        await redirect_active_tab_if_blocked();
       }
     } catch (error) {
       record_state(`Managed-list policy load failed: ${String(error.message ?? error)}`);
@@ -372,6 +373,36 @@ async function refresh() {
     );
   }
 }
+async function redirect_active_tab_if_blocked() {
+  if (
+    active_tab_id === null ||
+    typeof active_tab_url !== "string" ||
+    !active_tab_url.startsWith("http")
+  ) {
+    return;
+  }
+  const raw_url = active_tab_url;
+  const hit = match(raw_url);
+  if (hit === null) {
+    return;
+  }
+  try {
+    const tab = await browser.tabs.get(active_tab_id);
+    if (
+      !tab ||
+      tab.id !== active_tab_id ||
+      tab.url !== raw_url
+    ) {
+      return;
+    }
+    await browser.tabs.update(active_tab_id, {
+      url: block_page_url(raw_url, hit),
+    });
+  } catch {
+    // The active tab can disappear during a policy refresh.
+  }
+}
+
 
 /** True when the tab holding this request is not the visible tab. */
 const state_ready = browser.storage.local

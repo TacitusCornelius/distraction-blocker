@@ -36,6 +36,8 @@ test("Firefox blocks HTTP requests before the first policy response", async () =
     disconnect() {},
   };
   const webRequest = { onBeforeRequest: event() };
+  const updates = [];
+  let currentTabUrl = "https://example.com/";
   const browser = {
     runtime,
     alarms: { create() {}, onAlarm: event() },
@@ -51,7 +53,14 @@ test("Firefox blocks HTTP requests before the first policy response", async () =
       onChanged: event(),
     },
     webRequest,
-    tabs: { get: async () => ({ active: true }) },
+    tabs: {
+      get: async () => ({ id: 7, active: true, url: currentTabUrl }),
+      update: async (tabId, details) => {
+        updates.push({ tabId, details });
+        currentTabUrl = details.url;
+        return { id: tabId, url: details.url };
+      },
+    },
   };
   const context = vm.createContext({
     browser,
@@ -97,6 +106,18 @@ test("Firefox blocks HTTP requests before the first policy response", async () =
     context,
   );
   assert.equal(applied, true);
+  currentTabUrl = "https://example.com/blocked";
+  vm.runInContext(
+    `active_tab_id = 7; active_tab_url = "https://example.com/blocked";`,
+    context,
+  );
+  await vm.runInContext("redirect_active_tab_if_blocked()", context);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].tabId, 7);
+  const forced_page = new URL(updates[0].details.url);
+  assert.equal(forced_page.pathname, "/blocked.html");
+  assert.equal(forced_page.searchParams.get("rule"), "Test extension rule");
+  assert.equal(forced_page.searchParams.get("url"), "https://example.com/blocked");
   const result = await listener({
     tabId: 7,
     type: "main_frame",

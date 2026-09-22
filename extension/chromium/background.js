@@ -82,13 +82,15 @@ const allowance_tracker = new AllowanceTracker({
     }),
   on_exhausted: (rule_id) => {
     timed_available_rules.delete(rule_id);
-    queue_timed_rule_block(rule_id, true);
+    const block_update = queue_timed_rule_block(rule_id, true);
+    void block_update.then(() => redirect_active_tab_if_blocked(rule_id));
     queue_refresh();
     schedule_allowance_pulse();
   },
   on_unavailable: (rule_id) => {
     timed_available_rules.delete(rule_id);
-    queue_timed_rule_block(rule_id, true);
+    const block_update = queue_timed_rule_block(rule_id, true);
+    void block_update.then(() => redirect_active_tab_if_blocked(rule_id));
     schedule_allowance_pulse();
   },
   on_available: (rule_id) => {
@@ -304,7 +306,7 @@ function queue_timed_blocks(rules) {
 
 function queue_timed_rule_block(rule_id, blocked) {
   if (!timed_policy_rules.has(rule_id)) {
-    return;
+    return Promise.resolve();
   }
   if (blocked) {
     timed_available_rules.delete(rule_id);
@@ -316,6 +318,7 @@ function queue_timed_rule_block(rule_id, blocked) {
     .catch((error) => {
       record_state(`Timed allowance blocking update failed: ${String(error)}`);
     });
+  return session_rule_queue;
 }
 
 chrome.storage.local.get(["block_inactive", "denials"]).then((stored) => {
@@ -441,12 +444,12 @@ function schedule_allowance_pulse() {
   allowance_timer.unref?.();
 }
 
-function update_allowance_url(tab_id, url) {
+async function update_allowance_url(tab_id, url) {
   if (tab_id !== active_tab_id) {
     return;
   }
   active_tab_url = typeof url === "string" ? url : null;
-  void allowance_tracker.set_tab_match(
+  await allowance_tracker.set_tab_match(
     tab_id,
     typeof url === "string" && match_time_allowance !== null
       ? match_time_allowance(url)
@@ -564,7 +567,8 @@ export async function apply_policy(policy) {
   match_time_allowance = next_match_time_allowance;
   await queue_timed_blocks(timed_allowance);
   if (active_tab_id !== null && active_tab_url !== null) {
-    update_allowance_url(active_tab_id, active_tab_url);
+    await update_allowance_url(active_tab_id, active_tab_url);
+    await redirect_active_tab_if_blocked();
   }
   rule_meta.clear();
   for (const [dnr_id, meta] of next_rule_meta) {
@@ -766,6 +770,47 @@ function show_block_page(details, hit = null) {
     // The tab can disappear while a blocked request is being observed.
   }
 }
+async function redirect_active_tab_if_blocked(rule_id = null) {
+  if (
+    active_tab_id === null ||
+    typeof active_tab_url !== "string" ||
+    !active_tab_url.startsWith("http")
+  ) {
+    return;
+  }
+  const raw_url = active_tab_url;
+  let hit = match_enforced === null ? null : match_enforced(raw_url);
+  if (hit === null && match_time_allowance !== null) {
+    const timed = match_time_allowance(raw_url);
+    if (
+      timed !== null &&
+      !timed_available_rules.has(timed.rule_id) &&
+      (rule_id === null || timed.rule_id === rule_id)
+    ) {
+      hit = timed;
+    }
+  }
+  if (hit === null) {
+    return;
+  }
+  try {
+    const tab = await chrome.tabs.get(active_tab_id);
+    if (
+      !tab ||
+      tab.id !== active_tab_id ||
+      tab.url !== raw_url
+    ) {
+      return;
+    }
+    const page = new URL(chrome.runtime.getURL("blocked.html"));
+    page.searchParams.set("rule", hit.name || hit.rule_id || "Policy is not ready");
+    page.searchParams.set("url", raw_url);
+    await chrome.tabs.update(active_tab_id, { url: page.href });
+  } catch {
+    // The active tab can disappear during a policy refresh.
+  }
+}
+
 
 function observe_request(details) {
   const enforced_hit =
