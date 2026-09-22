@@ -132,6 +132,17 @@ class AllowanceEngineTests(unittest.TestCase):
         self.assertEqual(continued.window_start_utc, at(9, 35))
         self.assertEqual(continued.period_used_seconds, 60)
         self.assertTrue(continued.allowed)
+        boundary_gap = allowance_decision(
+            selected,
+            at(9, 36),
+            (
+                UsageInterval(at(9, 5), at(9, 15)),
+                UsageInterval(at(9, 34), at(9, 35)),
+            ),
+        )
+        self.assertEqual(boundary_gap.window_start_utc, at(9, 36))
+        self.assertEqual(boundary_gap.period_used_seconds, 0)
+        self.assertTrue(boundary_gap.allowed)
 
         first_navigation = allowance_decision(selected, at(9, 35))
         self.assertEqual(first_navigation.window_start_utc, at(9, 35))

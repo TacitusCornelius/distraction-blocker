@@ -2,7 +2,7 @@
 
 The root service will own persistence and reporting.  This module deliberately
 only answers three questions: which concrete weekly occurrence is active, what
-fixed-window bucket contains it, and how much budget remains after already
+rolling refill window contains it, and how much budget remains after already
 observed usage intervals.
 """
 from dataclasses import dataclass
@@ -366,7 +366,7 @@ def _rolling_window_start(
     if now - previous_end >= window:
         return now
     candidate = anchor + ((now - anchor) // window) * window
-    return candidate if candidate <= previous_end else now
+    return candidate if candidate < previous_end else now
 
 
 def _daily_windows(

@@ -89,8 +89,7 @@ const allowance_tracker = new AllowanceTracker({
   },
   on_unavailable: (rule_id) => {
     timed_available_rules.delete(rule_id);
-    const block_update = queue_timed_rule_block(rule_id, true);
-    void block_update.then(() => redirect_active_tab_if_blocked(rule_id));
+    queue_timed_rule_block(rule_id, true);
     schedule_allowance_pulse();
   },
   on_available: (rule_id) => {

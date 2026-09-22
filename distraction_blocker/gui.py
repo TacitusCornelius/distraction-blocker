@@ -4997,7 +4997,7 @@ class RuleEditor:
         weekly.append(self.time_allowance_daily_spin)
         allowance_note = Gtk.Label(
             label="Each period below has its own allowance mode. "
-            "No allowance blocks the full period; total and fixed-window "
+            "No allowance blocks the full period; total and rolling-refill "
             "modes permit elapsed browser time."
         )
         allowance_note.set_xalign(0)
