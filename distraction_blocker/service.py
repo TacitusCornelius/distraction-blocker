@@ -1085,8 +1085,6 @@ class BlockerService:
         trusted = bool(getattr(self.clock, "trusted", True))
         if not self._rule_active(old, now, trusted):
             return None
-        if self._weakened_allowance(old, new):
-            return "active rule allowance cannot be weakened"
         old_targets = {(target.kind, target.value) for target in old.targets}
         new_targets = {(target.kind, target.value) for target in new.targets}
         old_system_targets = {
@@ -1109,8 +1107,9 @@ class BlockerService:
                 or new.schedule.end_utc < old.schedule.end_utc
             ):
                 return "active rule cannot shorten schedule"
-        elif old.schedule.to_dict() != new.schedule.to_dict():
-            return "active recurring schedule cannot be changed"
+        # A recurring schedule change is a weakening change, not an
+        # inherently invalid one. The caller enforces any effective lock
+        # before persisting it, preserving edits to unlocked active rules.
         return None
 
     def _put_rule(self, uid: int, raw: Any) -> dict[str, Any]:

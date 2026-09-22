@@ -5559,6 +5559,11 @@ class RuleEditor:
         if hasattr(self, "target_list"):
             self._render_list(self.target_list, self.target_entries)
             self._render_list(
+                self.exception_list,
+                self.url_exceptions,
+                exception=True,
+            )
+            self._render_list(
                 self.system_list,
                 self.system_target_entries,
                 system=True,

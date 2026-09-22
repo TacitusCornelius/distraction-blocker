@@ -624,7 +624,41 @@ class StoredRuleEditorTests(unittest.TestCase):
 
         self.assertEqual(editor.weekly_rows, [])
 
-    def test_pomodoro_rule_populates_picker_and_integer_controls(self) -> None:
+    def test_render_targets_populates_exception_and_application_lists(self) -> None:
+        editor = RuleEditor.__new__(RuleEditor)
+        editor.target_list = object()
+        editor.exception_list = object()
+        editor.system_list = object()
+        editor.target_entries = []
+        editor.url_exceptions = [
+            {"kind": "url_path", "value": "reddit.com/allowed"}
+        ]
+        editor.system_target_entries = []
+        editor.application_paths = ["/usr/bin/python3"]
+        rendered = []
+        editor._render_list = (
+            lambda widget, entries, **options:
+            rendered.append((widget, tuple(entries), options))
+        )
+        editor._render_applications = lambda: rendered.append(
+            ("applications", tuple(editor.application_paths), {})
+        )
+
+        editor._render_targets()
+
+        self.assertIn(
+            (
+                editor.exception_list,
+                ({"kind": "url_path", "value": "reddit.com/allowed"},),
+                {"exception": True},
+            ),
+            rendered,
+        )
+        self.assertIn(
+            ("applications", ("/usr/bin/python3",), {}),
+            rendered,
+        )
+
         class TextField:
             def set_text(self, value):
                 self.value = value

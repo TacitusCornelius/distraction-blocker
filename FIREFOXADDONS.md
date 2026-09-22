@@ -1,7 +1,7 @@
 # Firefox and LibreWolf release
 
 This repository ships a Firefox-compatible Manifest V2 adapter in
-`extension/firefox/`. Version 1.9.0 uses the same shared core as Chromium and
+`extension/firefox/`. Version 1.9.2 uses the same shared core as Chromium and
 has a stable Gecko add-on ID. The browser extension is only one part of the
 installation: the Ubuntu root service and native-messaging host are required
 for enforcement.
@@ -32,7 +32,7 @@ python3 scripts/package_firefox_extension.py
 The script creates:
 
 ```text
-dist/distraction-blocker-firefox-1.9.0.xpi
+dist/distraction-blocker-firefox-1.9.2.xpi
 ```
 
 The XPI contains `manifest.json` at its root, preserves the stable Gecko ID,
@@ -73,11 +73,12 @@ Use these notes in the AMO submission metadata:
 
 ### Version notes
 
-> Version 1.9.0 adds the Firefox browser adapter with stable add-on
-> identity, local native-messaging policy synchronization, URL blocking, status
-> reporting, and bounded local usage/denial reporting. The extension requires
-> the Distraction Blocker Ubuntu service and native-messaging host. No remote
-> account or developer server is used.
+> Version 1.9.2 fixes timed-allowance usage reporting by persisting the
+> service lease ID with every queued usage interval. It also discards reports
+> whose in-memory service lease was invalidated by a service restart. The
+> extension requires the Distraction Blocker Ubuntu service and
+> native-messaging host. No remote account or developer server is used.
+
 
 ### Notes to reviewer
 
@@ -124,7 +125,7 @@ Then install the signed XPI:
 
 1. Open the browser's Add-ons or Extensions page.
 2. Choose **Install Add-on From File** from the add-ons settings menu.
-3. Select the signed `distraction-blocker-firefox-1.9.0.xpi`.
+3. Select the signed `distraction-blocker-firefox-1.9.2.xpi`.
 4. Confirm the installation and verify that the add-on ID is
    `{e4f1a2b3-9c8d-4e5f-a6b7-8c9d0e1f2a3b}`.
 

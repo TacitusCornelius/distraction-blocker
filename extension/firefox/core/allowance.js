@@ -73,19 +73,27 @@ class AllowanceTracker {
       return;
     }
     const seen = new Set(this.pending.map((report) => report.report_id));
+    let discarded = false;
     for (const report of reports) {
       if (
         report &&
         typeof report === "object" &&
         typeof report.report_id === "string" &&
         typeof report.rule_id === "string" &&
+        typeof report.lease_id === "string" &&
         typeof report.start_utc === "string" &&
         typeof report.end_utc === "string" &&
         !seen.has(report.report_id)
       ) {
         this.pending.push({ ...report });
         seen.add(report.report_id);
+      } else {
+        // Reports created before lease IDs were persisted cannot be submitted.
+        discarded = true;
       }
+    }
+    if (discarded) {
+      this.on_pending_changed(this.pending);
     }
   }
 
@@ -103,7 +111,6 @@ class AllowanceTracker {
   _eligible() {
     return this.active_tab_id !== null && this.focused && !this.idle && this.match !== null;
   }
-
   _advance(at_ms) {
     const now = Number(at_ms);
     if (!Number.isFinite(now)) {
@@ -132,6 +139,7 @@ class AllowanceTracker {
           this.pending.push({
             report_id: random_uuid(),
             rule_id: this.lease.rule_id,
+            lease_id: this.lease.lease_id,
             start_utc: start_ms <= this.lease.start_ms
               ? this.lease.start_utc
               : iso_at(start_ms),
@@ -218,6 +226,14 @@ class AllowanceTracker {
           return false;
         }
         if (!response || response.ok !== true) {
+          // Lease state is in-memory at the service. A restart invalidates
+          // reports queued under the old lease; discard only that stale
+          // prefix so a new lease can be requested.
+          if (response?.error?.code === "not_found") {
+            this.pending.shift();
+            this.on_pending_changed(this.pending);
+            continue;
+          }
           this.lease = null;
           this.on_unavailable(report.rule_id);
           return false;
@@ -245,7 +261,11 @@ class AllowanceTracker {
         return false;
       }
       const lease = response_result(lease_response);
-      if (!lease || lease.rule_id !== requested_rule_id) {
+      if (
+        !lease ||
+        lease.rule_id !== requested_rule_id ||
+        typeof lease.lease_id !== "string"
+      ) {
         if (lease_response?.error?.code === "allowance_exhausted") {
           this.exhausted_rules.add(requested_rule_id);
           this.lease = null;
@@ -269,6 +289,7 @@ class AllowanceTracker {
       this.exhausted_rules.delete(requested_rule_id);
       this.lease = {
         rule_id: requested_rule_id,
+        lease_id: lease.lease_id,
         start_ms,
         end_ms,
         start_utc: lease.start_utc,

@@ -517,6 +517,71 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertTrue(deleted["ok"])
 
+    def test_active_recurring_schedule_can_change_when_unlocked(self):
+        rule = Rule.from_dict({
+            "id": "22345678-1234-5678-1234-567812345678",
+            "name": "Weekly",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {
+                "kind": "weekly",
+                "timezone": "UTC",
+                "periods": [
+                    {"weekdays": [3], "start": "00:00:00", "end": "23:00:00"}
+                ],
+            },
+            "revision": 0,
+        })
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,))), FakeClock(), FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        changed = rule.to_dict()
+        changed["schedule"]["periods"][0]["end"] = "22:00:00"
+
+        result = service.dispatch(1000, {"command": "put_rule", "rule": changed})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            service.policy.rules[0].schedule.to_dict()["periods"][0]["end"],
+            "22:00:00",
+        )
+
+    def test_active_recurring_schedule_change_still_requires_unlock(self):
+        rule = Rule.from_dict({
+            "id": "32345678-1234-5678-1234-567812345678",
+            "name": "Weekly",
+            "enabled": True,
+            "targets": [{"kind": "website", "value": "example.com"}],
+            "schedule": {
+                "kind": "weekly",
+                "timezone": "UTC",
+                "periods": [
+                    {"weekdays": [3], "start": "00:00:00", "end": "23:00:00"}
+                ],
+            },
+            "revision": 0,
+        })
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,))), FakeClock(), FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+        locked = service.dispatch(1000, {
+            "command": "set_rule_lock",
+            "rule_id": rule.id,
+            "lock": {"kind": "schedule"},
+        })
+        self.assertTrue(locked["ok"])
+        changed = rule.to_dict()
+        changed["schedule"]["periods"][0]["end"] = "22:00:00"
+
+        result = service.dispatch(1000, {"command": "put_rule", "rule": changed})
+
+        self.assertEqual(result["error"]["code"], "schedule_lock")
+        self.assertEqual(service.policy.rules[0], rule)
+
     def test_indefinite_rule_can_be_disabled_then_deleted(self):
         rule = Rule.from_dict({
             "id": "12345678-1234-5678-1234-567812345678",
@@ -1556,7 +1621,7 @@ class ServiceTests(unittest.TestCase):
 
 
 
-    def test_allowance_increase_is_rejected_for_active_rule(self):
+    def test_allowance_increase_can_be_saved_for_active_unlocked_rule(self):
         old = Rule.from_dict(
             {
                 "id": "99999999-9999-4999-8999-999999999999",
@@ -1581,7 +1646,55 @@ class ServiceTests(unittest.TestCase):
         result = service.dispatch(
             1000, {"command": "put_rule", "rule": updated}
         )
-        self.assertEqual(result["error"]["code"], "active_rule")
+        self.assertTrue(result["ok"])
+        self.assertEqual(service.policy.rules[0].allowance_starts, 2)
+
+    def test_active_timed_allowance_daily_cap_can_change_when_unlocked(self):
+        old = Rule.from_dict(
+            {
+                "id": "aaaaaaa9-9999-4999-8999-999999999999",
+                "name": "Timed",
+                "enabled": True,
+                "targets": [
+                    {"kind": "url_path", "value": "example.com/feed"}
+                ],
+                "schedule": {
+                    "kind": "weekly",
+                    "timezone": "UTC",
+                    "periods": [
+                        {
+                            "weekdays": [3],
+                            "start": "00:00:00",
+                            "end": "23:00:00",
+                        }
+                    ],
+                },
+                "revision": 0,
+                "allowance_time": {
+                    "periods": [{"mode": "total", "quota_seconds": 600}],
+                    "daily_cap_seconds": 1200,
+                },
+            }
+        )
+        updated = old.to_dict()
+        updated["allowance_time"]["daily_cap_seconds"] = 1800
+        service = BlockerService(
+            FakeStore(Policy(0, (old,))),
+            FakeClock(),
+            FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+
+        result = service.dispatch(
+            1000, {"command": "put_rule", "rule": updated}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            service.policy.rules[0].time_allowance.daily_cap_seconds,
+            1800,
+        )
 
     def test_allowance_increase_is_rejected_by_rule_lock(self):
         old = closed_weekly_rule(allowance_starts=2)
