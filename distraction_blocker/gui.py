@@ -300,6 +300,7 @@ class RuleForm:
     # System targets are exact hostnames or managed-list references only.
     system_blocking: bool = False
     system_target_entries: tuple[dict[str, str], ...] = ()
+    excluded_managed_domains: tuple[str, ...] = ()
 
 @dataclass(frozen=True)
 class ServiceSnapshot:
@@ -682,6 +683,10 @@ def form_to_rule(
         ]
     if exceptions:
         rule_data["exceptions"] = [target.to_dict() for target in exceptions]
+    if form.excluded_managed_domains:
+        rule_data["excluded_managed_domains"] = list(
+            form.excluded_managed_domains
+        )
     if form.allowance_starts is not None:
         if (
             isinstance(form.allowance_starts, bool)
@@ -784,6 +789,7 @@ def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
         notifications_enabled=rule.notifications_enabled,
         notification_categories=rule.notification_categories,
         system_blocking=rule.system_blocking,
+        excluded_managed_domains=rule.excluded_managed_domains,
         system_target_entries=system_target_entries,
     )
 
@@ -4474,6 +4480,7 @@ class RuleEditor:
         self.url_exceptions: list[dict[str, str]] = []
         self.system_blocking = False
         self.managed_list_domains: dict[str, tuple[str, ...]] = {}
+        self.excluded_managed_domains: list[str] = []
         self.weekly_rows: list[WeeklyPeriodRow] = []
         local_now = datetime.now(ZoneInfo(timezone_name))
         self.default_one_start, self.default_one_end = default_one_time_window(local_now)
@@ -4643,6 +4650,21 @@ class RuleEditor:
         self.target_list.add_css_class("boxed-list")
         target_scroller.set_child(self.target_list)
         outer.append(target_scroller)
+        self.excluded_domains_section = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=int(Space.COMPACT)
+        )
+        excluded_heading = Gtk.Label(
+            label="Excluded from managed lists in this rule"
+        )
+        excluded_heading.add_css_class("heading")
+        excluded_heading.set_xalign(0)
+        self.excluded_domains_section.append(excluded_heading)
+        self.excluded_domains_list = Gtk.ListBox()
+        self.excluded_domains_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.excluded_domains_list.add_css_class("boxed-list")
+        self.excluded_domains_section.append(self.excluded_domains_list)
+        self.excluded_domains_section.set_visible(False)
+        outer.append(self.excluded_domains_section)
 
         exception_heading = Gtk.Label(label="Browser Block exceptions")
         exception_heading.add_css_class("heading")
@@ -5489,6 +5511,7 @@ class RuleEditor:
                     for domain in self.managed_list_domains.get(
                         entry["value"], ()
                     )
+                    if system or domain not in self.excluded_managed_domains
                 ]
                 if entry["kind"] == "managed_list"
                 else [entry]
@@ -5529,12 +5552,11 @@ class RuleEditor:
             value = display_entry["value"]
             if entry["kind"] == "managed_list" and display_entry is entry:
                 value = f"{managed_names.get(value, value)} ({value})"
-            provenance = f" (from {', '.join(sources)})" if sources else ""
             prefix = "Exception: " if exception else ""
             label = Gtk.Label(
                 label=(
                     f"{prefix}[{kind_labels.get(display_entry['kind'], display_entry['kind'])}] "
-                    f"{value}{provenance}"
+                    f"{value}"
                 )
             )
             label.set_xalign(0)
@@ -5550,6 +5572,19 @@ class RuleEditor:
                     is_system=system: self._remove_target(
                         item, is_exception, is_system
                     ),
+                )
+                box.append(remove)
+            if sources and not exception and not system:
+                remove = Gtk.Button.new_with_mnemonic(
+                    "_Remove from this rule"
+                )
+                remove.set_tooltip_text(
+                    f"Stop this rule from blocking {value} via managed lists."
+                )
+                remove.connect(
+                    "clicked",
+                    lambda _button, domain=value:
+                    self._remove_managed_domain_from_rule(domain),
                 )
                 box.append(remove)
             row.set_child(box)
@@ -5569,8 +5604,39 @@ class RuleEditor:
                 system=True,
             )
             self._render_applications()
+            self._render_excluded_managed_domains()
             return
         self._render_url_targets()
+    def _render_excluded_managed_domains(self) -> None:
+        if not hasattr(self, "excluded_domains_list"):
+            return
+        self._clear_list(self.excluded_domains_list)
+        self.excluded_domains_section.set_visible(
+            bool(self.excluded_managed_domains)
+        )
+        for domain in self.excluded_managed_domains:
+            row = self.Gtk.ListBoxRow()
+            box = self.Gtk.Box(
+                orientation=self.Gtk.Orientation.HORIZONTAL,
+                spacing=int(Space.SMALL),
+            )
+            label = self.Gtk.Label(label=domain)
+            label.set_xalign(0)
+            label.set_hexpand(True)
+            box.append(label)
+            restore = self.Gtk.Button.new_with_mnemonic("_Restore")
+            restore.connect(
+                "clicked",
+                lambda _button, value=domain:
+                self._restore_managed_domain_to_rule(value),
+            )
+            box.append(restore)
+            row.set_child(box)
+            self.excluded_domains_list.append(row)
+
+    def _restore_managed_domain_to_rule(self, domain: str) -> None:
+        self.excluded_managed_domains.remove(domain)
+        self._render_targets()
 
     def _render_url_targets(self) -> None:
         if hasattr(self, "target_list"):
@@ -5599,8 +5665,23 @@ class RuleEditor:
             check = checks.get(entry["value"])
             if check is not None and check.get_active():
                 check.set_active(False)
+        if (
+            entry.get("kind") == "managed_list"
+            and not system
+            and not any(
+                item.get("kind") == "managed_list"
+                for item in self.target_entries
+            )
+        ):
+            self.excluded_managed_domains.clear()
         self._render_targets()
         self._update_time_allowance_availability()
+    def _remove_managed_domain_from_rule(self, domain: str) -> None:
+        if domain not in self.excluded_managed_domains:
+            self.excluded_managed_domains.append(domain)
+        self._render_targets()
+        self.error_label.set_text("")
+
 
     def _remove_url_target(
         self, entry: dict[str, str], exception: bool = False
@@ -6081,6 +6162,7 @@ class RuleEditor:
             configure_lock_after_save=self.configure_lock_check.get_active(),
             system_blocking=self.system_blocking_check.get_active(),
             system_target_entries=system_target_entries,
+            excluded_managed_domains=tuple(self.excluded_managed_domains),
         )
 
     def _submit(self) -> None:
@@ -6117,6 +6199,9 @@ class RuleEditor:
             entries.extend(form.url_targets)
         if hasattr(self, "target_entries"):
             self.target_entries = entries
+            self.excluded_managed_domains = list(
+                form.excluded_managed_domains
+            )
             self.url_exceptions = list(form.url_exceptions)
             self._render_targets()
         else:
@@ -6133,11 +6218,12 @@ class RuleEditor:
             for category, check in self.notification_checks.items():
                 check.set_active(category in form.notification_categories)
             self._notifications_changed(enabled_check)
+
         for list_id in form.managed_list_ids:
+            self._load_managed_list(list_id)
             check = self.managed_list_checks.get(list_id)
             if check is not None:
                 check.set_active(True)
-            self._load_managed_list(list_id)
         if hasattr(self, "system_target_entries"):
             self.system_target_entries = list(form.system_target_entries)
             for entry in self.system_target_entries:

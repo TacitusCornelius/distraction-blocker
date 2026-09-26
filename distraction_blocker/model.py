@@ -628,6 +628,8 @@ class Rule:
     # System targets are retained even while the system-level toggle is off.
     system_blocking: bool = False
     system_targets: tuple[Target, ...] = ()
+    # Exact managed-list domains omitted from this rule's browser targets.
+    excluded_managed_domains: tuple[str, ...] = ()
 
 
     @classmethod
@@ -647,6 +649,7 @@ class Rule:
                 "notifications",
                 "system_blocking",
                 "system_targets",
+                "excluded_managed_domains",
             },
             "rule",
         )
@@ -658,6 +661,22 @@ class Rule:
         if not isinstance(raw_targets, list):
             _error("bad_type", "targets must be a list")
         targets = tuple(Target.from_dict(item) for item in raw_targets)
+        raw_excluded_domains = obj.get("excluded_managed_domains", [])
+        if not isinstance(raw_excluded_domains, list):
+            _error("bad_type", "excluded_managed_domains must be a list")
+        excluded_managed_domains = tuple(
+            Target.from_dict({"kind": "website", "value": value}).value
+            for value in raw_excluded_domains
+        )
+        if len(set(excluded_managed_domains)) != len(excluded_managed_domains):
+            _error("bad_value", "excluded_managed_domains must be unique")
+        if excluded_managed_domains and not any(
+            target.kind == "managed_list" for target in targets
+        ):
+            _error(
+                "bad_value",
+                "excluded_managed_domains require a managed-list target",
+            )
         if len(set(targets)) != len(targets):
             _error("bad_value", "targets must be unique")
         raw_system_targets = obj.get("system_targets", [])
@@ -767,6 +786,7 @@ class Rule:
             notification_categories=notification_categories,
             system_blocking=system_blocking,
             system_targets=system_targets,
+            excluded_managed_domains=excluded_managed_domains,
         )
 
 
@@ -793,6 +813,10 @@ class Rule:
             data["system_targets"] = [
                 target.to_dict() for target in self.system_targets
             ]
+        if self.excluded_managed_domains:
+            data["excluded_managed_domains"] = list(
+                self.excluded_managed_domains
+            )
         if (
             not self.notifications_enabled
             or self.notification_categories != NOTIFICATION_CATEGORIES
@@ -954,6 +978,7 @@ class PolicyProjection:
             "notifications",
             "system_blocking",
             "system_targets",
+            "excluded_managed_domains",
         }
         normalized: list[dict[str, Any]] = []
         seen_ids: set[str] = set()

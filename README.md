@@ -13,6 +13,11 @@ Each rule supports website, application, and managed-list targets. Each rule use
 - Pomodoro: The rule alternates work blocks with permitted breaks.
 - Indefinite: The rule stays active until the user disables it.
 
+In a rule's **Block Targets**, individual domains supplied by an attached
+managed list can be excluded from that rule without editing the shared list.
+The exclusion applies only to that rule's managed-list targets; direct
+website targets and separate system-level blocks are unaffected.
+
 A weekly period can cross midnight. Overlapping periods act as one continuous block.
 
 An active finite rule cannot lose targets or shorten its schedule. An active

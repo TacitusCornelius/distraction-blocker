@@ -168,6 +168,46 @@ test("tracker rejects a lease response for a rule that is no longer active", asy
   assert.deepEqual(unavailable, ["old"]);
 });
 
+test("tracker rejects a lease response when the active match changes within the same rule", async () => {
+  let resolve_lease;
+  const unavailable = [];
+  const tracker = new AllowanceTracker({
+    request_lease: () => new Promise((resolve) => {
+      resolve_lease = resolve;
+    }),
+    report_usage: async () => ({ ok: true }),
+    on_unavailable: (rule_id) => unavailable.push(rule_id),
+  });
+  await tracker.set_focused(true);
+  await tracker.set_idle(false);
+  const first = tracker.set_active_tab(1, {
+    rule_id: "timed",
+    kind: "website",
+    value: "first.example",
+    name: "Timed",
+  });
+  await Promise.resolve();
+  await tracker.set_tab_match(1, {
+    rule_id: "timed",
+    kind: "website",
+    value: "second.example",
+    name: "Timed",
+  });
+  resolve_lease({
+    ok: true,
+    result: {
+      rule_id: "timed",
+      lease_id: "55555555-5555-4555-8555-555555555555",
+      start_utc: "1970-01-01T00:00:01.000Z",
+      end_utc: "1970-01-01T00:00:04.000Z",
+    },
+  });
+  await first;
+  assert.equal(tracker.has_lease("timed"), false);
+  assert.deepEqual(unavailable, ["timed"]);
+});
+
+
 test("tracker reports queued usage changes for durable persistence", async () => {
   let now = 1000;
   let snapshot = [];

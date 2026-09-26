@@ -52,7 +52,7 @@ test("managed-list expansion is complete before browser compilation", async () =
     return {
       ok: true,
       result: {
-        id,
+        list_id: id,
         offset,
         revision: 4,
         domains: offset === 0 ? ["list.example"] : [],
@@ -64,5 +64,49 @@ test("managed-list expansion is complete before browser compilation", async () =
   assert.deepEqual(expanded.rules[0].targets, [
     { kind: "website", value: "list.example" },
     { kind: "website", value: "direct.example" },
+  ]);
+});
+
+test("managed-domain exclusions apply only to their rule's list expansion", async () => {
+  const policy = {
+    schema_version: 6,
+    revision: 9,
+    rules: [
+      {
+        id: "rule-1",
+        enabled: true,
+        targets: [
+          { kind: "managed_list", value: "list-1" },
+          { kind: "website", value: "list.example" },
+          { kind: "website", value: "direct.example" },
+        ],
+        excluded_managed_domains: ["list.example"],
+      },
+      {
+        id: "rule-2",
+        enabled: true,
+        targets: [{ kind: "managed_list", value: "list-1" }],
+      },
+    ],
+  };
+  const expanded = await expand_managed_lists(policy, async (id, offset) => ({
+    ok: true,
+    result: {
+      list_id: id,
+      offset,
+      revision: 9,
+      domains: ["list.example", "other.example"],
+      next_offset: null,
+    },
+  }));
+
+  assert.deepEqual(expanded.rules[0].targets, [
+    { kind: "website", value: "other.example" },
+    { kind: "website", value: "list.example" },
+    { kind: "website", value: "direct.example" },
+  ]);
+  assert.deepEqual(expanded.rules[1].targets, [
+    { kind: "website", value: "list.example" },
+    { kind: "website", value: "other.example" },
   ]);
 });

@@ -60,7 +60,7 @@ export async function expand_managed_lists(policy, read_list) {
       }
       const result = response.result;
       if (
-        result.id !== list_id ||
+        result.list_id !== list_id ||
         result.offset !== offset ||
         result.revision !== policy.revision ||
         !Array.isArray(result.domains) ||
@@ -89,12 +89,15 @@ export async function expand_managed_lists(policy, read_list) {
     rules: policy.rules.map((rule) => {
       const targets = [];
       const seen = new Set();
+      const excluded = new Set(rule.excluded_managed_domains ?? []);
       for (const target of rule.targets ?? []) {
         const expanded = target?.kind === "managed_list"
-          ? (domains.get(target.value) ?? []).map((value) => ({
-              kind: "website",
-              value,
-            }))
+          ? (domains.get(target.value) ?? [])
+              .filter((value) => !excluded.has(value))
+              .map((value) => ({
+                kind: "website",
+                value,
+              }))
           : [target];
         for (const item of expanded) {
           const key = `${item.kind}\u0000${item.value}`;

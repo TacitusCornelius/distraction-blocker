@@ -368,6 +368,25 @@ class FormConversionTests(unittest.TestCase):
         )
         self.assertEqual(rule["schedule"], {"kind": "indefinite"})
 
+    def test_managed_domain_exclusions_round_trip_per_rule(self) -> None:
+        original = make_rule(
+            targets=[{"kind": "managed_list", "value": LIST_ID}]
+        )
+        rule = Rule.from_dict(
+            {
+                **original.to_dict(),
+                "excluded_managed_domains": ["SOCIAL.example."],
+            }
+        )
+
+        form = rule_to_form(rule, "UTC")
+        rebuilt = form_to_request(form, rule)["rule"]
+
+        self.assertEqual(form.excluded_managed_domains, ("social.example",))
+        self.assertEqual(
+            rebuilt["excluded_managed_domains"], ["social.example"]
+        )
+
     def test_rule_round_trip_keeps_lists_and_weekly_periods(self) -> None:
         rule = make_rule(
             targets=[
@@ -774,6 +793,7 @@ class StoredRuleEditorTests(unittest.TestCase):
         editor._add_url_target()
         self.assertEqual(len(editor.url_targets), 1)
         self.assertIn("2 to 64", editor.error_label.text)
+
 
     def test_target_import_selects_missing_managed_snapshots(self) -> None:
         managed = ManagedList.from_dict({

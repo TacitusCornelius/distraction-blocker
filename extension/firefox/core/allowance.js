@@ -21,6 +21,19 @@ function response_result(response) {
   return response && response.ok && response.result ? response.result : null;
 }
 
+function same_match(left, right) {
+  if (left === right) {
+    return true;
+  }
+  if (left === null || right === null) {
+    return false;
+  }
+  return left.rule_id === right.rule_id
+    && left.kind === right.kind
+    && left.value === right.value
+    && left.name === right.name;
+}
+
 /**
  * Browser-agnostic lease-backed foreground usage tracker.
  *
@@ -53,7 +66,7 @@ class AllowanceTracker {
     this.lease = null;
     this.last_ms = null;
     this.pending = [];
-    this.busy = false;
+    this.context_generation = 0;
   }
 
   is_exhausted(rule_id) {
@@ -164,9 +177,18 @@ class AllowanceTracker {
     }
   }
 
+  _invalidate_context() {
+    this.context_generation += 1;
+    const rule_id = this.lease?.rule_id;
+    this.lease = null;
+    if (rule_id !== undefined) {
+      this.on_unavailable(rule_id);
+    }
+  }
+
   reset() {
     this._advance(this.now());
-    this.lease = null;
+    this._invalidate_context();
     this.exhausted_rules.clear();
   }
 
@@ -176,9 +198,16 @@ class AllowanceTracker {
   }
 
   set_active_tab(tab_id, match) {
+    const next_tab_id = Number.isInteger(tab_id) && tab_id >= 0 ? tab_id : null;
+    const next_match = match ?? null;
+    const changed = next_tab_id !== this.active_tab_id
+      || !same_match(next_match, this.match);
     this._advance(this.now());
-    this.active_tab_id = Number.isInteger(tab_id) && tab_id >= 0 ? tab_id : null;
-    this.match = match ?? null;
+    if (changed) {
+      this._invalidate_context();
+    }
+    this.active_tab_id = next_tab_id;
+    this.match = next_match;
     this.last_ms = this.now();
     return this.pump();
   }
@@ -187,20 +216,35 @@ class AllowanceTracker {
     if (tab_id !== this.active_tab_id) {
       return Promise.resolve(false);
     }
+    const next_match = match ?? null;
+    const changed = !same_match(next_match, this.match);
     this._advance(this.now());
-    this.match = match ?? null;
+    if (changed) {
+      this._invalidate_context();
+    }
+    this.match = next_match;
     return this.pump();
   }
 
   set_focused(focused) {
+    const next_focused = focused === true;
+    const changed = next_focused !== this.focused;
     this._advance(this.now());
-    this.focused = focused === true;
+    if (changed) {
+      this._invalidate_context();
+    }
+    this.focused = next_focused;
     return this.pump();
   }
 
   set_idle(idle) {
+    const next_idle = idle === true;
+    const changed = next_idle !== this.idle;
     this._advance(this.now());
-    this.idle = idle === true;
+    if (changed) {
+      this._invalidate_context();
+    }
+    this.idle = next_idle;
     return this.pump();
   }
 
@@ -245,6 +289,7 @@ class AllowanceTracker {
         return true;
       }
       const requested_rule_id = this.match.rule_id;
+      const request_generation = this.context_generation;
       let lease_response;
       try {
         lease_response = await this.request_lease(
@@ -255,7 +300,11 @@ class AllowanceTracker {
         this.on_unavailable(requested_rule_id);
         return false;
       }
-      if (this.match?.rule_id !== requested_rule_id || !this._eligible()) {
+      if (
+        request_generation !== this.context_generation ||
+        this.match?.rule_id !== requested_rule_id ||
+        !this._eligible()
+      ) {
         this.lease = null;
         this.on_unavailable(requested_rule_id);
         return false;
