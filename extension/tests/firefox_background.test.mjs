@@ -111,10 +111,27 @@ test("Firefox blocks HTTP requests before the first policy response", async () =
       return nativePort;
     },
   };
+  const host_requests = [];
+  let status_response = {
+    ok: true,
+    result: {
+      active: true,
+      remaining_seconds: 0,
+      window_seconds: null,
+      daily_cap_seconds: null,
+    },
+  };
   const nativePort = {
     onMessage: event(),
     onDisconnect: event(),
-    postMessage() {
+    postMessage(message) {
+      host_requests.push(message);
+      if (message.command === "allowance_status") {
+        for (const listener of nativePort.onMessage.listeners) {
+          listener(status_response);
+        }
+        return;
+      }
       for (const listener of nativePort.onDisconnect.listeners) {
         listener();
       }
@@ -213,6 +230,78 @@ test("Firefox blocks HTTP requests before the first policy response", async () =
   assert.equal(page.pathname, "/blocked.html");
   assert.equal(page.searchParams.get("rule"), "Test extension rule");
   assert.equal(page.searchParams.get("url"), "https://example.com/blocked");
+  const timed_rule_id = "timed-rule";
+  assert.equal(await vm.runInContext(
+    `apply_policy(${JSON.stringify({
+      schema_version: 6,
+      revision: 2,
+      rules: [{
+        id: timed_rule_id,
+        name: "Social Media Evenings",
+        enabled: true,
+        targets: [{ kind: "url_path", value: "example.com/blocked.html" }],
+        allowance_time: {
+          periods: [{ mode: "fixed_window", quota_seconds: 600, window_seconds: 3600 }],
+          daily_cap_seconds: 3600,
+        },
+        budget_exhausted: true,
+      }],
+    })})`,
+    context,
+  ), true);
+  const exhausted_page = new URL(await listener({
+    tabId: 7,
+    type: "main_frame",
+    url: "https://example.com/blocked.html",
+  }).then((result) => result.redirectUrl));
+  assert.equal(exhausted_page.searchParams.get("rule_id"), timed_rule_id);
+  const status = await vm.runInContext(
+    `allowance_status_for_url(${JSON.stringify(exhausted_page.href)})`,
+    context,
+  );
+  assert.equal(status.ok, true);
+  assert.equal(status.result.remaining_seconds, 0);
+  assert.equal(status.result.rule_name, "Social Media Evenings");
+  assert.equal(host_requests.at(-1).command, "allowance_status");
+  assert.equal(host_requests.at(-1).rule_id, timed_rule_id);
+  const public_blocked_path_status = await vm.runInContext(
+    `allowance_status_for_url("https://example.com/blocked.html", ${JSON.stringify(timed_rule_id)})`,
+    context,
+  );
+  assert.equal(public_blocked_path_status.result.remaining_seconds, 0);
+
+  assert.equal(await vm.runInContext(
+    `apply_policy(${JSON.stringify({
+      schema_version: 6,
+      revision: 3,
+      rules: [
+        {
+          id: "strict-rule",
+          name: "Strict",
+          enabled: true,
+          targets: [{ kind: "url_path", value: "example.com/blocked.html" }],
+        },
+        {
+          id: timed_rule_id,
+          name: "Social Media Evenings",
+          enabled: true,
+          targets: [{ kind: "url_path", value: "example.com/blocked.html" }],
+          allowance_time: {
+            periods: [{ mode: "fixed_window", quota_seconds: 600, window_seconds: 3600 }],
+            daily_cap_seconds: 3600,
+          },
+        },
+      ],
+    })})`,
+    context,
+  ), true);
+  const before_overlap_status = host_requests.length;
+  const overlap_status = await vm.runInContext(
+    `allowance_status_for_url("https://example.com/blocked.html")`,
+    context,
+  );
+  assert.equal(overlap_status.result, null);
+  assert.equal(host_requests.length, before_overlap_status);
 });
 
 test("Firefox restores cached policy before handling startup requests", async () => {

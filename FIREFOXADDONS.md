@@ -1,7 +1,7 @@
 # Firefox and LibreWolf release
 
 This repository ships a Firefox-compatible Manifest V2 adapter in
-`extension/firefox/`. Version 1.9.5 uses the same shared core as Chromium and
+`extension/firefox/`. Version 1.9.6 uses the same shared core as Chromium and
 has a stable Gecko add-on ID. The browser extension is only one part of the
 installation: the Ubuntu root service and native-messaging host are required
 for enforcement.
@@ -32,7 +32,7 @@ python3 scripts/package_firefox_extension.py
 The script creates:
 
 ```text
-dist/distraction-blocker-firefox-1.9.5.xpi
+dist/distraction-blocker-firefox-1.9.6.xpi
 ```
 
 The XPI contains `manifest.json` at its root, preserves the stable Gecko ID,
@@ -73,10 +73,10 @@ Use these notes in the AMO submission metadata:
 
 ### Version notes
 
-> Version 1.9.5 fixes managed-list loading so browser rules referencing a
-> managed list are enforced, while preserving bounded-chunk consistency
-> checks. Requires the Distraction Blocker Ubuntu service and native-messaging
-> host. No remote account or developer server is used.
+> Version 1.9.6 fixes block-page allowance status for exhausted timed budgets
+> and overlapping blocking rules, while retaining managed-list loading.
+> Requires the Distraction Blocker Ubuntu service and native-messaging host.
+> No remote account or developer server is used.
 
 
 ### Notes to reviewer
@@ -126,7 +126,7 @@ sudo python3 scripts/install.py --confirm --owner-uid "$(id -u)"
 Then install the signed XPI:
 
 1. Open the browser's Add-ons or Extensions page.
-2. Select the signed `distraction-blocker-firefox-1.9.5.xpi`.
+2. Select the signed `distraction-blocker-firefox-1.9.6.xpi`.
 3. Confirm the installation and verify that the add-on ID is
    `{e4f1a2b3-9c8d-4e5f-a6b7-8c9d0e1f2a3b}`.
 

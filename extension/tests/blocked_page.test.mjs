@@ -60,21 +60,34 @@ test("block page displays allowance budget, rolling reset, and timer state", asy
     lease_remaining_seconds: 20,
   };
   let went_back = false;
+  let status_message;
   const context = vm.createContext({
     document: { getElementById: (id) => fields.get(id) },
     history: { back() { went_back = true; } },
-    window: { location: { search: "?rule=Evenings&url=https%3A%2F%2Fx.com%2F" } },
+    window: {
+      location: {
+        search: "?rule=Evenings&rule_id=timed-rule&url=https%3A%2F%2Fx.com%2F",
+      },
+    },
     URLSearchParams,
     Date,
     browser: {
       runtime: {
-        sendMessage: () => Promise.resolve({ ok: true, result }),
+        sendMessage: (message) => {
+          status_message = message;
+          return Promise.resolve({ ok: true, result });
+        },
       },
     },
   });
   const source = readFileSync(join(root, "firefox", "blocked.js"), "utf8");
   vm.runInContext(source, context);
   await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual({ ...status_message }, {
+    topic: "allowance_status",
+    url: "https://x.com/",
+    rule_id: "timed-rule",
+  });
   assert.equal(fields.get("rule-name").textContent, "Evenings");
   assert.equal(fields.get("requested").textContent, "Requested page: https://x.com/");
   fields.get("back").listeners.click();

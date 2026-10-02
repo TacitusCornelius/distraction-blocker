@@ -20,6 +20,7 @@ const POLICY_KEY = "policy_snapshot";
 const STARTUP_REFRESH_WAIT_MS = 2000;
 let match = compile([]);
 let match_time_allowance = compile([]);
+let time_allowance_status_matchers = new Map();
 let policy_ready = false;
 let last_error = "No policy loaded yet.";
 let last_refresh_ms = 0;
@@ -125,9 +126,23 @@ function install_matchers(rules) {
   // allowance rules permit starts until their budget is exhausted.
   const { enforced, allowance } = partition_rules(rules);
   const timed_allowance = allowance.filter(is_time_allowance_rule);
-  match = compile(enforced);
-  match_allowance = compile(allowance);
-  match_time_allowance = compile(timed_allowance);
+  const next_match = compile(enforced);
+  const next_match_allowance = compile(allowance);
+  const next_match_time_allowance = compile(timed_allowance);
+  const next_status_matchers = new Map(
+    rules
+      .filter(
+        (rule) =>
+          rule.enabled &&
+          rule.allowance_time !== null &&
+          rule.allowance_time !== undefined,
+      )
+      .map((rule) => [rule.id, compile([rule])]),
+  );
+  match = next_match;
+  match_allowance = next_match_allowance;
+  match_time_allowance = next_match_time_allowance;
+  time_allowance_status_matchers = next_status_matchers;
   prune_usage(pending_usage, rules);
   if (active_tab_id !== null && active_tab_url !== null) {
     update_allowance_url(active_tab_id, active_tab_url);
@@ -215,20 +230,35 @@ function host_request(message) {
     port.postMessage(message);
   });
 }
-async function allowance_status_for_url(url) {
+async function allowance_status_for_url(url, requested_rule_id = null) {
+  let rule_id = typeof requested_rule_id === "string"
+    ? requested_rule_id
+    : null;
   if (typeof url === "string") {
     try {
       const parsed = new URL(url);
-      if (parsed.pathname.endsWith("/blocked.html")) {
+      const blocked_page = new URL(browser.runtime.getURL("blocked.html"));
+      if (
+        parsed.origin === blocked_page.origin &&
+        parsed.pathname === blocked_page.pathname
+      ) {
         url = parsed.searchParams.get("url");
+        rule_id = rule_id ?? parsed.searchParams.get("rule_id");
       }
     } catch {
       url = null;
     }
   }
-  const hit = typeof url === "string" && match_time_allowance !== null
-    ? match_time_allowance(url)
-    : null;
+  let hit = null;
+  if (typeof url === "string" && rule_id !== null) {
+    hit = time_allowance_status_matchers.get(rule_id)?.(url) ?? null;
+  } else if (typeof url === "string") {
+    const blocking_hit = match(url);
+    hit = blocking_hit === null
+      ? match_time_allowance(url)
+      : time_allowance_status_matchers.get(blocking_hit.rule_id)?.(url) ??
+        null;
+  }
   if (hit === null) {
     return { ok: true, result: null };
   }
@@ -498,6 +528,9 @@ function block_page_url(raw_url, hit = null) {
     "rule",
     hit?.name || hit?.rule_id || "Policy is not ready",
   );
+  if (typeof hit?.rule_id === "string") {
+    page.searchParams.set("rule_id", hit.rule_id);
+  }
   page.searchParams.set("url", raw_url);
   return page.href;
 }
@@ -569,7 +602,10 @@ browser.webRequest.onBeforeRequest.addListener(
 
 browser.runtime.onMessage.addListener((message) => {
   if (message?.topic === "allowance_status") {
-    return allowance_status_for_url(message.url ?? active_tab_url)
+    return allowance_status_for_url(
+      message.url ?? active_tab_url,
+      message.rule_id,
+    )
       .catch(() => ({
         ok: false,
         error: { message: "Allowance status is unavailable." },

@@ -41,9 +41,10 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
     ok: false,
     error: { code: "test_host", message: "not configured" },
   };
+  let allowance_status_request;
   let reportRequest;
-  let webRequestListener;
   let messageListener;
+  let webRequestListener;
   const tab_updates = [];
   let active_tab = { id: 7, active: true, url: "https://outside.example/" };
   let idle_query_interval = null;
@@ -76,6 +77,9 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
             if (message.command === "report_website_denials") {
               reportRequest = message;
             }
+            if (message.command === "allowance_status") {
+              allowance_status_request = message;
+            }
             const response = message.command === "request_allowance_lease"
               ? {
                   ok: true,
@@ -86,13 +90,23 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
                     end_utc: new Date(Date.now() + 30_000).toISOString(),
                   },
                 }
-              : message.command === "report_website_denials" ||
-                  message.command === "report_website_usage"
-                ? hostResponse
-                : {
-                    ok: false,
-                    error: { code: "test_host", message: "not configured" },
-                  };
+              : message.command === "allowance_status"
+                ? {
+                    ok: true,
+                    result: {
+                      active: true,
+                      remaining_seconds: 0,
+                      window_seconds: null,
+                      daily_cap_seconds: null,
+                    },
+                  }
+                : message.command === "report_website_denials" ||
+                    message.command === "report_website_usage"
+                  ? hostResponse
+                  : {
+                      ok: false,
+                      error: { code: "test_host", message: "not configured" },
+                    };
             queueMicrotask(() => onMessage?.(response));
           },
         };
@@ -372,10 +386,83 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
     type: "main_frame",
     url: requested_url,
   });
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setImmediate(resolve));
+  for (
+    let attempt = 0;
+    attempt < 10 &&
+    !tab_updates.some((update) => update.details.url === requested_url);
+    attempt += 1
+  ) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
   assert.ok(
     tab_updates.some((update) => update.details.url === requested_url),
     "first blocked navigation should resume after acquiring its timed lease",
   );
+  const exhausted_rule = {
+    id: timed_rule_id,
+    name: "Evenings",
+    enabled: true,
+    targets: [{ kind: "url_path", value: "example.com/blocked.html" }],
+    allowance_time: {
+      periods: [{
+        mode: "fixed_window",
+        quota_seconds: 600,
+        window_seconds: 3600,
+      }],
+      daily_cap_seconds: 3600,
+    },
+    budget_exhausted: true,
+  };
+  assert.equal(await apply_policy({
+    schema_version: 6,
+    revision: 7,
+    rules: [exhausted_rule],
+  }), true);
+  await webRequestListener({
+    tabId: 7,
+    type: "main_frame",
+    url: "https://example.com/blocked.html",
+  });
+  const exhausted_page = new URL(tab_updates.at(-1).details.url);
+  assert.equal(exhausted_page.searchParams.get("rule_id"), timed_rule_id);
+  assert.equal(
+    exhausted_page.searchParams.get("url"),
+    "https://example.com/blocked.html",
+  );
+  const exhausted_status = await new Promise((resolve) => {
+    messageListener({
+      topic: "allowance_status",
+      url: "https://example.com/blocked.html",
+      rule_id: exhausted_page.searchParams.get("rule_id"),
+    }, {}, resolve);
+  });
+  assert.equal(exhausted_status.ok, true);
+  assert.equal(exhausted_status.result.remaining_seconds, 0);
+  assert.equal(exhausted_status.result.rule_name, "Evenings");
+  assert.equal(allowance_status_request.command, "allowance_status");
+  assert.equal(allowance_status_request.rule_id, timed_rule_id);
+
+  const overlapping = {
+    schema_version: 6,
+    revision: 8,
+    rules: [
+      {
+        id: "strict-rule",
+        name: "Strict",
+        enabled: true,
+        targets: [{ kind: "url_path", value: "example.com/blocked.html" }],
+      },
+      { ...exhausted_rule, budget_exhausted: false },
+    ],
+  };
+  assert.equal(await apply_policy(overlapping), true);
+  const previous_status_request = allowance_status_request;
+  const overlap_status = await new Promise((resolve) => {
+    messageListener({
+      topic: "allowance_status",
+      url: "https://example.com/blocked.html",
+    }, {}, resolve);
+  });
+  assert.equal(overlap_status.result, null);
+  assert.equal(allowance_status_request, previous_status_request);
 });

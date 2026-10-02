@@ -55,6 +55,9 @@ const extension_api = globalThis.browser ?? globalThis.chrome;
 extension_api.runtime.sendMessage({
   topic: "allowance_status",
   url: requested,
+  ...(typeof params.get("rule_id") === "string"
+    ? { rule_id: params.get("rule_id") }
+    : {}),
 }).then((response) => {
   document.getElementById("allowance-status").textContent =
     response?.ok

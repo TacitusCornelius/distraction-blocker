@@ -62,6 +62,7 @@ let totals_backup_scheduled = false;
 let match_enforced = null;
 let match_allowance = null;
 let match_time_allowance = null;
+let time_allowance_status_matchers = new Map();
 let active_tab_id = null;
 let active_tab_url = null;
 let allowance_timer = null;
@@ -186,9 +187,20 @@ function restore_policy_snapshot(stored) {
     const { enforced, allowance } = partition_rules(snapshot.rules);
     const timed_allowance = allowance.filter(is_time_allowance_rule);
     const compiled = compile_dnr(enforced);
+    const next_time_allowance_status_matchers = new Map(
+      snapshot.rules
+        .filter(
+          (rule) =>
+            rule.enabled &&
+            rule.allowance_time !== null &&
+            rule.allowance_time !== undefined,
+        )
+        .map((rule) => [rule.id, compile([rule])]),
+    );
     match_enforced = compile(enforced);
     match_allowance = compile(allowance);
     match_time_allowance = compile(timed_allowance);
+    time_allowance_status_matchers = next_time_allowance_status_matchers;
     timed_policy_rules = new Map(
       timed_allowance.map((rule) => [rule.id, rule]),
     );
@@ -425,20 +437,35 @@ function host_request(message) {
     port.postMessage(message);
   });
 }
-async function allowance_status_for_url(url) {
+async function allowance_status_for_url(url, requested_rule_id = null) {
+  let rule_id = typeof requested_rule_id === "string"
+    ? requested_rule_id
+    : null;
   if (typeof url === "string") {
     try {
       const parsed = new URL(url);
-      if (parsed.pathname.endsWith("/blocked.html")) {
+      const blocked_page = new URL(chrome.runtime.getURL("blocked.html"));
+      if (
+        parsed.origin === blocked_page.origin &&
+        parsed.pathname === blocked_page.pathname
+      ) {
         url = parsed.searchParams.get("url");
+        rule_id = rule_id ?? parsed.searchParams.get("rule_id");
       }
     } catch {
       url = null;
     }
   }
-  const hit = typeof url === "string" && match_time_allowance !== null
-    ? match_time_allowance(url)
-    : null;
+  let hit = null;
+  if (typeof url === "string" && rule_id !== null) {
+    hit = time_allowance_status_matchers.get(rule_id)?.(url) ?? null;
+  } else if (typeof url === "string") {
+    const blocking_hit = match_enforced(url);
+    hit = blocking_hit === null
+      ? match_time_allowance(url)
+      : time_allowance_status_matchers.get(blocking_hit.rule_id)?.(url) ??
+        null;
+  }
   if (hit === null) {
     return { ok: true, result: null };
   }
@@ -552,6 +579,7 @@ export async function apply_policy(policy) {
   let next_match_enforced;
   let next_match_allowance;
   let next_match_time_allowance;
+  let next_time_allowance_status_matchers;
   let compiled;
   try {
     // Breadcrumb: compile every matcher before touching the active state.
@@ -559,6 +587,16 @@ export async function apply_policy(policy) {
     next_match_enforced = compile(enforced);
     next_match_allowance = compile(allowance);
     next_match_time_allowance = compile(timed_allowance);
+    next_time_allowance_status_matchers = new Map(
+      rules
+        .filter(
+          (rule) =>
+            rule.enabled &&
+            rule.allowance_time !== null &&
+            rule.allowance_time !== undefined,
+        )
+        .map((rule) => [rule.id, compile([rule])]),
+    );
     compiled = compile_dnr(enforced);
   } catch (error) {
     record_state(`Policy compile failed: ${String(error.message ?? error)}`);
@@ -598,6 +636,7 @@ export async function apply_policy(policy) {
   match_enforced = next_match_enforced;
   match_allowance = next_match_allowance;
   match_time_allowance = next_match_time_allowance;
+  time_allowance_status_matchers = next_time_allowance_status_matchers;
   await queue_timed_blocks(timed_allowance);
   if (active_tab_id !== null && active_tab_url !== null) {
     await update_allowance_url(active_tab_id, active_tab_url);
@@ -801,6 +840,9 @@ function show_block_page(details, hit = null) {
     "rule",
     hit?.name || hit?.rule_id || "Policy is not ready",
   );
+  if (typeof hit?.rule_id === "string") {
+    page.searchParams.set("rule_id", hit.rule_id);
+  }
   page.searchParams.set("url", details.url);
   try {
     Promise.resolve(
@@ -875,6 +917,9 @@ async function redirect_active_tab_if_blocked(rule_id = null) {
     }
     const page = new URL(chrome.runtime.getURL("blocked.html"));
     page.searchParams.set("rule", hit.name || hit.rule_id || "Policy is not ready");
+    if (typeof hit?.rule_id === "string") {
+      page.searchParams.set("rule_id", hit.rule_id);
+    }
     page.searchParams.set("url", raw_url);
     await chrome.tabs.update(active_tab_id, { url: page.href });
   } catch {
@@ -969,7 +1014,10 @@ chrome.webRequest.onBeforeRequest.addListener(
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.topic === "allowance_status") {
-    void allowance_status_for_url(message.url ?? active_tab_url)
+    void allowance_status_for_url(
+      message.url ?? active_tab_url,
+      message.rule_id,
+    )
       .then(sendResponse)
       .catch(() => sendResponse({
         ok: false,
