@@ -233,11 +233,11 @@ sudo python3 scripts/install.py --confirm --owner-uid 1000
 
 The installer copies root-owned code to `/usr/lib/distraction-blocker`. It installs and starts `distraction-blocker.service`.
 
-### Chrome Web Store extension (Version 1.9)
+### Chrome Web Store extension (Version 1.9.5)
 
 The Chromium adapter is published separately as an unlisted Chrome Web Store
 item. The root service and native-messaging host are still required; the
-browser extension alone is not a complete installation. Build the Version 1.9
+browser extension alone is not a complete installation. Build the Version 1.9.5
 upload archive from the repository root:
 
 ```bash
@@ -259,7 +259,7 @@ sudo python3 scripts/install.py --confirm --owner-uid "$(id -u)"
 
 Do not use **Load unpacked** as the production installation method.
 
-### Firefox / LibreWolf extension (Version 1.9)
+### Firefox / LibreWolf extension (Version 1.9.5)
 
 Build the Firefox submission archive from the repository root:
 
@@ -268,7 +268,7 @@ python3 extension/build.py
 python3 scripts/package_firefox_extension.py
 ```
 
-Submit `dist/distraction-blocker-firefox-1.9.3.xpi` to Mozilla's AMO
+Submit `dist/distraction-blocker-firefox-1.9.5.xpi` to Mozilla's AMO
 self-distribution channel, download the resulting signed XPI, and install that
 signed file through the Firefox or LibreWolf Add-ons page. The root service and
 native-messaging host are still required; install them with the command above.

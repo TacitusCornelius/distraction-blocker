@@ -1,7 +1,7 @@
 # Firefox and LibreWolf release
 
 This repository ships a Firefox-compatible Manifest V2 adapter in
-`extension/firefox/`. Version 1.9.3 uses the same shared core as Chromium and
+`extension/firefox/`. Version 1.9.5 uses the same shared core as Chromium and
 has a stable Gecko add-on ID. The browser extension is only one part of the
 installation: the Ubuntu root service and native-messaging host are required
 for enforcement.
@@ -32,7 +32,7 @@ python3 scripts/package_firefox_extension.py
 The script creates:
 
 ```text
-dist/distraction-blocker-firefox-1.9.3.xpi
+dist/distraction-blocker-firefox-1.9.5.xpi
 ```
 
 The XPI contains `manifest.json` at its root, preserves the stable Gecko ID,
@@ -73,28 +73,24 @@ Use these notes in the AMO submission metadata:
 
 ### Version notes
 
-> Version 1.9.3 redirects an already-loaded active page when a refreshed
-> timed-allowance policy exhausts its budget. It also includes the 1.9.2
-> timed-allowance usage-reporting fixes, including persisted service lease IDs
-> and stale-lease report handling. The extension requires the Distraction
-> Blocker Ubuntu service and native-messaging host. No remote account or
-> developer server is used.
+> Version 1.9.5 fixes managed-list loading so browser rules referencing a
+> managed list are enforced, while preserving bounded-chunk consistency
+> checks. Requires the Distraction Blocker Ubuntu service and native-messaging
+> host. No remote account or developer server is used.
 
 
 ### Notes to reviewer
 
 > No website account is required. This is a desktop-only local policy adapter.
-> Testing requires the Distraction Blocker Ubuntu service and native-messaging
-> host to be installed first; see `FIREFOXADDONS.md`. The extension
-> communicates only with the locally installed
-> `org.distraction_blocker.extension` host. Configure a weekly URL-level rule
-> with a short timed allowance, load the matching URL in the focused active
-> tab,
-> and verify that Firefox permits only the leased foreground time. When the
-> allowance is exhausted and the refreshed policy marks the rule blocked, the
-> active document is redirected to `blocked.html`. Verify that the requested
-> URL and rule name are displayed there. No page content or remote account is
-> involved.
+> Testing requires the updated Distraction Blocker Ubuntu service and
+> native-messaging host. The extension communicates only with the locally
+> installed `org.distraction_blocker.extension` host. Configure a weekly
+> URL-level rule with a fixed-window timed allowance and daily cap, then open
+> its matching URL in the focused active tab. Verify that the allowance timer
+> starts, the browser permits only leased foreground time, and the popup shows
+> remaining allowance, rolling-window refill, and daily-cap status. Exhaust
+> the allowance and verify the blocked page reports the rule and allowance
+> state. No page content or remote account is involved.
 
 ## AMO self-distribution
 
@@ -130,7 +126,7 @@ sudo python3 scripts/install.py --confirm --owner-uid "$(id -u)"
 Then install the signed XPI:
 
 1. Open the browser's Add-ons or Extensions page.
-2. Select the signed `distraction-blocker-firefox-1.9.3.xpi`.
+2. Select the signed `distraction-blocker-firefox-1.9.5.xpi`.
 3. Confirm the installation and verify that the add-on ID is
    `{e4f1a2b3-9c8d-4e5f-a6b7-8c9d0e1f2a3b}`.
 

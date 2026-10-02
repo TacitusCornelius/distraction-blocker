@@ -4,9 +4,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 function event() {
-  return { addListener() {} };
-}
+  const listeners = [];
+  return {
+    addListener(listener) {
+      listeners.push(listener);
+    },
+    fire(...args) {
+      for (const listener of listeners) listener(...args);
+    },
+  };
 
+}
 function policy(id, value, revision) {
   const targets = Array.isArray(value)
     ? value
@@ -37,6 +45,12 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   let webRequestListener;
   let messageListener;
   const tab_updates = [];
+  let active_tab = { id: 7, active: true, url: "https://outside.example/" };
+  let idle_query_interval = null;
+  let resolve_active_tab_sync;
+  const active_tab_sync = new Promise((resolve) => {
+    resolve_active_tab_sync = resolve;
+  });
 
   globalThis.setTimeout = () => ({ unref() {} });
   globalThis.chrome = {
@@ -62,15 +76,24 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
             if (message.command === "report_website_denials") {
               reportRequest = message;
             }
-            queueMicrotask(() => onMessage?.(
-              message.command === "report_website_denials" ||
-              message.command === "report_website_usage"
+            const response = message.command === "request_allowance_lease"
+              ? {
+                  ok: true,
+                  result: {
+                    rule_id: message.rule_id,
+                    lease_id: "lease",
+                    start_utc: new Date().toISOString(),
+                    end_utc: new Date(Date.now() + 30_000).toISOString(),
+                  },
+                }
+              : message.command === "report_website_denials" ||
+                  message.command === "report_website_usage"
                 ? hostResponse
                 : {
                     ok: false,
                     error: { code: "test_host", message: "not configured" },
-                  },
-            ));
+                  };
+            queueMicrotask(() => onMessage?.(response));
           },
         };
       },
@@ -96,12 +119,23 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
       onChanged: event(),
     },
     tabs: {
-      query() { return Promise.resolve([]); },
+      query(options = {}) {
+        return Promise.resolve(options.active ? [active_tab] : []);
+      },
+      get(tab_id) {
+        if (tab_id === active_tab.id) {
+          resolve_active_tab_sync();
+          return Promise.resolve(active_tab);
+        }
+        return Promise.reject(new Error("missing tab"));
+      },
       update(tab_id, details) {
         tab_updates.push({ tab_id, details });
-        return Promise.resolve();
+        active_tab = { ...active_tab, ...details };
+        return Promise.resolve(active_tab);
       },
       onActivated: event(),
+      onUpdated: event(),
       onCreated: event(),
       onRemoved: event(),
       onReplaced: event(),
@@ -138,11 +172,25 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
         addListener(listener) { webRequestListener = listener; },
       },
     },
+    idle: {
+      onStateChanged: event(),
+      queryState(seconds, callback) {
+        idle_query_interval = seconds;
+        callback("active");
+      },
+    },
+    windows: {
+      WINDOW_ID_NONE: -1,
+      onFocusChanged: event(),
+      getLastFocused: async () => ({ focused: true }),
+    },
   };
   const { apply_policy, report_matches, report_usage } = await import("../chromium/background.js");
+  await active_tab_sync;
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(local.inactive_ok, false);
   assert.match(local.inactive_error, /session update rejected/);
+  assert.equal(idle_query_interval, 15);
   sessionUpdateFailure = false;
 
   assert.equal(
@@ -295,4 +343,39 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   hostResponse = undefined;
   await report_usage();
   assert.match(local.last_error, /native messaging host returned no response/);
+
+  const timed_rule_id = "33333333-3333-4333-8333-333333333333";
+  assert.equal(await apply_policy({
+    schema_version: 6,
+    revision: 6,
+    rules: [{
+      id: timed_rule_id,
+      name: "Social Media Evenings",
+      enabled: true,
+      targets: [{ kind: "website", value: "x.com" }],
+      allowance_time: {
+        periods: [{
+          mode: "fixed_window",
+          quota_seconds: 600,
+          window_seconds: 3600,
+        }],
+        daily_cap_seconds: 3600,
+      },
+    }],
+  }), true);
+  active_tab = { ...active_tab, url: "https://outside.example/" };
+  globalThis.chrome.tabs.onUpdated.fire(7, { url: active_tab.url });
+  await new Promise((resolve) => setImmediate(resolve));
+  const requested_url = "https://x.com/";
+  await webRequestListener({
+    tabId: 7,
+    type: "main_frame",
+    url: requested_url,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(
+    tab_updates.some((update) => update.details.url === requested_url),
+    "first blocked navigation should resume after acquiring its timed lease",
+  );
 });

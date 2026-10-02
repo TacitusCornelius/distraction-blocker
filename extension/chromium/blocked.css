@@ -76,6 +76,7 @@ h2 {
   font-weight: 700;
   margin: 0;
   overflow-wrap: anywhere;
+  white-space: pre-line;
 }
 
 .requested {

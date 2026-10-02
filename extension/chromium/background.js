@@ -425,6 +425,40 @@ function host_request(message) {
     port.postMessage(message);
   });
 }
+async function allowance_status_for_url(url) {
+  if (typeof url === "string") {
+    try {
+      const parsed = new URL(url);
+      if (parsed.pathname.endsWith("/blocked.html")) {
+        url = parsed.searchParams.get("url");
+      }
+    } catch {
+      url = null;
+    }
+  }
+  const hit = typeof url === "string" && match_time_allowance !== null
+    ? match_time_allowance(url)
+    : null;
+  if (hit === null) {
+    return { ok: true, result: null };
+  }
+  const response = await host_request({
+    command: "allowance_status",
+    rule_id: hit.rule_id,
+  });
+  if (response?.ok) {
+    response.result.lease_remaining_seconds =
+      allowance_tracker.has_lease(hit.rule_id)
+        ? Math.max(
+            0,
+            Math.ceil((allowance_tracker.lease.end_ms - Date.now()) / 1000),
+          )
+        : null;
+    response.result.rule_name = hit.name || hit.rule_id;
+  }
+  return response;
+}
+
 
 function schedule_allowance_pulse() {
   if (allowance_timer !== null) {
@@ -746,6 +780,13 @@ chrome.windows?.onFocusChanged?.addListener((windowId) => {
 chrome.idle?.onStateChanged?.addListener((state) => {
   void allowance_tracker.set_idle(state !== "active");
 });
+if (chrome.idle?.queryState) {
+  chrome.idle.queryState(15, (state) => {
+    if (!chrome.runtime.lastError && typeof state === "string") {
+      void allowance_tracker.set_idle(state !== "active");
+    }
+  });
+}
 void sync_active_window();
 
 // Breadcrumb: observation only (no "blocking") — DNR enforces. Denial
@@ -769,6 +810,37 @@ function show_block_page(details, hit = null) {
     // The tab can disappear while a blocked request is being observed.
   }
 }
+async function start_timed_navigation(details, timed) {
+  if (details.tabId !== active_tab_id) {
+    show_block_page(details, timed);
+    return;
+  }
+  await update_allowance_url(details.tabId, details.url);
+  if (
+    active_tab_id !== details.tabId ||
+    active_tab_url !== details.url
+  ) {
+    return;
+  }
+  if (!timed_available_rules.has(timed.rule_id)) {
+    show_block_page(details, timed);
+    return;
+  }
+  await session_rule_queue;
+  try {
+    const tab = await chrome.tabs.get(details.tabId);
+    if (
+      tab?.id === details.tabId &&
+      active_tab_id === details.tabId &&
+      active_tab_url === details.url
+    ) {
+      await chrome.tabs.update(details.tabId, { url: details.url });
+    }
+  } catch {
+    // The tab can disappear while its timed allowance is being acquired.
+  }
+}
+
 async function redirect_active_tab_if_blocked(rule_id = null) {
   if (
     active_tab_id === null ||
@@ -838,7 +910,8 @@ function observe_request(details) {
       ? null
       : match_time_allowance(details.url);
     if (timed !== null && !timed_available_rules.has(timed.rule_id)) {
-      show_block_page(details, timed);
+      void start_timed_navigation(details, timed);
+      return;
     }
     if (timed === null && match_allowance !== null) {
       const allowed = match_allowance(details.url);
@@ -894,7 +967,16 @@ chrome.webRequest.onBeforeRequest.addListener(
   { urls: ["<all_urls>"] },
 );
 
-chrome.runtime.onMessage.addListener((_message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.topic === "allowance_status") {
+    void allowance_status_for_url(message.url ?? active_tab_url)
+      .then(sendResponse)
+      .catch(() => sendResponse({
+        ok: false,
+        error: { message: "Allowance status is unavailable." },
+      }));
+    return true;
+  }
   sendResponse({
     policy_ok: last_error === null,
     last_error,

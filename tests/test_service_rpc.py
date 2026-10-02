@@ -1249,6 +1249,7 @@ class ServiceTests(unittest.TestCase):
         listed = service.dispatch(1000, {"command": "list_managed_lists"})
         self.assertNotIn("domains", listed["result"][0])
         chunk = service.dispatch(1000, {"command": "read_managed_list", "list_id": managed.id, "offset": 0})
+        self.assertEqual(chunk["result"]["id"], managed.id)
         self.assertEqual(chunk["result"]["domains"], list(managed.domains))
     def test_system_managed_list_projects_domains_to_hosts(self):
         managed = ManagedList.from_dict({
@@ -1694,6 +1695,60 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(
             service.policy.rules[0].time_allowance.daily_cap_seconds,
             1800,
+        )
+
+    def test_allowance_status_reports_current_rolling_and_daily_budgets(self):
+        rule = Rule.from_dict({
+            "id": "bbbbbbb9-9999-4999-8999-999999999999",
+            "name": "Social Media Evenings",
+            "enabled": True,
+            "targets": [
+                {"kind": "url_path", "value": "x.com/"}
+            ],
+            "schedule": {
+                "kind": "weekly",
+                "timezone": "UTC",
+                "periods": [{
+                    "weekdays": [3],
+                    "start": "17:00:00",
+                    "end": "22:00:00",
+                }],
+            },
+            "revision": 0,
+            "allowance_time": {
+                "periods": [{
+                    "mode": "fixed_window",
+                    "quota_seconds": 600,
+                    "window_seconds": 3600,
+                }],
+                "daily_cap_seconds": 3600,
+            },
+        })
+        service = BlockerService(
+            FakeStore(Policy(0, (rule,))),
+            FakeClock(datetime(2026, 1, 1, 18, 0, tzinfo=timezone.utc)),
+            FakeHosts(),
+            FakeApplications(),
+        )
+        service.start()
+
+        result = service.dispatch(1000, {
+            "command": "allowance_status",
+            "rule_id": rule.id,
+        })
+
+        self.assertTrue(result["ok"])
+        status = result["result"]
+        self.assertTrue(status["active"])
+        self.assertTrue(status["allowed"])
+        self.assertEqual(status["remaining_seconds"], 600)
+        self.assertEqual(status["period_budget_seconds"], 600)
+        self.assertEqual(status["period_mode"], "fixed_window")
+        self.assertEqual(status["window_seconds"], 3600)
+        self.assertEqual(status["period_remaining_seconds"], 600)
+        self.assertEqual(status["daily_remaining_seconds"], 3600)
+        self.assertEqual(
+            status["window_end_utc"], "2026-01-01T19:00:00.000000Z"
         )
 
     def test_allowance_increase_is_rejected_by_rule_lock(self):

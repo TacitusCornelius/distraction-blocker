@@ -168,6 +168,19 @@ class NativeHostTests(unittest.TestCase):
             self.assertTrue(allowed_list["ok"])
             active = host_entry.handle({"command": "list_active_rules"})
             self.assertTrue(active["ok"])
+            allowance_status = host_entry.handle({
+                "command": "allowance_status",
+                "rule_id": "11111111-1111-4111-8111-111111111111",
+            })
+            self.assertTrue(allowance_status["ok"])
+            denied_allowance_status = host_entry.handle({
+                "command": "allowance_status",
+                "rule_id": "11111111-1111-4111-8111-111111111111",
+                "extra": True,
+            })
+            self.assertEqual(
+                denied_allowance_status["error"]["code"], "forbidden"
+            )
         denied = host_entry.handle({"command": "delete_rule"})
         self.assertFalse(denied["ok"])
         fields = host_entry.handle({"command": "status", "extra": 1})

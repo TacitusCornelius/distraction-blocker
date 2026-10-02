@@ -60,7 +60,7 @@ export async function expand_managed_lists(policy, read_list) {
       }
       const result = response.result;
       if (
-        result.list_id !== list_id ||
+        result.id !== list_id ||
         result.offset !== offset ||
         result.revision !== policy.revision ||
         !Array.isArray(result.domains) ||

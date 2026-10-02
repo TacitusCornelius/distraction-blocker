@@ -88,6 +88,7 @@ h1 {
   font-size: 0.86rem;
   font-weight: 700;
   margin: 3px 0 0;
+  white-space: pre-line;
 }
 
 .status-copy.bad { color: #b91c1c; }

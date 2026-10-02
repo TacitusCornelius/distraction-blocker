@@ -2,6 +2,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { compile } from "../core/engine.js";
 import { expand_managed_lists, rules_from_policy } from "../core/policy.js";
 
 const current = {
@@ -52,7 +53,7 @@ test("managed-list expansion is complete before browser compilation", async () =
     return {
       ok: true,
       result: {
-        list_id: id,
+        id,
         offset,
         revision: 4,
         domains: offset === 0 ? ["list.example"] : [],
@@ -65,6 +66,7 @@ test("managed-list expansion is complete before browser compilation", async () =
     { kind: "website", value: "list.example" },
     { kind: "website", value: "direct.example" },
   ]);
+  assert.equal(compile(expanded.rules)("https://list.example/path")?.rule_id, "rule-1");
 });
 
 test("managed-domain exclusions apply only to their rule's list expansion", async () => {
@@ -92,7 +94,7 @@ test("managed-domain exclusions apply only to their rule's list expansion", asyn
   const expanded = await expand_managed_lists(policy, async (id, offset) => ({
     ok: true,
     result: {
-      list_id: id,
+      id,
       offset,
       revision: 9,
       domains: ["list.example", "other.example"],

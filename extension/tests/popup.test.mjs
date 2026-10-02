@@ -43,6 +43,7 @@ function popup_fixture() {
     "block_inactive",
     "inactive_state",
     "recorded",
+    "allowance-status",
   ]) {
     elements.set(id, {
       textContent: "",
@@ -102,8 +103,24 @@ test("popup renders status, denial totals, and inactive-tab state", async () => 
     };
     const api = {
       runtime: {
-        sendMessage() {
-          return Promise.resolve(status);
+        sendMessage(message) {
+          return Promise.resolve(message.topic === "allowance_status"
+            ? {
+                ok: true,
+                result: {
+                  rule_name: "Social Media Evenings",
+                  active: true,
+                  remaining_seconds: 420,
+                  period_budget_seconds: 600,
+                  period_remaining_seconds: 420,
+                  window_seconds: 3600,
+                  window_end_utc: new Date(Date.now() + 1_800_000).toISOString(),
+                  daily_cap_seconds: 3600,
+                  daily_remaining_seconds: 3000,
+                  lease_remaining_seconds: 20,
+                },
+              }
+            : status);
         },
       },
       storage: {
@@ -141,6 +158,14 @@ test("popup renders status, denial totals, and inactive-tab state", async () => 
     assert.equal(
       fixture.elements.get("inactive_state").textContent,
       "Background-tab loads are permitted.",
+    );
+    assert.match(
+      fixture.elements.get("allowance-status").textContent,
+      /7m remaining in the current allowance/,
+    );
+    assert.match(
+      fixture.elements.get("allowance-status").textContent,
+      /Rolling window: 10m per 60m/,
     );
   }
 });

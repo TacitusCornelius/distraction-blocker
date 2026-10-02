@@ -13,6 +13,92 @@ function event() {
   };
 }
 
+test("Firefox seeds the allowance tracker from the browser's current idle state", async () => {
+  const rule_id = "33333333-3333-4333-8333-333333333333";
+  const runtime = {
+    onInstalled: event(),
+    onStartup: event(),
+    onMessage: event(),
+    getURL(path) {
+      return `moz-extension://test/${path}`;
+    },
+    connectNative() {
+      const port = {
+        onMessage: event(),
+        onDisconnect: event(),
+        postMessage(message) {
+          const now = new Date();
+          const response = message.command === "request_allowance_lease"
+            ? {
+                ok: true,
+                result: {
+                  rule_id,
+                  lease_id: "lease",
+                  start_utc: now.toISOString(),
+                  end_utc: new Date(now.getTime() + 30_000).toISOString(),
+                },
+              }
+            : { ok: true, result: {} };
+          queueMicrotask(() => {
+            for (const listener of port.onMessage.listeners) listener(response);
+          });
+        },
+        disconnect() {},
+      };
+      return port;
+    },
+  };
+  const browser = {
+    runtime,
+    alarms: { create() {}, onAlarm: event() },
+    storage: {
+      local: {
+        get: () => Promise.resolve({}),
+        set: () => Promise.resolve(),
+      },
+      onChanged: event(),
+    },
+    idle: {
+      onStateChanged: event(),
+      queryState: async () => "active",
+    },
+    webRequest: { onBeforeRequest: event() },
+    tabs: {
+      onActivated: event(),
+      onUpdated: event(),
+      onRemoved: event(),
+      get: async () => ({ id: 7, active: true }),
+      query: async () => [],
+    },
+  };
+  const context = vm.createContext({
+    browser,
+    console,
+    Date,
+    Promise,
+    URL,
+    URLSearchParams,
+    setTimeout,
+    clearTimeout,
+    queueMicrotask,
+  });
+  const coreFiles = ["usage.js", "policy.js", "engine.js", "dnr.js", "allowance.js"];
+  const source = [
+    ...coreFiles.map((file) =>
+      readFileSync(new URL(`../firefox/core/${file}`, import.meta.url), "utf8"),
+    ),
+    readFileSync(new URL("../firefox/background.js", import.meta.url), "utf8"),
+  ].join("\n");
+  vm.runInContext(source, context);
+  const acquired = await vm.runInContext(`(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await allowance_tracker.set_active_tab(7, { rule_id: "${rule_id}" });
+    await allowance_tracker.set_focused(true);
+    return allowance_tracker.has_lease("${rule_id}");
+  })()`, context);
+  assert.equal(acquired, true);
+});
+
 test("Firefox blocks HTTP requests before the first policy response", async () => {
   const runtime = {
     onInstalled: event(),

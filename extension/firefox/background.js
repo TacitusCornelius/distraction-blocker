@@ -215,6 +215,40 @@ function host_request(message) {
     port.postMessage(message);
   });
 }
+async function allowance_status_for_url(url) {
+  if (typeof url === "string") {
+    try {
+      const parsed = new URL(url);
+      if (parsed.pathname.endsWith("/blocked.html")) {
+        url = parsed.searchParams.get("url");
+      }
+    } catch {
+      url = null;
+    }
+  }
+  const hit = typeof url === "string" && match_time_allowance !== null
+    ? match_time_allowance(url)
+    : null;
+  if (hit === null) {
+    return { ok: true, result: null };
+  }
+  const response = await host_request({
+    command: "allowance_status",
+    rule_id: hit.rule_id,
+  });
+  if (response?.ok) {
+    response.result.lease_remaining_seconds =
+      allowance_tracker.has_lease(hit.rule_id)
+        ? Math.max(
+            0,
+            Math.ceil((allowance_tracker.lease.end_ms - Date.now()) / 1000),
+          )
+        : null;
+    response.result.rule_name = hit.name || hit.rule_id;
+  }
+  return response;
+}
+
 
 function schedule_allowance_pulse() {
   if (allowance_timer !== null) {
@@ -447,6 +481,14 @@ browser.windows?.onFocusChanged?.addListener((windowId) => {
 browser.idle?.onStateChanged?.addListener((state) => {
   void allowance_tracker.set_idle(state !== "active");
 });
+if (browser.idle?.queryState) {
+  browser.idle.queryState(15).then((state) => {
+    if (typeof state === "string") {
+      return allowance_tracker.set_idle(state !== "active");
+    }
+    return undefined;
+  }).catch(() => {});
+}
 void sync_active_window();
 
 
@@ -525,7 +567,14 @@ browser.webRequest.onBeforeRequest.addListener(
   ["blocking"],
 );
 
-browser.runtime.onMessage.addListener((_message) => {
+browser.runtime.onMessage.addListener((message) => {
+  if (message?.topic === "allowance_status") {
+    return allowance_status_for_url(message.url ?? active_tab_url)
+      .catch(() => ({
+        ok: false,
+        error: { message: "Allowance status is unavailable." },
+      }));
+  }
   return Promise.resolve({
     policy_ok: last_error === null,
     last_error,

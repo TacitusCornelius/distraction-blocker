@@ -1898,6 +1898,7 @@ class BlockerService:
 
         "report_website_denials": ((frozenset({"command", "entries"}),), "entries is required", "_cmd_report_website_denials"),
         "report_website_usage": ((frozenset({"command", "entries"}),), "entries is required", "_cmd_report_website_usage"),
+        "allowance_status": ((frozenset({"command", "rule_id"}),), "rule_id is required", "_cmd_allowance_status"),
         "request_allowance_lease": ((frozenset({"command", "rule_id", "seconds"}),), "rule_id and seconds are required", "_cmd_request_allowance_lease"),
         "report_allowance_usage": ((frozenset({"command", "lease_id", "report_id", "start_utc", "end_utc"}),), "allowance usage fields are required", "_cmd_report_allowance_usage"),
 
@@ -2268,6 +2269,53 @@ class BlockerService:
             None,
         )
 
+    def _cmd_allowance_status(
+        self, uid: int, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            rule_id = canonical_uuid(request["rule_id"])
+        except (KeyError, TypeError, CanonicalError):
+            return self._error("bad_request", "rule_id is required")
+        rule = self._allowance_rule(rule_id)
+        if rule is None:
+            return self._error("not_found", "timed allowance rule was not found")
+        now = self._now()
+        decision = allowance_decision(
+            rule, now, self._allowance_usage.for_rule(rule.id)
+        )
+        if decision is None:
+            return self._error("not_found", "timed allowance rule was not found")
+        return self._ok({
+            "rule_id": rule.id,
+            "active": decision.active,
+            "allowed": decision.allowed,
+            "period_mode": (
+                rule.time_allowance.periods[decision.period_index].mode
+                if decision.period_index is not None else None
+            ),
+            "window_seconds": (
+                rule.time_allowance.periods[decision.period_index].window_seconds
+                if decision.period_index is not None
+                and rule.time_allowance.periods[decision.period_index].mode == "fixed_window"
+                else None
+            ),
+            "remaining_seconds": decision.remaining_seconds,
+            "period_budget_seconds": decision.period_budget_seconds,
+            "period_used_seconds": decision.period_used_seconds,
+            "period_remaining_seconds": decision.period_remaining_seconds,
+            "window_start_utc": (
+                format_utc(decision.window_start_utc)
+                if decision.window_start_utc is not None else None
+            ),
+            "window_end_utc": (
+                format_utc(decision.window_end_utc)
+                if decision.window_end_utc is not None else None
+            ),
+            "daily_cap_seconds": decision.daily_cap_seconds,
+            "daily_used_seconds": decision.daily_used_seconds,
+            "daily_remaining_seconds": decision.daily_remaining_seconds,
+            "checked_utc": format_utc(now),
+        })
     def _cmd_request_allowance_lease(
         self, uid: int, request: dict[str, Any]
     ) -> dict[str, Any]:
