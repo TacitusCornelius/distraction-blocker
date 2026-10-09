@@ -60,6 +60,25 @@ class AllowanceServiceTests(unittest.TestCase):
         service.start()
         return service, store
 
+    def test_allowance_status_reports_current_budget(self):
+        service, _store = self.make_service(quota=60)
+
+        response = service.dispatch(1000, {
+            "command": "allowance_status",
+            "rule_id": RULE_ID,
+        })
+
+        self.assertTrue(response["ok"], response)
+        status = response["result"]
+        self.assertEqual(status["rule_id"], RULE_ID)
+        self.assertTrue(status["active"])
+        self.assertTrue(status["allowed"])
+        self.assertEqual(status["period_mode"], "total")
+        self.assertEqual(status["period_budget_seconds"], 60)
+        self.assertEqual(status["period_used_seconds"], 0)
+        self.assertEqual(status["period_remaining_seconds"], 60)
+        self.assertEqual(status["remaining_seconds"], 60)
+
     def test_lease_reserves_budget_and_report_is_idempotent(self):
         service, store = self.make_service()
         lease = service.dispatch(1000, {
