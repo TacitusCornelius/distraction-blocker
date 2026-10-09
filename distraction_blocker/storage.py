@@ -413,7 +413,7 @@ class ProtectedStore:
                 raise StorageError(
                     "old policy contains an unsupported browser-wide target"
                 )
-            if "allowance_time" in rule:
+            if source_schema < 5 and "allowance_time" in rule:
                 raise StorageError(
                     "old policy contains an unsupported elapsed-time allowance"
                 )

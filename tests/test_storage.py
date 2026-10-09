@@ -215,6 +215,39 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(rule["system_blocking"])
         self.assertEqual(rule["system_targets"], [])
 
+    def test_policy_schema6_migration_preserves_elapsed_allowance(self):
+        migrated = ProtectedStore._migrate_policy({
+            "schema_version": 6,
+            "revision": 2,
+            "rules": [{
+                "id": "12345678-1234-5678-9234-567812345678",
+                "name": "Timed",
+                "enabled": True,
+                "targets": [{"kind": "url_path", "value": "example.com/feed"}],
+                "schedule": {
+                    "kind": "weekly",
+                    "timezone": "UTC",
+                    "periods": [{
+                        "weekdays": [0],
+                        "start": "09:00",
+                        "end": "10:00",
+                    }],
+                },
+                "revision": 0,
+                "allowance_time": {
+                    "periods": [{"mode": "strict"}],
+                    "daily_cap_seconds": 1200,
+                },
+            }],
+            "managed_lists": [],
+        })
+        self.assertEqual(migrated["schema_version"], POLICY_SCHEMA_VERSION)
+        self.assertEqual(
+            migrated["rules"][0]["allowance_time"],
+            {"periods": [{"mode": "strict"}], "daily_cap_seconds": 1200},
+        )
+        Policy.from_dict(migrated)
+
     def test_old_policy_schema_rejects_browser_wide_target(self):
         with self.assertRaisesRegex(StorageError, "unsupported browser-wide"):
             ProtectedStore._migrate_policy({
