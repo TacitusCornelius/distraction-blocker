@@ -109,7 +109,7 @@ class InstallerSecurityTests(unittest.TestCase):
             unit = root / "unit"
             unit.write_text(
                 "[Service]\n"
-                "ReadWritePaths=/var/lib/distraction-blocker /run/distraction-blocker /etc\n",
+                "ReadWritePaths=/var/lib/distraction-blocker /run/distraction-blocker /etc/hosts\n",
                 encoding="utf-8",
             )
             with patch.object(install, "UNIT", unit), patch.object(
@@ -118,8 +118,7 @@ class InstallerSecurityTests(unittest.TestCase):
                 install.configure_service_unit(home, 1000)
             rendered = unit.read_text(encoding="utf-8")
             self.assertIn(
-                f"ReadWritePaths=/var/lib/distraction-blocker /run/distraction-blocker /etc "
-                f"{home}/.config/distraction-blocker",
+                "ReadWritePaths=/var/lib/distraction-blocker /run/distraction-blocker /etc/hosts ",
                 rendered,
             )
             self.assertIn(
@@ -133,6 +132,29 @@ class InstallerSecurityTests(unittest.TestCase):
             self.assertTrue(
                 (home / ".config" / "distraction-blocker").is_dir()
             )
+
+
+    def test_net_admin_capability_is_only_in_opt_in_network_dropin(self):
+        root = Path(__file__).resolve().parent.parent / "packaging"
+        base_unit = (root / "distraction-blocker.service").read_text()
+        network_dropin = (root / "distraction-blocker-network.conf").read_text()
+        self.assertNotIn("CAP_NET_ADMIN", base_unit)
+        self.assertIn("CAP_NET_ADMIN", network_dropin)
+        self.assertIn("ReadWritePaths=/etc", network_dropin)
+
+    def test_unmarked_network_assets_require_opt_in_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dropin = root / "network.conf"
+            dropin.write_text("network capability grant\n", encoding="utf-8")
+            with (
+                patch.object(install, "DNS_UNIT", root / "dns.service"),
+                patch.object(install, "FENCE_UNIT", root / "restore.service"),
+                patch.object(install, "SANDBOX_DROPIN", dropin),
+            ):
+                with self.assertRaises(SystemExit):
+                    install.reject_unmarked_network_assets(False)
+                install.reject_unmarked_network_assets(True)
 
 
 

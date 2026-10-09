@@ -195,9 +195,15 @@ test("Firefox blocks HTTP requests before the first policy response", async () =
   assert.equal(startup_page.pathname, "/blocked.html");
   assert.equal(startup_page.searchParams.get("rule"), "Policy is not ready");
 
+  const background_startup_result = await listener({
+    tabId: -1,
+    type: "xmlhttprequest",
+    url: "https://updates.example/background",
+  });
+  assert.equal(background_startup_result.cancel, true);
   const applied = vm.runInContext(
     `apply_policy(${JSON.stringify({
-      schema_version: 6,
+      schema_version: 7,
       revision: 1,
       rules: [{
         id: "test-rule",
@@ -230,11 +236,42 @@ test("Firefox blocks HTTP requests before the first policy response", async () =
   assert.equal(page.pathname, "/blocked.html");
   assert.equal(page.searchParams.get("rule"), "Test extension rule");
   assert.equal(page.searchParams.get("url"), "https://example.com/blocked");
+  const socket_from_site_rule = await listener({
+    tabId: 7,
+    type: "websocket",
+    url: "wss://example.com/blocked",
+  });
+  assert.equal(Object.keys(socket_from_site_rule).length, 0);
+  assert.equal(await vm.runInContext(
+    `apply_policy(${JSON.stringify({
+      schema_version: 7,
+      revision: 2,
+      rules: [{
+        id: "browser-all",
+        name: "Browser only",
+        enabled: true,
+        targets: [{ kind: "browser_all", value: "all" }],
+      }],
+    })})`,
+    context,
+  ), true);
+  const socket_from_browser_rule = await listener({
+    tabId: 7,
+    type: "websocket",
+    url: "wss://socket.example/connect",
+  });
+  assert.equal(socket_from_browser_rule.cancel, true);
+  const browser_background_request = await listener({
+    tabId: -1,
+    type: "xmlhttprequest",
+    url: "https://service.example/update",
+  });
+  assert.equal(browser_background_request.cancel, true);
   const timed_rule_id = "timed-rule";
   assert.equal(await vm.runInContext(
     `apply_policy(${JSON.stringify({
-      schema_version: 6,
-      revision: 2,
+      schema_version: 7,
+      revision: 3,
       rules: [{
         id: timed_rule_id,
         name: "Social Media Evenings",
@@ -272,7 +309,7 @@ test("Firefox blocks HTTP requests before the first policy response", async () =
 
   assert.equal(await vm.runInContext(
     `apply_policy(${JSON.stringify({
-      schema_version: 6,
+      schema_version: 7,
       revision: 3,
       rules: [
         {
@@ -328,7 +365,7 @@ test("Firefox restores cached policy before handling startup requests", async ()
   };
   const webRequest = { onBeforeRequest: event() };
   const snapshot = {
-    schema_version: 6,
+    schema_version: 7,
     revision: 7,
     rules: [{
       id: "cached-rule",

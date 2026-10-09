@@ -82,7 +82,7 @@ class ExportTests(unittest.TestCase):
         text = native_export_text(policy, datetime(2026, 8, 13, 12, tzinfo=timezone.utc))
         value = json.loads(text)
         self.assertEqual(value["format"], "distraction-blocker")
-        self.assertEqual(value["version"], 8)
+        self.assertEqual(value["version"], 9)
         self.assertEqual(parse_native_export(text), policy)
 
     def test_native_v1_import_converts_to_empty_lists(self):
@@ -160,6 +160,16 @@ class ExportTests(unittest.TestCase):
                 "items": [],
             }))
 
+    def test_target_list_v1_rejects_browser_wide_targets(self):
+        value = {
+            "format": "distraction-blocker-target-list",
+            "version": 1,
+            "scope": "targets",
+            "items": [{"kind": "browser_all", "value": "all"}],
+        }
+        with self.assertRaisesRegex(TransferError, "target-list format v2"):
+            parse_target_list_text(json.dumps(value))
+
 
 
 
@@ -177,7 +187,7 @@ class ExportTests(unittest.TestCase):
         })
         policy = Policy(0, (rule,))
         text = native_export_text(policy, datetime(2026, 8, 13, 12, tzinfo=timezone.utc))
-        self.assertEqual(json.loads(text)["version"], 8)
+        self.assertEqual(json.loads(text)["version"], 9)
         self.assertEqual(parse_native_export(text), policy)
 
     def test_native_v2_import_refuses_network_targets(self):
@@ -263,6 +273,26 @@ class ExportTests(unittest.TestCase):
             "managed_lists": [],
         }
         with self.assertRaisesRegex(TransferError, "v7"):
+            parse_native_export(json.dumps(value))
+
+    def test_native_v8_import_refuses_browser_wide_targets(self):
+        rule = Rule.from_dict({
+            "id": RULE_ID,
+            "name": "All internet",
+            "enabled": True,
+            "targets": [{"kind": "browser_all", "value": "all"}],
+            "schedule": {"kind": "indefinite"},
+            "revision": 0,
+        })
+        value = {
+            "format": "distraction-blocker",
+            "version": 8,
+            "exported_utc": "2026-08-13T12:00:00Z",
+            "revision": 0,
+            "rules": [rule.to_dict()],
+            "managed_lists": [],
+        }
+        with self.assertRaisesRegex(TransferError, "native format v9"):
             parse_native_export(json.dumps(value))
 
     def test_native_import_refuses_malformed_or_unknown_data(self):

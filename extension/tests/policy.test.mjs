@@ -6,7 +6,7 @@ import { compile } from "../core/engine.js";
 import { expand_managed_lists, rules_from_policy } from "../core/policy.js";
 
 const current = {
-  schema_version: 6,
+  schema_version: 7,
   revision: 7,
   rules: [{ id: "rule-1" }],
 };
@@ -22,7 +22,8 @@ test("policy parser rejects missing, unknown, and invalid outer values", () => {
     [],
     { revision: 7, rules: [] },
     { ...current, schema_version: 1 },
-    { ...current, schema_version: 7 },
+    { ...current, schema_version: 6 },
+    { ...current, schema_version: 8 },
     { ...current, revision: -1 },
     { ...current, revision: true },
     { ...current, rules: {} },
@@ -36,7 +37,7 @@ test("policy parser rejects missing, unknown, and invalid outer values", () => {
 
 test("managed-list expansion is complete before browser compilation", async () => {
   const policy = {
-    schema_version: 6,
+    schema_version: 7,
     revision: 4,
     rules: [{
       id: "rule-1",
@@ -71,7 +72,7 @@ test("managed-list expansion is complete before browser compilation", async () =
 
 test("managed-domain exclusions apply only to their rule's list expansion", async () => {
   const policy = {
-    schema_version: 6,
+    schema_version: 7,
     revision: 9,
     rules: [
       {

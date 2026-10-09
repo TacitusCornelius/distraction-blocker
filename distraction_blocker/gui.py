@@ -738,7 +738,7 @@ def rule_to_form(rule: Rule, timezone_name: str) -> RuleForm:
     url_targets = tuple(
         {"kind": item["kind"], "value": item["value"]}
         for item in targets
-        if item["kind"] in Target.URL_LIKE_KINDS
+        if item["kind"] in Target.BROWSER_TARGET_KINDS
     )
     url_exceptions = tuple(
         {"kind": item.kind, "value": item.value}
@@ -1896,6 +1896,7 @@ def _target_summary(rule: Rule) -> str:
     url_targets = sum(
         item["kind"] in Target.URL_LIKE_KINDS for item in targets
     )
+    browser_wide = sum(item["kind"] == "browser_all" for item in targets)
     parts: list[str] = []
     if websites:
         parts.append(f"{websites} website" + ("s" if websites != 1 else ""))
@@ -1907,6 +1908,8 @@ def _target_summary(rule: Rule) -> str:
         )
     if url_targets:
         parts.append(f"{url_targets} URL rule" + ("s" if url_targets != 1 else ""))
+    if browser_wide:
+        parts.append("browser-wide block")
     networks = sum(item["kind"] == "network" for item in targets)
     if networks:
         parts.append(
@@ -4622,6 +4625,7 @@ class RuleEditor:
                 "Keyword",
                 "YouTube video",
                 "YouTube channel",
+                "All internet (browser only)",
             )
         )
         self.target_entry = Gtk.Entry()
@@ -5160,6 +5164,14 @@ class RuleEditor:
                 "domains, and URL-level targets. Configure one allowance "
                 "mode for each weekly period."
             )
+        elif any(
+            entry.get("kind") == "browser_all"
+            for entry in self._block_target_entries()
+        ):
+            note.set_text(
+                "Timed allowances are unavailable for the browser-wide "
+                "Block Target."
+            )
         else:
             note.set_text(
                 "Remove applications, network controls, or active "
@@ -5269,6 +5281,7 @@ class RuleEditor:
         "youtube_video",
         "youtube_channel",
     )
+    _BLOCK_URL_KINDS = (*_URL_KINDS, "browser_all")
 
     # Breadcrumb (network seam): (control, checkbox label, tooltip); the
     # control names are the network target values stored in the rule.
@@ -5416,18 +5429,22 @@ class RuleEditor:
         else:
             dropdown = getattr(self, "target_kind_dropdown", None)
             entry_widget = getattr(self, "target_entry", None)
-            kinds = ("auto", "website", *self._URL_KINDS)
+            kinds = (
+                "auto", "website", *self._BLOCK_URL_KINDS
+            )
             target_list = getattr(self, "target_entries", self.url_targets)
             if dropdown is None:
                 dropdown = self.url_kind_dropdown
                 entry_widget = self.url_entry
-                kinds = self._URL_KINDS
+                kinds = self._BLOCK_URL_KINDS
         selected = dropdown.get_selected()
         kind = kinds[selected] if selected < len(kinds) else kinds[0]
         value = entry_widget.get_text().strip()
         if kind == "auto":
             kind, value = self._classify_target(value, exception)
-        if not value:
+        if kind == "browser_all":
+            value = "all"
+        elif not value:
             self.error_label.set_text("Enter a target first.")
             return
         try:
@@ -5496,6 +5513,7 @@ class RuleEditor:
             "url_keyword": "Keyword",
             "youtube_video": "YouTube video",
             "youtube_channel": "YouTube channel",
+            "browser_all": "All internet (browser only)",
         }
         managed_names = {
             summary.id: summary.name for summary in self.managed_lists

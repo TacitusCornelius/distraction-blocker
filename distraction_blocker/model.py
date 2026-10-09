@@ -32,10 +32,11 @@ MAX_POMODORO_CYCLES = 20
 MAX_ALLOWANCE_STARTS = 2**53 - 1
 MAX_TIME_ALLOWANCE_SECONDS = 24 * 60 * 60
 TIME_ALLOWANCE_MODES = frozenset({"strict", "total", "fixed_window"})
-# Breadcrumb: schema 5 adds elapsed-time allowance configuration while
-# retaining allowance_starts as a separate legacy behavior. Schema 6 adds
-# browser/system target separation without rewriting existing browser targets.
-POLICY_SCHEMA_VERSION = 6
+# Schema 5 adds elapsed-time allowance configuration while retaining
+# allowance_starts as a separate legacy behavior. Schema 6 adds
+# browser/system target separation; schema 7 adds browser-wide blocking as a
+# browser target without changing system network controls.
+POLICY_SCHEMA_VERSION = 7
 # Breadcrumb: the closed set of network control names a network target may
 # carry. The value is a fixed control name, never raw firewall input.
 NETWORK_CONTROLS = frozenset(
@@ -242,9 +243,8 @@ class Target:
     kind: str
     value: str
 
-    # Breadcrumb: single source of truth for "URL-like" target kinds. The
-    # GUI groups these kinds together; membership here must stay in sync
-    # with the from_dict cascade below.
+    # Browser-wide HTTP(S)/WebSocket blocking is distinct from network rules.
+    # It is a browser target but not a URL exception target.
     URL_LIKE_KINDS = frozenset({
         "url_path",
         "url_wildcard",
@@ -252,6 +252,7 @@ class Target:
         "youtube_video",
         "youtube_channel",
     })
+    BROWSER_TARGET_KINDS = URL_LIKE_KINDS | {"browser_all"}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Target":
@@ -266,6 +267,7 @@ class Target:
             "url_keyword",
             "youtube_video",
             "youtube_channel",
+            "browser_all",
             "network",
         }:
             _error("bad_value", "target kind is not supported")
@@ -286,6 +288,10 @@ class Target:
             value = _youtube_video_id(value, "YouTube video target")
         elif kind == "youtube_channel":
             value = _youtube_channel(value, "YouTube channel target")
+        elif kind == "browser_all":
+            value = _string(value, "browser-wide target value")
+            if value != "all":
+                _error("bad_value", "browser-wide target value must be 'all'")
         elif kind == "network":
             value = _network_control(value, "network target value")
         else:

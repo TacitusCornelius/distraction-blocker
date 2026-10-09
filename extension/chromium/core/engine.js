@@ -12,6 +12,7 @@
  * url_keyword:    keyword occurs anywhere in the full lowercase URL.
  * youtube_video:  video ID equal on any YouTube host (case-sensitive).
  * youtube_channel: @handle or UC channel ID in the URL path.
+ * browser_all:    every HTTP(S) and WebSocket URL, browser-level only.
  * network:        ignored; OS-level enforcer targets, never URLs.
  */
 "use strict";
@@ -36,6 +37,15 @@ const YOUTUBE_HOSTS = new Set([
   "youtube-nocookie.com",
   "www.youtube-nocookie.com",
 ]);
+function is_browser_network_protocol(protocol) {
+  return (
+    protocol === "http:" ||
+    protocol === "https:" ||
+    protocol === "ws:" ||
+    protocol === "wss:"
+  );
+}
+
 /**
  * Extract a video ID or channel reference from a YouTube URL.
  * Handles watch?v=, /shorts/, /embed/, /live/, /@handle and /channel/UC….
@@ -70,6 +80,7 @@ export function youtube_fields(parsed) {
         ? youtube_video
         : null,
     youtube_channel: youtube_channel ? youtube_channel.toLowerCase() : null,
+    browser_network: is_browser_network_protocol(parsed.protocol),
   };
 }
 
@@ -88,11 +99,15 @@ export function describe_url(raw) {
       href: parsed.href.toLowerCase(),
       youtube_video: null,
       youtube_channel: null,
+      browser_network: is_browser_network_protocol(parsed.protocol),
     }
   );
 }
 
 function target_matches(target, url) {
+  if (target.kind === "browser_all") {
+    return url.browser_network;
+  }
   if (target.kind === "website") {
     return target.value === url.host;
   }
@@ -125,6 +140,8 @@ function target_matches(target, url) {
 /**
  * Compile service rules into a matcher.
  * `rules` is a list of { id, enabled, targets, exceptions } objects.
+ * The optional browser_all_only mode is for Firefox WebSocket and
+ * unassociated browser requests, which only support the explicit broad target.
  */
 export function compile(rules) {
   const active = (rules ?? []).filter(
@@ -133,8 +150,8 @@ export function compile(rules) {
   const exceptions = active.flatMap((rule) =>
     Array.isArray(rule.exceptions) ? rule.exceptions : []
   );
-  /** Return { rule_id, kind, value } for the first match, or null. */
-  return function match(raw_url) {
+  /** Return { rule_id, kind, value } for the first matching target, or null. */
+  return function match(raw_url, browser_all_only = false) {
     const url = describe_url(raw_url);
     if (url === null) {
       return null;
@@ -144,6 +161,9 @@ export function compile(rules) {
     }
     for (const rule of active) {
       for (const target of rule.targets) {
+        if (browser_all_only && target.kind !== "browser_all") {
+          continue;
+        }
         if (target_matches(target, url)) {
           return {
             rule_id: rule.id,

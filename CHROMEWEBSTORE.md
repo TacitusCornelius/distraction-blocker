@@ -4,8 +4,9 @@ This repository ships a Chromium Manifest V3 adapter in `extension/chromium/`.
 The Chrome Web Store package is an installation channel for that adapter; the
 Ubuntu root service and native-messaging host remain required for enforcement.
 
-The Web Store release is **Version 1.9.6**. The Firefox and Chromium adapter
-manifests share this version so the extension build contract remains strict.
+The Web Store update candidate is **Version 1.9.7**. The Firefox and Chromium
+adapter manifests share this version so the extension build contract remains
+strict.
 
 ## Distribution decision
 
@@ -21,11 +22,12 @@ review. Those are operator actions in the Chrome Developer Dashboard.
 
 ## Current publication status
 
-Version 1.9.6 is prepared as an update to the existing Chrome Web Store item.
-The upload archive is `dist/distraction-blocker-chromium-1.9.6.zip`. Submit it
-to the existing item, not as a second extension. This patch fixes timed
-allowance status reporting for exhausted budgets and rules that overlap a
-regular blocking rule, while preserving managed-list loading.
+Version 1.9.7 is prepared as an update to the existing Chrome Web Store item.
+The upload archive is `dist/distraction-blocker-chromium-1.9.7.zip`. Submit it
+to the existing item, not as a second extension. This release adds the
+browser-only whole-internet Block Target, enforced by the browser extensions
+without activating DNS or protected-user firewall controls. Publication remains
+an operator action in the Chrome Developer Dashboard.
 The public HTTPS privacy-policy URL remains available at:
 
 <https://tacituscornelius.github.io/distraction-blocker/privacy-policy/>

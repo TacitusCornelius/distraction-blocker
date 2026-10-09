@@ -452,6 +452,21 @@ class FormConversionTests(unittest.TestCase):
         self.assertEqual(rebuilt["rule"], rule.to_dict())
         self.assertIn("3 URL rules", _target_summary(rule))
 
+    def test_browser_wide_target_round_trips_separately_from_network(self) -> None:
+        rule = make_rule(
+            targets=[{"kind": "browser_all", "value": "all"}],
+        )
+
+        form = rule_to_form(rule, "UTC")
+        rebuilt = form_to_request(form, id_factory=lambda: UUID(RULE_ID))
+
+        self.assertEqual(
+            form.url_targets,
+            ({"kind": "browser_all", "value": "all"},),
+        )
+        self.assertEqual(rebuilt["rule"], rule.to_dict())
+        self.assertIn("browser-wide block", _target_summary(rule))
+
     def test_rule_round_trip_keeps_url_exceptions(self) -> None:
         rule = make_rule(
             targets=[{"kind": "website", "value": "example.com"}],

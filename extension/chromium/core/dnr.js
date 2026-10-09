@@ -15,6 +15,7 @@
  *                    (case-insensitive).
  * - youtube_video:   video ID equal on any YouTube host form (case-sensitive).
  * - youtube_channel: @handle or UC channel reference in the URL path.
+ * - browser_all:     every HTTP(S) and WebSocket URL.
  */
 "use strict";
 
@@ -46,6 +47,10 @@ const NETWORK_RESOURCE_TYPES = [
   "other",
 ];
 
+// DNR limits regex rules across rule sets; reserve one slot for the
+// per-tab session rule used by inactive-tab blocking.
+const MAX_POLICY_REGEX_RULES = 999;
+
 function escape_regex(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -64,8 +69,13 @@ function case_insensitive_host(host) {
 }
 
 /** Build the anchored DNR regexFilter body for one target, or null. */
-export function target_pattern(target) {
-  const anchor = "^https?://";
+export function target_pattern(target, include_websockets = false) {
+  const anchor = include_websockets
+    ? "^(?:https?|wss?)://"
+    : "^https?://";
+  if (target.kind === "browser_all") {
+    return "^(?:https?|wss?)://.*";
+  }
   if (target.kind === "website") {
     return (
       anchor +
@@ -151,7 +161,7 @@ export function compile_dnr(rules) {
       }
     }
     for (const target of Array.isArray(rule.exceptions) ? rule.exceptions : []) {
-      const pattern = target_pattern(target);
+      const pattern = target_pattern(target, true);
       if (pattern !== null) {
         entries.push({
           rule_id: rule.id,
@@ -163,8 +173,10 @@ export function compile_dnr(rules) {
       }
     }
   }
-  if (entries.length > 5000) {
-    throw new Error("browser rule capacity cannot hold the complete policy");
+  if (entries.length > MAX_POLICY_REGEX_RULES) {
+    throw new Error(
+      `browser policy exceeds the ${MAX_POLICY_REGEX_RULES}-rule regex capacity`,
+    );
   }
   entries.sort((a, b) =>
     a.exception - b.exception ||

@@ -398,10 +398,21 @@ class ProtectedStore:
         rules = migrated.get("rules")
         if not isinstance(rules, list):
             raise StorageError("policy rules are invalid")
+        source_schema = data.get("schema_version", 1)
         converted_rules = []
         for rule in rules:
             if not isinstance(rule, dict):
                 raise StorageError("policy rule is invalid")
+            targets = rule.get("targets")
+            if source_schema < POLICY_SCHEMA_VERSION and isinstance(
+                targets, list
+            ) and any(
+                isinstance(target, dict) and target.get("kind") == "browser_all"
+                for target in targets
+            ):
+                raise StorageError(
+                    "old policy contains an unsupported browser-wide target"
+                )
             if "allowance_time" in rule:
                 raise StorageError(
                     "old policy contains an unsupported elapsed-time allowance"

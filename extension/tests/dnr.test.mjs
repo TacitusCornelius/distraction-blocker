@@ -25,6 +25,8 @@ const { compile } = await import(join(root, "core", "engine.js"));
 function compiled_regexes(policy_name) {
   return compile_dnr(conformance.policies[policy_name]).map((entry) => ({
     rule_id: entry.rule_id,
+    priority: entry.rule.priority,
+    action: entry.rule.action.type,
     regexp: rule_to_regexp(entry.rule),
   }));
 }
@@ -34,9 +36,11 @@ for (const [index, case_] of conformance.cases.entries()) {
     continue; // DNR regexes only see well-formed request URLs.
   }
   test(`dnr conformance ${index}: ${case_.policy} ${case_.url.slice(0, 60)}`, () => {
-    const regexes = compiled_regexes(case_.policy);
-    const hit = regexes.find((entry) => entry.regexp.test(case_.url));
-    const blocked = hit !== undefined;
+    const matches = compiled_regexes(case_.policy)
+      .filter((entry) => entry.regexp.test(case_.url))
+      .sort((left, right) => right.priority - left.priority);
+    const hit = matches[0];
+    const blocked = hit?.action === "block";
     const expected_blocked = case_.expect !== null;
     assert.equal(
       blocked,
@@ -92,6 +96,21 @@ test("URL exceptions emit higher-priority allow rules", () => {
   );
   assert.equal(rule_to_regexp(entries[0].rule).test("https://example.com/blocked"), true);
   assert.equal(rule_to_regexp(entries[1].rule).test("https://example.com/allowed"), true);
+  const browser_wide = compile_dnr([{
+    id: "all-web",
+    enabled: true,
+    targets: [{ kind: "browser_all", value: "all" }],
+    exceptions: [{ kind: "url_path", value: "example.com/allowed" }],
+  }]);
+  const websocket_block = browser_wide.find(
+    (entry) => entry.rule.action.type === "block",
+  );
+  const websocket_exception = browser_wide.find(
+    (entry) => entry.rule.action.type === "allow",
+  );
+  assert.equal(rule_to_regexp(websocket_block.rule).test("wss://example.com/allowed"), true);
+  assert.equal(rule_to_regexp(websocket_exception.rule).test("wss://example.com/allowed"), true);
+  assert.equal(websocket_exception.rule.priority, 2);
 });
 
 test("website DNR patterns are exact hostnames and allow ports", () => {
@@ -105,6 +124,49 @@ test("website DNR patterns are exact hostnames and allow ports", () => {
   assert.equal(regexp.test("http://EXAMPLE.COM:8443/"), true);
   assert.equal(regexp.test("https://sub.example.com/"), false);
   assert.equal(regexp.test("https://example.com.evil/"), false);
+  assert.equal(regexp.test("wss://example.com/socket"), false);
+});
+
+test("browser-wide target blocks web and WebSocket URLs, not network controls", () => {
+  const entries = compile_dnr([{
+    id: "all-web",
+    enabled: true,
+    targets: [{ kind: "browser_all", value: "all" }],
+  }]);
+  assert.equal(entries.length, 1);
+  const rule = entries[0].rule;
+  const regexp = rule_to_regexp(rule);
+  assert.equal(regexp.test("http://one.example/path"), true);
+  assert.equal(regexp.test("https://another.example:8443/"), true);
+  assert.equal(regexp.test("ws://socket.example/connect"), true);
+  assert.equal(regexp.test("wss://socket.example/connect"), true);
+  assert.equal(regexp.test("file:///tmp/page.html"), false);
+  assert.equal(regexp.test("ftp://example.com/file"), false);
+  assert.ok(rule.condition.resourceTypes.includes("main_frame"));
+  assert.ok(rule.condition.resourceTypes.includes("websocket"));
+
+  const network = compile_dnr([{
+    id: "network-only",
+    enabled: true,
+    targets: [{ kind: "network", value: "whole_internet" }],
+  }]);
+  assert.deepEqual(network, []);
+});
+
+test("DNR compilation enforces regex-rule capacity before installation", () => {
+  const policy_for = (count) => [{
+    id: "large",
+    enabled: true,
+    targets: Array.from({ length: count }, (_, index) => ({
+      kind: "url_keyword",
+      value: `keyword-${index}`,
+    })),
+  }];
+  assert.equal(compile_dnr(policy_for(999)).length, 999);
+  assert.throws(
+    () => compile_dnr(policy_for(1000)),
+    /999-rule regex capacity/,
+  );
 });
 test("YouTube video IDs keep case-sensitive parity with Firefox", () => {
   const rules = [{

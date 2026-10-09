@@ -214,6 +214,22 @@ class StorageTests(unittest.TestCase):
         rule = migrated["rules"][0]
         self.assertFalse(rule["system_blocking"])
         self.assertEqual(rule["system_targets"], [])
+
+    def test_old_policy_schema_rejects_browser_wide_target(self):
+        with self.assertRaisesRegex(StorageError, "unsupported browser-wide"):
+            ProtectedStore._migrate_policy({
+                "schema_version": 6,
+                "revision": 2,
+                "rules": [{
+                    "id": "12345678-1234-5678-9234-567812345678",
+                    "name": "Legacy",
+                    "enabled": True,
+                    "targets": [{"kind": "browser_all", "value": "all"}],
+                    "schedule": {"kind": "indefinite"},
+                    "revision": 0,
+                }],
+                "managed_lists": [],
+            })
     def test_network_policy_round_trips_through_signed_storage(self):
         # Breadcrumb: network targets are root policy data; the signed
         # envelope must carry them intact across save and load.

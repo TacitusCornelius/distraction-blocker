@@ -195,10 +195,14 @@ The next feature cycle is built:
 
 - Chromium inactive-tab blocking uses a session DNR rule with inactive tab
   IDs. Tab events replace the rule.
-- Policy projections include `schema_version: 5` and `revision`. Firefox,
+- Policy projections include `schema_version: 7` and `revision`. Firefox,
   Chromium, the GUI, and the CLI reject an unsupported projection.
 
 The root service must remain the final policy authority.
+
+The browser-only whole-internet target is a distinct `browser_all` rule target.
+It blocks HTTP(S) and WebSocket requests in the supported browser extensions
+and does not activate protected-user firewall or DNS controls.
 
 ## Privileged network version
 

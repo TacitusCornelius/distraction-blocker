@@ -267,6 +267,15 @@ class UrlTargetTests(unittest.TestCase):
             with self.subTest(value=data["value"]):
                 with self.assertRaises(ValidationError):
                     Target.from_dict(data)
+    def test_browser_all_is_a_fixed_browser_target_not_a_network_control(self):
+        target = Target.from_dict({"kind": "browser_all", "value": "all"})
+        self.assertEqual(
+            target.to_dict(), {"kind": "browser_all", "value": "all"}
+        )
+        for value in ("*", "whole_internet", ""):
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    Target.from_dict({"kind": "browser_all", "value": value})
 
     def test_policy_round_trips_url_targets(self):
         policy = Policy.from_dict({
@@ -280,6 +289,7 @@ class UrlTargetTests(unittest.TestCase):
                     {"kind": "url_path", "value": "example.com/feed"},
                     {"kind": "url_wildcard", "value": "example.com/v/*"},
                     {"kind": "url_keyword", "value": "casino"},
+                    {"kind": "browser_all", "value": "all"},
                 ],
                 "schedule": {"kind": "indefinite"},
                 "revision": 0,
@@ -311,6 +321,11 @@ class UrlTargetTests(unittest.TestCase):
             Rule.from_dict({
                 **rule,
                 "exceptions": [{"kind": "network", "value": "vpn"}],
+            })
+        with self.assertRaises(ValidationError):
+            Rule.from_dict({
+                **rule,
+                "exceptions": [{"kind": "browser_all", "value": "all"}],
             })
 
 

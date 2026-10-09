@@ -20,7 +20,7 @@ function policy(id, value, revision) {
     ? value
     : [{ kind: "url_path", value }];
   return {
-    schema_version: 6,
+    schema_version: 7,
     revision,
     rules: [{
       id,
@@ -258,7 +258,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   assert.equal(status.denials["old → example.com/blocked"], 2);
   updateFailure = false;
   const overlap = {
-    schema_version: 6,
+    schema_version: 7,
     revision: 3,
     rules: [
       {
@@ -292,7 +292,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   );
 
   const exhausted = {
-    schema_version: 6,
+    schema_version: 7,
     revision: 4,
     rules: [{
       id: "spent",
@@ -339,7 +339,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
     1,
   );
   const allowance = {
-    schema_version: 6,
+    schema_version: 7,
     revision: 5,
     rules: [{
       id: "usage",
@@ -360,7 +360,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
 
   const timed_rule_id = "33333333-3333-4333-8333-333333333333";
   assert.equal(await apply_policy({
-    schema_version: 6,
+    schema_version: 7,
     revision: 6,
     rules: [{
       id: timed_rule_id,
@@ -388,7 +388,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   });
   for (
     let attempt = 0;
-    attempt < 10 &&
+    attempt < 100 &&
     !tab_updates.some((update) => update.details.url === requested_url);
     attempt += 1
   ) {
@@ -414,7 +414,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
     budget_exhausted: true,
   };
   assert.equal(await apply_policy({
-    schema_version: 6,
+    schema_version: 7,
     revision: 7,
     rules: [exhausted_rule],
   }), true);
@@ -443,7 +443,7 @@ test("Chromium keeps the old policy state when DNR rejects a replacement", async
   assert.equal(allowance_status_request.rule_id, timed_rule_id);
 
   const overlapping = {
-    schema_version: 6,
+    schema_version: 7,
     revision: 8,
     rules: [
       {

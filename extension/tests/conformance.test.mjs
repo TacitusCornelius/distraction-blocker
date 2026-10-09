@@ -88,6 +88,36 @@ test("website targets match an exact hostname across all paths", () => {
   assert.equal(match("https://example.com.evil.test/"), null);
 });
 
+test("WebSocket adapter matching is limited to browser-wide targets", () => {
+  const match = compile([{
+    id: "site",
+    enabled: true,
+    targets: [{ kind: "website", value: "example.com" }],
+  }, {
+    id: "browser-all",
+    enabled: true,
+    targets: [{ kind: "browser_all", value: "all" }],
+  }]);
+  assert.equal(
+    match("wss://example.com/socket", true)?.rule_id,
+    "browser-all",
+  );
+  assert.equal(match("https://example.com/")?.rule_id, "site");
+});
+test("browser-wide matches honor path exceptions for WebSockets", () => {
+  const match = compile([{
+    id: "browser-all",
+    enabled: true,
+    targets: [{ kind: "browser_all", value: "all" }],
+    exceptions: [{ kind: "url_path", value: "example.com/allowed" }],
+  }]);
+  assert.equal(match("wss://example.com/allowed"), null);
+  assert.equal(
+    match("wss://example.com/blocked")?.rule_id,
+    "browser-all",
+  );
+});
+
 
 // Breadcrumb: Firefox compiles the shared core to classic scripts (MV2
 // persistent background), so its copies intentionally differ from the

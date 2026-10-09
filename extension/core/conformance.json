@@ -30,7 +30,12 @@
           { "kind": "url_path", "value": "example.com/net" }
         ] }
     ],
-    "empty": []
+    "empty": [],
+    "browser-all": [
+      { "id": "browser-all-rule", "enabled": true,
+        "targets": [{ "kind": "browser_all", "value": "all" }],
+        "exceptions": [{ "kind": "url_path", "value": "example.org/allow" }] }
+    ]
   },
   "cases": [
     { "policy": "mixed", "url": "https://example.com/feed",
@@ -76,6 +81,20 @@
     { "policy": "network", "url": "https://example.com/net",
       "expect": { "rule_id": "net-mixed" } },
     { "policy": "network", "url": "https://example.com/net/extra",
-      "expect": null }
+      "expect": null },
+    { "policy": "browser-all", "url": "https://example.com/any/path?x=1",
+      "expect": { "rule_id": "browser-all-rule" } },
+    { "policy": "browser-all", "url": "http://another.test/",
+      "expect": { "rule_id": "browser-all-rule" } },
+    { "policy": "browser-all", "url": "https://example.org/allow",
+      "expect": null },
+    { "policy": "browser-all", "url": "https://example.org/allowed",
+      "expect": { "rule_id": "browser-all-rule" } },
+    { "policy": "browser-all", "url": "wss://socket.example/connect",
+      "expect": { "rule_id": "browser-all-rule" } },
+    { "policy": "browser-all", "url": "ws://socket.example/connect",
+      "expect": { "rule_id": "browser-all-rule" } },
+    { "policy": "browser-all", "url": "file:///tmp/page.html", "expect": null },
+    { "policy": "browser-all", "url": "ftp://example.com/file", "expect": null }
   ]
 }

@@ -80,6 +80,17 @@ def check_network_asset(path: Path) -> None:
     ):
         fail(f"refusing to replace an unowned network asset: {path}")
 
+
+def reject_unmarked_network_assets(marker_present: bool) -> None:
+    if marker_present:
+        return
+    for path in (DNS_UNIT, FENCE_UNIT, SANDBOX_DROPIN):
+        if path.exists() or path.is_symlink():
+            fail(
+                "network-control files exist without the explicit opt-in marker; "
+                f"inspect or remove them before installing: {path}"
+            )
+
 def check_icon_asset(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
@@ -318,7 +329,9 @@ def configure_service_unit(owner_home: Path, owner_uid: int) -> None:
     config_path = str(owner_home / ".config" / "distraction-blocker")
     escaped_path = config_path.replace("\\", "\\x5c").replace(" ", "\\x20")
     text = UNIT.read_text(encoding="utf-8")
-    read_write = "ReadWritePaths=/var/lib/distraction-blocker /run/distraction-blocker /etc"
+    read_write = (
+        "ReadWritePaths=/var/lib/distraction-blocker /run/distraction-blocker /etc/hosts"
+    )
     if read_write not in text or "[Service]\n" not in text:
         fail("the service unit has unexpected settings")
     text = text.replace(read_write, f"{read_write} {escaped_path}", 1)
@@ -537,6 +550,18 @@ def install_files(
             check_network_asset(path)
         validate_network_dependencies()
         ensure_dns_user(owner_uid)
+    for path in (STATE, RUN):
+        if path.is_symlink() or path.exists() and not path.is_dir():
+            fail(f"protected path is not a directory: {path}")
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    RUN.mkdir(mode=0o755, parents=True, exist_ok=True)
+    set_mode(STATE, 0o700)
+    set_mode(RUN, 0o755)
+    if network_on:
+        if write_marker and not module.is_network_enabled(STATE):
+            module.write_network_marker(STATE)
+        if not module.is_network_enabled(STATE):
+            fail("the network opt-in marker is not valid after installation")
     root_flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -695,22 +720,7 @@ def install_files(
     marker = PREFIX / MARKER_NAME
     marker.write_text(MARKER_TEXT, encoding="ascii")
     set_mode(marker, 0o644)
-    for path in (STATE, RUN):
-        if path.is_symlink() or path.exists() and not path.is_dir():
-            fail(f"protected path is not a directory: {path}")
-    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
-    RUN.mkdir(mode=0o755, parents=True, exist_ok=True)
-    set_mode(STATE, 0o700)
     prepare_notification_directory(owner_home, owner_spec)
-    set_mode(RUN, 0o755)
-    if network_on:
-        # Breadcrumb: only an explicit operator opt-in writes the
-        # root-protected marker; a valid pre-existing marker survives
-        # upgrades untouched.
-        if write_marker and not module.is_network_enabled(STATE):
-            module.write_network_marker(STATE)
-        if not module.is_network_enabled(STATE):
-            fail("the network opt-in marker is not valid after installation")
     owner_file = STATE / "owner.uid"
     if owner_file.is_symlink():
         fail("the owner UID file is a symlink")
@@ -742,6 +752,7 @@ def main() -> int:
     if marker.exists() and not marker_present:
         fail(f"an invalid or foreign file occupies {marker}")
     network_on = args.enable_network_controls or marker_present
+    reject_unmarked_network_assets(marker_present or args.enable_network_controls)
 
     try:
         install_files(

@@ -1,7 +1,7 @@
 # Distraction Blocker browser extension
 
-This subfolder holds the browser extension planned in
-`docs/FUTURE-VERSIONS.md` under "Browser extension version".
+This subfolder contains the browser extension source. The historical roadmap
+is in `docs/FUTURE-VERSIONS.md` under "Browser extension version".
 
 ## Product boundary
 
@@ -17,6 +17,11 @@ URL-level rules that `/etc/hosts` cannot express:
   iframe/embedded content is blocked like a top-level navigation.
 - Inactive-tab blocking.
 - Browser-extension protection.
+- Browser-wide blocking (`browser_all`) blocks HTTP(S) and WebSocket requests
+  inside the supported extension; it does not change DNS or background-process
+  access and does not cover non-web schemes or other non-URL traffic.
+- Browser policies are limited to 999 regex rules so one browser rule slot
+  remains available for inactive-tab blocking.
 - Each weekly URL-level rule can use a timed allowance. The service accounts
   focused active-tab usage against per-period rolling windows and an optional
   local-day cap; the browser surfaces remaining allowance and refill status.
@@ -31,8 +36,10 @@ Managed-list targets are loaded in bounded chunks and expanded before the
 browser compiles the complete policy. The two adapters block inactive-tab
 loads. URL-level exceptions are browser-only allows: an exception matching
 a URL takes precedence over URL blocks, while the root service continues
-enforcing its own targets. Policy projections include an explicit schema
-version.
+enforcing its own targets. Policy projections use schema version 7; install
+the matching updated extension before enabling policies with new target types,
+because older adapters reject an incompatible projection. Update the service
+and native host together with the repository installer.
 
 The desktop application does not trust the extension. Policy flows from
 the root service to the extension. The extension sends observational

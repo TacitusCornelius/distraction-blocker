@@ -1,6 +1,6 @@
 # Distraction Blocker
 
-Distraction Blocker is an Ubuntu desktop application. It blocks exact website hostnames and application executable paths.
+Distraction Blocker manages scheduled rules for website and URL targets, including a browser-only whole-internet target, and application executable paths.
 
 The application uses a native GTK 4 interface. A root-owned systemd service applies each active rule.
 
@@ -19,6 +19,15 @@ The exclusion applies only to that rule's managed-list targets; direct
 website targets and separate system-level blocks are unaffected.
 
 A weekly period can cross midnight. Overlapping periods act as one continuous block.
+
+The **All internet (browser only)** Block Target is a browser-extension rule:
+it blocks HTTP, HTTPS, and WebSocket requests in the supported browser without
+installing an OS-level network block or changing DNS. In **Block Targets**,
+select that option and add it without entering a value. Leave
+**System-level blocks** disabled and do not select the **Whole internet**
+network control if other processes must remain online. It does not block
+browser-internal pages, local files, other URL schemes, or traffic from other
+applications, and it depends on the browser extension being enabled.
 
 An active finite rule cannot lose targets or shorten its schedule. An active
 unlocked rule can be disabled manually; an effective lock prevents weakening
@@ -233,11 +242,11 @@ sudo python3 scripts/install.py --confirm --owner-uid 1000
 
 The installer copies root-owned code to `/usr/lib/distraction-blocker`. It installs and starts `distraction-blocker.service`.
 
-### Chrome Web Store extension (Version 1.9.6)
+### Chrome Web Store extension (Version 1.9.7)
 
 The Chromium adapter is published separately as an unlisted Chrome Web Store
 item. The root service and native-messaging host are still required; the
-browser extension alone is not a complete installation. Build the Version 1.9.6
+browser extension alone is not a complete installation. Build the Version 1.9.7
 upload archive from the repository root:
 
 ```bash
@@ -259,7 +268,7 @@ sudo python3 scripts/install.py --confirm --owner-uid "$(id -u)"
 
 Do not use **Load unpacked** as the production installation method.
 
-### Firefox / LibreWolf extension (Version 1.9.6)
+### Firefox / LibreWolf extension (Version 1.9.7)
 
 Build the Firefox submission archive from the repository root:
 
@@ -268,7 +277,7 @@ python3 extension/build.py
 python3 scripts/package_firefox_extension.py
 ```
 
-Submit `dist/distraction-blocker-firefox-1.9.6.xpi` to Mozilla's AMO
+Submit `dist/distraction-blocker-firefox-1.9.7.xpi` to Mozilla's AMO
 self-distribution channel, download the resulting signed XPI, and install that
 signed file through the Firefox or LibreWolf Add-ons page. The root service and
 native-messaging host are still required; install them with the command above.

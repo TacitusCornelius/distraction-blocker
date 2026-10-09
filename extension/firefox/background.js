@@ -553,7 +553,9 @@ async function wait_for_initial_refresh() {
 
 browser.webRequest.onBeforeRequest.addListener(
   async (details) => {
-    if (details.tabId === -1 || !details.url.startsWith("http")) {
+    const websocket_request = /^wss?:/i.test(details.url);
+    const background_request = details.tabId === -1;
+    if (!/^(?:https?|wss?):/i.test(details.url)) {
       return {};
     }
     await state_ready;
@@ -561,7 +563,10 @@ browser.webRequest.onBeforeRequest.addListener(
     if (!policy_ready) {
       return block_result(details);
     }
-    const hit = match(details.url);
+    const hit = match(
+      details.url,
+      websocket_request || background_request,
+    );
     if (hit !== null) {
       if (details.type === "main_frame") {
         await update_allowance_url(details.tabId, null);
@@ -569,6 +574,9 @@ browser.webRequest.onBeforeRequest.addListener(
       bump_usage(pending_denials, hit.rule_id, hit.value);
       record_state(null);
       return block_result(details, hit);
+    }
+    if (websocket_request || background_request) {
+      return {};
     }
     const timed = match_time_allowance(details.url);
     if (details.type === "main_frame") {

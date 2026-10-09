@@ -18,10 +18,10 @@ from .model import POLICY_SCHEMA_VERSION, ManagedList, Policy, Rule, Schedule, T
 
 NATIVE_FORMAT = "distraction-blocker"
 # Version 6 adds elapsed-time allowance policy fields; version 7 adds the
-# local DNS network target; version 8 adds browser/system target separation.
-# Earlier portable files are migrated on import when their targets remain
-# supported.
-NATIVE_VERSION = 8
+# local DNS network target; version 8 adds browser/system target separation;
+# version 9 adds browser-wide targets. Earlier portable files are migrated on
+# import when their targets remain supported.
+NATIVE_VERSION = 9
 MAX_DOMAIN_IMPORT_BYTES = 4 * 1024 * 1024
 MAX_NATIVE_IMPORT_BYTES = 8 * 1024 * 1024
 MAX_IMPORT_ENTRIES = 50_000
@@ -53,7 +53,7 @@ class ImportPreview:
 
 
 TARGET_LIST_FORMAT = "distraction-blocker-target-list"
-TARGET_LIST_VERSION = 1
+TARGET_LIST_VERSION = 2
 TARGET_LIST_SCOPES = frozenset({"targets", "exceptions", "applications"})
 
 
@@ -1343,7 +1343,8 @@ def parse_target_list_text(
         raise TransferError("target-list export fields are invalid")
     if value.get("format") != TARGET_LIST_FORMAT:
         raise TransferError("target-list export format is not supported")
-    if value.get("version") != TARGET_LIST_VERSION:
+    version = value.get("version")
+    if type(version) is not int or version not in {1, TARGET_LIST_VERSION}:
         raise TransferError("target-list export version is not supported")
     scope = value.get("scope")
     if not isinstance(scope, str) or scope not in TARGET_LIST_SCOPES:
@@ -1358,6 +1359,10 @@ def parse_target_list_text(
     try:
         for raw_item in raw_items:
             target = Target.from_dict(raw_item)
+            if version < TARGET_LIST_VERSION and target.kind == "browser_all":
+                raise TransferError(
+                    "browser-wide targets require target-list format v2"
+                )
             if scope == "exceptions" and target.kind not in Target.URL_LIKE_KINDS:
                 raise TransferError("target-list exceptions must be URL-level")
             if scope == "applications" and target.kind != "application":
@@ -1458,7 +1463,7 @@ def parse_native_export(text: str) -> Policy:
     if value.get("format") != NATIVE_FORMAT:
         raise TransferError("native export format is not supported")
     version = value.get("version")
-    if type(version) is not int or version not in {1, 2, 3, 4, 5, 6, 7, NATIVE_VERSION}:
+    if type(version) is not int or version not in {1, 2, 3, 4, 5, 6, 7, 8, NATIVE_VERSION}:
         raise TransferError("native export version is not supported")
     raw_rules = value.get("rules")
     if not isinstance(raw_rules, list):
@@ -1479,7 +1484,13 @@ def parse_native_export(text: str) -> Policy:
                     "elapsed-time allowances require native format v6"
                 )
             for target in raw_rule["targets"]:
-                if not isinstance(target, Mapping) or target.get("kind") != "network":
+                if not isinstance(target, Mapping):
+                    continue
+                if target.get("kind") == "browser_all" and version < 9:
+                    raise TransferError(
+                        "browser-wide targets require native format v9"
+                    )
+                if target.get("kind") != "network":
                     continue
                 raw_target_value = target.get("value")
                 if raw_target_value == "local_dns" and version < 7:
